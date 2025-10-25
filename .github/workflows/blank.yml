@@ -276,6 +276,7 @@ jobs:
           async function fetchMyTrades(symbol, startTime) { return await mexcSignedRequest('/api/v3/myTrades', { symbol, startTime, limit: 1000 }); }
           async function fetchOpenOrders(symbol) { return await mexcSignedRequest('/api/v3/openOrders', symbol?{ symbol }:{}) || []; }
           async function fetchK(sym,interval,limit,startTime,endTime){ const u=api("/api/v3/klines",{symbol:sym,interval,limit,startTime,endTime}); const r=await getJSON(u,10000,2); return Array.isArray(r)?r:null; }
+          async function fetchDepth(symbol){ return await getJSON(api("/api/v3/depth",{symbol,limit:DEPTH_LIMIT}), 10000, 2); }
           async function fetchAll24hr(){
             let all=await getJSON(api("/api/v3/ticker/24hr"),10000,2); if(Array.isArray(all)&&all.length) return all;
             const exi=await getJSON(api("/api/v3/exchangeInfo"),10000,2); const syms=(exi?.symbols||[]).filter(s=>s.status==="TRADING").map(s=>s.symbol).slice(0,300);
