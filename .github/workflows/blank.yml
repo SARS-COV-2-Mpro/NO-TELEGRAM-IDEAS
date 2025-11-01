@@ -1,6 +1,8 @@
-name: Ideas Pusher (MEXC Ultimate 7.7.7++)
+name: Ideas Pusher (MEXC Ultimate 7.7.7)
 
 on:
+  schedule:
+    - cron: "0 */3 * * *"   # run every 25 minutes
   repository_dispatch:
     types: [run_B]
   workflow_dispatch: {}
