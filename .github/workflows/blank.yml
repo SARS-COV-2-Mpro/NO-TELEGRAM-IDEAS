@@ -1,4 +1,4 @@
-       name: Ideas Pusher (MEXC Ultimate 7.7.7)
+name: Ideas Pusher (MEXC Ultimate 7.7.7)
 
 on:
   repository_dispatch:
@@ -1501,7 +1501,8 @@ jobs:
                 realized:{ tp_hit:exit_reason==="tp", sl_hit:exit_reason==="sl", ttl_exit:exit_reason==="ttl", max_favorable_excursion_bps:mfe, max_adverse_excursion_bps:mae }
               };
             }catch(e){ return { status:"sim_error", error:e?.message||String(e), closed:false }; }
-          }   
+          }
+          
           // ---------- Main ----------
           let reason="ok", selectionTier="confidence";
           try{
