@@ -1,4 +1,4 @@
-name: Ideas Pusher (MEXC Ultimate 7.7.7)
+       name: Ideas Pusher (MEXC Ultimate 7.7.7)
 
 on:
   repository_dispatch:
@@ -45,6 +45,7 @@ jobs:
       ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
       MEXC_BASE: ${{ vars.MEXC_BASE }}
       FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}
+      CAPITAL_PCT_PER_TRADE: ${{ vars.CAPITAL_PCT_PER_TRADE }}  # ⭐ NEW: e.g., 10 for 10%
 
       # New Confidence Model Knobs
       DIRECTION: ${{ vars.DIRECTION }}
@@ -77,6 +78,68 @@ jobs:
         with:
           node-version: 20
 
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install ML libraries
+        run: |
+          pip install --quiet numpy scikit-learn xgboost lightgbm catboost
+
+      - name: Create Python ML trainer
+        run: |
+          cat > /tmp/train_models.py << 'PYTHON'
+          import sys, json, pickle, base64
+          import numpy as np
+          from xgboost import XGBClassifier
+          from lightgbm import LGBMClassifier
+          from catboost import CatBoostClassifier
+
+          data = json.load(sys.stdin)
+          features = np.array([s['features'] for s in data])
+          labels = np.array([s['label'] for s in data])
+
+          models = {}
+
+          # XGBoost
+          xgb = XGBClassifier(max_depth=4, n_estimators=50, learning_rate=0.1, random_state=42, verbosity=0)
+          xgb.fit(features, labels)
+          models['xgboost'] = base64.b64encode(pickle.dumps(xgb)).decode()
+
+          # LightGBM
+          lgb = LGBMClassifier(max_depth=4, n_estimators=50, learning_rate=0.1, random_state=42, verbose=-1)
+          lgb.fit(features, labels)
+          models['lightgbm'] = base64.b64encode(pickle.dumps(lgb)).decode()
+
+          # CatBoost
+          cat = CatBoostClassifier(depth=4, iterations=50, learning_rate=0.1, random_state=42, verbose=False)
+          cat.fit(features, labels)
+          models['catboost'] = base64.b64encode(pickle.dumps(cat)).decode()
+
+          print(json.dumps(models))
+          PYTHON
+
+      - name: Create Python ML predictor
+        run: |
+          cat > /tmp/predict_models.py << 'PYTHON'
+          import sys, json, pickle, base64
+          import numpy as np
+
+          input_data = json.load(sys.stdin)
+          features = np.array(input_data['features']).reshape(1, -1)
+          models_b64 = input_data['models']
+
+          predictions = {}
+          for name, model_b64 in models_b64.items():
+            model = pickle.loads(base64.b64decode(model_b64))
+            pred = int(model.predict(features)[0])
+            predictions[name] = 'long' if pred == 1 else 'short'
+
+          print(json.dumps(predictions))
+          PYTHON
+
       - name: Run pusher (always-push + clear logs)
         shell: bash
         run: |
@@ -93,6 +156,7 @@ jobs:
           (async ()=>{
           'use strict';
           const crypto = require('crypto');
+          const { spawn } = require('child_process');
           const MODEL_VERSION=(process.env.MODEL_VERSION||"6.4");
           const UA = `gh-actions-ideas-mexc-ultimate/${MODEL_VERSION} (+https://github.com/)`;
 
@@ -298,6 +362,11 @@ jobs:
           const LONG_BOUNCE_SL_ATR=Number(process.env.LONG_BOUNCE_SL_ATR||"0.50"), LONG_BOUNCE_TP_ATR=Number(process.env.LONG_BOUNCE_TP_ATR||"0.90");
           const LONG_SIMILARITY_RHO=Number(process.env.LONG_SIMILARITY_RHO||"0.84");
 
+          // ⭐ NEW: Fixed capital % per trade (e.g., 10 = 10% of capital)
+          const CAPITAL_PCT_PER_TRADE=Number(process.env.CAPITAL_PCT_PER_TRADE||"0");
+          const FIXED_SIZE_BPS = CAPITAL_PCT_PER_TRADE > 0 ? Math.min(2000, Math.round(CAPITAL_PCT_PER_TRADE * 100)) : 0;
+          // If CAPITAL_PCT_PER_TRADE=10, then FIXED_SIZE_BPS=1000 (10% = 1000 bps)
+
           const CONFIG_HASH=(()=>{ try{
             const knobs={
               DIRECTION, MR_BREAKOUT_DC_N, MR_BREAKOUT_RET15_ATR, MR_LOCKOUT_SEC,
@@ -414,6 +483,22 @@ jobs:
               cooldown:{}, cooldown_side:{}, pending:[], equity:[], closed:[],
               mr_lockout:{}, sym_stats:{}, sym_stats_real:{}, calibCoeffs:{}, lastReconcileTs:0,
               calibration_holdout:[],
+              ml_voting_history:[],
+              ml_model_weights:{ // ⭐ NEW: Adaptive weights
+                original_side:13,
+                xgboost:10,
+                lightgbm:10,
+                catboost:10,
+                random_forest:10,
+                logistic:10,
+                svm:10,
+                cnn1d:10,
+                lstm:10,
+                cnn_lstm:10,
+                tft:10,
+                hmm:10
+              },
+              ml_weight_history:[], // ⭐ NEW: Track weight changes
               ml_models:{
                 xgboost:{weights:null,trained_at:0,n_samples:0},
                 lightgbm:{weights:null,trained_at:0,n_samples:0},
@@ -466,6 +551,22 @@ jobs:
                 hmm:{transition:null,emission:null,trained_at:0,n_samples:0}
               };
               if(!Array.isArray(s.ml_training_buffer))s.ml_training_buffer=[];
+              if(!Array.isArray(s.ml_voting_history))s.ml_voting_history=[];
+              if(!s.ml_model_weights)s.ml_model_weights={ // ⭐ NEW
+                original_side:13,
+                xgboost:10,
+                lightgbm:10,
+                catboost:10,
+                random_forest:10,
+                logistic:10,
+                svm:10,
+                cnn1d:10,
+                lstm:10,
+                cnn_lstm:10,
+                tft:10,
+                hmm:10
+              };
+              if(!Array.isArray(s.ml_weight_history))s.ml_weight_history=[]; // ⭐ NEW
 
               return { state:s, persist:{ id, token, etag } };
             }catch(e){ log("loadState warn", e?.message||e); return { state:init, persist:null }; }
@@ -817,6 +918,154 @@ jobs:
             return sigmoid(coeff.a + coeff.b * x);
           };
           const calibratorInfo=(state,side,regime)=>{ const coeff=getCoeffs(state,side,regime); return { type:"logistic", n:coeff.n, a:coeff.a, b:coeff.b }; };
+          
+          // ========== PYTHON INTERFACE ==========
+
+          async function trainPythonModels(data) {
+            if(data.length < 20) return null;
+            try {
+              log(`🐍 Calling Python to train XGBoost, LightGBM, CatBoost...`);
+              const proc = spawn('python3', ['/tmp/train_models.py']);
+              let stdout = '';
+              let stderr = '';
+              
+              proc.stdin.write(JSON.stringify(data));
+              proc.stdin.end();
+              
+              proc.stdout.on('data', d => stdout += d);
+              proc.stderr.on('data', d => stderr += d);
+              
+              await new Promise((resolve, reject) => {
+                proc.on('close', code => {
+                  if(code === 0) resolve();
+                  else reject(new Error(`Python exit ${code}: ${stderr}`));
+                });
+                setTimeout(() => reject(new Error('Python training timeout')), 120000);
+              });
+              
+              const result = JSON.parse(stdout);
+              log(`✅ Python training complete (${Object.keys(result).length} models)`);
+              return result;
+            } catch(e) {
+              log('⚠️ Python training error:', e?.message || e);
+              return null;
+            }
+          }
+
+          async function predictPythonModels(models_b64, features) {
+            try {
+              const proc = spawn('python3', ['/tmp/predict_models.py']);
+              let stdout = '';
+              
+              proc.stdin.write(JSON.stringify({models: models_b64, features}));
+              proc.stdin.end();
+              
+              proc.stdout.on('data', d => stdout += d);
+              
+              await new Promise((resolve, reject) => {
+                proc.on('close', code => {
+                  if(code === 0) resolve();
+                  else reject(new Error('Python predict failed'));
+                });
+                setTimeout(() => reject(new Error('Python predict timeout')), 5000);
+              });
+              
+              return JSON.parse(stdout);
+            } catch(e) {
+              log('⚠️ Python predict error:', e?.message || e);
+              return null;
+            }
+          }
+
+          // ========== SIMPLIFIED JS MODELS ==========
+
+          function trainRandomForestJS(data, ts) {
+            const numTrees = 30;
+            const trees = [];
+            
+            for(let t = 0; t < numTrees; t++) {
+              const sample = [];
+              for(let i = 0; i < data.length; i++) {
+                sample.push(data[Math.floor(Math.random() * data.length)]);
+              }
+              
+              const featureIdx = Math.floor(Math.random() * (sample[0]?.features?.length || 18));
+              const threshold = Math.random() * 0.5 - 0.25;
+              
+              let left = 0, right = 0;
+              for(const s of sample) {
+                if((s.features[featureIdx] || 0) < threshold) {
+                  left += s.label;
+                } else {
+                  right += s.label;
+                }
+              }
+              
+              trees.push({
+                featureIdx,
+                threshold,
+                leftLabel: left > sample.length * 0.3 ? 1 : 0,
+                rightLabel: right > sample.length * 0.3 ? 1 : 0
+              });
+            }
+            
+            return { trees, trained_at: ts, n_samples: data.length };
+          }
+
+          function trainLogisticJS(data, ts) {
+            const w = Array(18).fill(0);
+            let bias = 0;
+            const lr = 0.01;
+            
+            for(let epoch = 0; epoch < 100; epoch++) {
+              for(const s of data) {
+                let z = bias;
+                for(let i = 0; i < w.length; i++) {
+                  z += w[i] * (s.features[i] || 0);
+                }
+                const pred = 1 / (1 + Math.exp(-z));
+                const err = s.label - pred;
+                
+                bias += lr * err;
+                for(let i = 0; i < w.length; i++) {
+                  w[i] += lr * err * (s.features[i] || 0);
+                }
+              }
+            }
+            
+            return { w, bias, trained_at: ts, n_samples: data.length };
+          }
+
+          function trainSVMLinearJS(data, ts) {
+            const w = Array(18).fill(0);
+            let bias = 0;
+            const lr = 0.001;
+            const C = 1.0;
+            
+            for(let epoch = 0; epoch < 50; epoch++) {
+              for(const s of data) {
+                const y = s.label === 1 ? 1 : -1;
+                let z = bias;
+                for(let i = 0; i < w.length; i++) {
+                  z += w[i] * (s.features[i] || 0);
+                }
+                
+                if(y * z < 1) {
+                  for(let i = 0; i < w.length; i++) {
+                    w[i] = w[i] * (1 - lr) + lr * C * y * (s.features[i] || 0);
+                  }
+                  bias += lr * C * y;
+                } else {
+                  for(let i = 0; i < w.length; i++) {
+                    w[i] *= (1 - lr);
+                  }
+                }
+              }
+            }
+            
+            return { w, bias, trained_at: ts, n_samples: data.length };
+          }
+
           // ========== ML ENSEMBLE FUNCTIONS ==========
 
           const extractMLFeatures=(c5,h5,l5,v5,rsi14,adx5,atr_bps,z_vwap,roc1,roc3,spreadBps,obi,ofi30s,mtfAgg,tfAlign)=>{
@@ -832,13 +1081,58 @@ jobs:
             ];
           };
 
-          // Simple model predictors (stubs - replace with real implementations)
-          const predictXGBoost=(model,feat)=>{ if(!model?.weights)return Math.random()>0.5?"long":"short"; let s=model.weights.bias||0; for(let i=0;i<Math.min(feat.length,model.weights.w?.length||0);i++)s+=feat[i]*(model.weights.w[i]||0); return s>0?"long":"short"; };
-          const predictLightGBM=(model,feat)=>{ if(!model?.weights)return Math.random()>0.5?"long":"short"; let s=model.weights.bias||0; for(let i=0;i<Math.min(feat.length,model.weights.w?.length||0);i++)s+=feat[i]*(model.weights.w[i]||0); return s>0?"long":"short"; };
-          const predictCatBoost=(model,feat)=>{ if(!model?.weights)return Math.random()>0.5?"long":"short"; let s=model.weights.bias||0; for(let i=0;i<Math.min(feat.length,model.weights.w?.length||0);i++)s+=feat[i]*(model.weights.w[i]||0); return s>0?"long":"short"; };
-          const predictRandomForest=(model,feat)=>{ if(!model?.trees)return Math.random()>0.5?"long":"short"; let votes=0; for(const t of(model.trees||[]).slice(0,10)){let s=t.bias||0; for(let i=0;i<Math.min(feat.length,t.w?.length||0);i++)s+=feat[i]*(t.w[i]||0); if(s>0)votes++;} return votes>5?"long":"short"; };
-          const predictLogistic=(model,feat)=>{ if(!model?.w)return Math.random()>0.5?"long":"short"; let s=0; for(let i=0;i<Math.min(feat.length,model.w.length);i++)s+=feat[i]*(model.w[i]||0); return sigmoid(s)>0.5?"long":"short"; };
-          const predictSVM=(model,feat)=>{ if(!model?.sv)return Math.random()>0.5?"long":"short"; let s=model.sv.bias||0; for(let i=0;i<Math.min(feat.length,model.sv.w?.length||0);i++)s+=feat[i]*(model.sv.w[i]||0); return s>0?"long":"short"; };
+          const predictXGBoost = async (model, feat) => {
+            if(model?.model_b64) {
+              const pred = await predictPythonModels({xgboost: model.model_b64}, feat);
+              return pred?.xgboost || (Math.random() > 0.5 ? "long" : "short");
+            }
+            return Math.random() > 0.5 ? "long" : "short";
+          };
+
+          const predictLightGBM = async (model, feat) => {
+            if(model?.model_b64) {
+              const pred = await predictPythonModels({lightgbm: model.model_b64}, feat);
+              return pred?.lightgbm || (Math.random() > 0.5 ? "long" : "short");
+            }
+            return Math.random() > 0.5 ? "long" : "short";
+          };
+
+          const predictCatBoost = async (model, feat) => {
+            if(model?.model_b64) {
+              const pred = await predictPythonModels({catboost: model.model_b64}, feat);
+              return pred?.catboost || (Math.random() > 0.5 ? "long" : "short");
+            }
+            return Math.random() > 0.5 ? "long" : "short";
+          };
+
+          const predictRandomForest = (model, feat) => {
+            if(!model?.trees) return Math.random() > 0.5 ? "long" : "short";
+            let votes = 0;
+            for(const tree of model.trees) {
+              const val = feat[tree.featureIdx] || 0;
+              votes += val < tree.threshold ? tree.leftLabel : tree.rightLabel;
+            }
+            return votes > model.trees.length * 0.5 ? "long" : "short";
+          };
+
+          const predictLogistic = (model, feat) => {
+            if(!model?.w) return Math.random() > 0.5 ? "long" : "short";
+            let z = model.bias || 0;
+            for(let i = 0; i < Math.min(feat.length, model.w.length); i++) {
+              z += feat[i] * model.w[i];
+            }
+            const p = 1 / (1 + Math.exp(-z));
+            return p > 0.5 ? "long" : "short";
+          };
+
+          const predictSVM = (model, feat) => {
+            if(!model?.w) return Math.random() > 0.5 ? "long" : "short";
+            let z = model.bias || 0;
+            for(let i = 0; i < Math.min(feat.length, model.w.length); i++) {
+              z += feat[i] * (model.w[i] || 0);
+            }
+            return z > 0 ? "long" : "short";
+          };
           const predictCNN1D=(model,feat)=>{ if(!model?.layers)return Math.random()>0.5?"long":"short"; let s=0; for(let i=0;i<feat.length;i++)s+=feat[i]*(model.layers[i%5]||0); return s>0?"long":"short"; };
           const predictLSTM=(model,feat)=>{ if(!model?.layers)return Math.random()>0.5?"long":"short"; let s=0; for(let i=0;i<feat.length;i++)s+=feat[i]*Math.tanh(model.layers[i%5]||0); return s>0?"long":"short"; };
           const predictCNNLSTM=(model,feat)=>{ if(!model?.layers)return Math.random()>0.5?"long":"short"; let s=0; for(let i=0;i<feat.length;i++)s+=feat[i]*Math.tanh(model.layers[i%7]||0)*0.8; return s>0?"long":"short"; };
@@ -858,15 +1152,27 @@ jobs:
             log(`🎓 Training ML models with ${data.length} samples...`);
             const nowTs=Date.now();
             
-            // Simple linear model training (replace with real algos)
-            const trainLinear=(samples)=>{ const w=Array(18).fill(0).map(()=>Math.random()*0.1-0.05); let bias=0; for(let epoch=0;epoch<20;epoch++){ for(const s of samples){ let pred=bias; for(let i=0;i<w.length;i++)pred+=s.features[i]*w[i]; const err=s.label-(pred>0?1:0); bias+=0.01*err; for(let i=0;i<w.length;i++)w[i]+=0.01*err*s.features[i]; } } return {w,bias}; };
+            // Train real Python models
+            const pyModels = await trainPythonModels(data);
             
-            state.ml_models.xgboost={weights:trainLinear(data),trained_at:nowTs,n_samples:data.length};
-            state.ml_models.lightgbm={weights:trainLinear(data),trained_at:nowTs,n_samples:data.length};
-            state.ml_models.catboost={weights:trainLinear(data),trained_at:nowTs,n_samples:data.length};
-            state.ml_models.random_forest={trees:Array(10).fill(null).map(()=>trainLinear(data.slice(0,Math.floor(data.length*0.7)))),trained_at:nowTs,n_samples:data.length};
-            state.ml_models.logistic={w:trainLinear(data).w,trained_at:nowTs,n_samples:data.length};
-            state.ml_models.svm={sv:trainLinear(data),trained_at:nowTs,n_samples:data.length};
+            if(pyModels){
+              state.ml_models.xgboost = {model_b64: pyModels.xgboost, trained_at:nowTs, n_samples:data.length};
+              state.ml_models.lightgbm = {model_b64: pyModels.lightgbm, trained_at:nowTs, n_samples:data.length};
+              state.ml_models.catboost = {model_b64: pyModels.catboost, trained_at:nowTs, n_samples:data.length};
+              log(`✅ Real XGBoost, LightGBM, CatBoost trained`);
+            } else {
+              log(`⚠️ Python training failed, using fallback stubs`);
+              state.ml_models.xgboost = {stub:true, trained_at:nowTs, n_samples:data.length};
+              state.ml_models.lightgbm = {stub:true, trained_at:nowTs, n_samples:data.length};
+              state.ml_models.catboost = {stub:true, trained_at:nowTs, n_samples:data.length};
+            }
+            
+            // Simplified JS models
+            state.ml_models.random_forest = trainRandomForestJS(data, nowTs);
+            state.ml_models.logistic = trainLogisticJS(data, nowTs);
+            state.ml_models.svm = trainSVMLinearJS(data, nowTs);
+            
+            // Keep stubs for deep learning models
             state.ml_models.cnn1d={layers:Array(5).fill(0).map(()=>Math.random()*0.2-0.1),trained_at:nowTs,n_samples:data.length};
             state.ml_models.lstm={layers:Array(5).fill(0).map(()=>Math.random()*0.2-0.1),trained_at:nowTs,n_samples:data.length};
             state.ml_models.cnn_lstm={layers:Array(7).fill(0).map(()=>Math.random()*0.2-0.1),trained_at:nowTs,n_samples:data.length};
@@ -880,35 +1186,215 @@ jobs:
             log(`\n========== ML ENSEMBLE: ${symbol} ==========`);
             log(`Original side: ${originalSide}`);
             
+            if(!state.ml_model_weights) state.ml_model_weights={
+              original_side:13,xgboost:10,lightgbm:10,catboost:10,random_forest:10,
+              logistic:10,svm:10,cnn1d:10,lstm:10,cnn_lstm:10,tft:10,hmm:10
+            };
+            
+            const weights=state.ml_model_weights;
+            
+            log(`\n📊 Current Weights:`);
+            log(`   Original Side: ${weights.original_side}`);
+            log(`   XGBoost: ${weights.xgboost}, LightGBM: ${weights.lightgbm}, CatBoost: ${weights.catboost}`);
+            log(`   RandomForest: ${weights.random_forest}, Logistic: ${weights.logistic}, SVM: ${weights.svm}`);
+            log(`   CNN-1D: ${weights.cnn1d}, LSTM: ${weights.lstm}, CNN-LSTM: ${weights.cnn_lstm}`);
+            log(`   TFT: ${weights.tft}, HMM: ${weights.hmm}`);
+            
             const votes={long:0,short:0,details:[]};
             
-            log(`🔍 Collecting votes from 11 models...`);
+            log(`\n🔍 Collecting votes from 12 voters (weighted)...`);
             
-            const v1=predictXGBoost(state.ml_models.xgboost,features); votes[v1]++; votes.details.push({model:'XGBoost',vote:v1}); log(`  [1] XGBoost      → ${v1.toUpperCase()}`);
-            const v2=predictLightGBM(state.ml_models.lightgbm,features); votes[v2]++; votes.details.push({model:'LightGBM',vote:v2}); log(`  [2] LightGBM     → ${v2.toUpperCase()}`);
-            const v3=predictCatBoost(state.ml_models.catboost,features); votes[v3]++; votes.details.push({model:'CatBoost',vote:v3}); log(`  [3] CatBoost     → ${v3.toUpperCase()}`);
-            const v4=predictRandomForest(state.ml_models.random_forest,features); votes[v4]++; votes.details.push({model:'RandomForest',vote:v4}); log(`  [4] RandomForest → ${v4.toUpperCase()}`);
-            const v5=predictLogistic(state.ml_models.logistic,features); votes[v5]++; votes.details.push({model:'Logistic',vote:v5}); log(`  [5] Logistic     → ${v5.toUpperCase()}`);
-            const v6=predictSVM(state.ml_models.svm,features); votes[v6]++; votes.details.push({model:'SVM',vote:v6}); log(`  [6] SVM          → ${v6.toUpperCase()}`);
-            const v7=predictCNN1D(state.ml_models.cnn1d,features); votes[v7]++; votes.details.push({model:'CNN-1D',vote:v7}); log(`  [7] CNN-1D       → ${v7.toUpperCase()}`);
-            const v8=predictLSTM(state.ml_models.lstm,features); votes[v8]++; votes.details.push({model:'LSTM',vote:v8}); log(`  [8] LSTM         → ${v8.toUpperCase()}`);
-            const v9=predictCNNLSTM(state.ml_models.cnn_lstm,features); votes[v9]++; votes.details.push({model:'CNN-LSTM',vote:v9}); log(`  [9] CNN-LSTM     → ${v9.toUpperCase()}`);
-            const v10=predictTFT(state.ml_models.tft,features); votes[v10]++; votes.details.push({model:'TFT',vote:v10}); log(`  [10] TFT         → ${v10.toUpperCase()}`);
-            const v11=predictHMM(state.ml_models.hmm,features); votes[v11]++; votes.details.push({model:'HMM',vote:v11}); log(`  [11] HMM         → ${v11.toUpperCase()}`);
+            // Voter 0: Original Side
+            const v0=originalSide;
+            const w0=weights.original_side||13;
+            votes[v0]+=w0;
+            votes.details.push({model:'Original Side',vote:v0,weight:w0});
+            log(`  [0] Original Side → ${v0.toUpperCase()} (weight: ${w0})`);
             
-            log(`\n📊 Vote Summary: LONG=${votes.long} SHORT=${votes.short}`);
+            // Voter 1: XGBoost
+            const v1=await predictXGBoost(state.ml_models.xgboost,features);
+            const w1=weights.xgboost||10;
+            votes[v1]+=w1;
+            votes.details.push({model:'XGBoost',vote:v1,weight:w1});
+            log(`  [1] XGBoost      → ${v1.toUpperCase()} (weight: ${w1})`);
+            
+            // Voter 2: LightGBM
+            const v2=await predictLightGBM(state.ml_models.lightgbm,features);
+            const w2=weights.lightgbm||10;
+            votes[v2]+=w2;
+            votes.details.push({model:'LightGBM',vote:v2,weight:w2});
+            log(`  [2] LightGBM     → ${v2.toUpperCase()} (weight: ${w2})`);
+            
+            // Voter 3: CatBoost
+            const v3=await predictCatBoost(state.ml_models.catboost,features);
+            const w3=weights.catboost||10;
+            votes[v3]+=w3;
+            votes.details.push({model:'CatBoost',vote:v3,weight:w3});
+            log(`  [3] CatBoost     → ${v3.toUpperCase()} (weight: ${w3})`);
+            
+            // Voter 4: RandomForest
+            const v4=predictRandomForest(state.ml_models.random_forest,features);
+            const w4=weights.random_forest||10;
+            votes[v4]+=w4;
+            votes.details.push({model:'RandomForest',vote:v4,weight:w4});
+            log(`  [4] RandomForest → ${v4.toUpperCase()} (weight: ${w4})`);
+            
+            // Voter 5: Logistic
+            const v5=predictLogistic(state.ml_models.logistic,features);
+            const w5=weights.logistic||10;
+            votes[v5]+=w5;
+            votes.details.push({model:'Logistic',vote:v5,weight:w5});
+            log(`  [5] Logistic     → ${v5.toUpperCase()} (weight: ${w5})`);
+            
+            // Voter 6: SVM
+            const v6=predictSVM(state.ml_models.svm,features);
+            const w6=weights.svm||10;
+            votes[v6]+=w6;
+            votes.details.push({model:'SVM',vote:v6,weight:w6});
+            log(`  [6] SVM          → ${v6.toUpperCase()} (weight: ${w6})`);
+            
+            // Voter 7: CNN-1D
+            const v7=predictCNN1D(state.ml_models.cnn1d,features);
+            const w7=weights.cnn1d||10;
+            votes[v7]+=w7;
+            votes.details.push({model:'CNN-1D',vote:v7,weight:w7});
+            log(`  [7] CNN-1D       → ${v7.toUpperCase()} (weight: ${w7})`);
+            
+            // Voter 8: LSTM
+            const v8=predictLSTM(state.ml_models.lstm,features);
+            const w8=weights.lstm||10;
+            votes[v8]+=w8;
+            votes.details.push({model:'LSTM',vote:v8,weight:w8});
+            log(`  [8] LSTM         → ${v8.toUpperCase()} (weight: ${w8})`);
+            
+            // Voter 9: CNN-LSTM
+            const v9=predictCNNLSTM(state.ml_models.cnn_lstm,features);
+            const w9=weights.cnn_lstm||10;
+            votes[v9]+=w9;
+            votes.details.push({model:'CNN-LSTM',vote:v9,weight:w9});
+            log(`  [9] CNN-LSTM     → ${v9.toUpperCase()} (weight: ${w9})`);
+            
+            // Voter 10: TFT
+            const v10=predictTFT(state.ml_models.tft,features);
+            const w10=weights.tft||10;
+            votes[v10]+=w10;
+            votes.details.push({model:'TFT',vote:v10,weight:w10});
+            log(`  [10] TFT         → ${v10.toUpperCase()} (weight: ${w10})`);
+            
+            // Voter 11: HMM
+            const v11=predictHMM(state.ml_models.hmm,features);
+            const w11=weights.hmm||10;
+            votes[v11]+=w11;
+            votes.details.push({model:'HMM',vote:v11,weight:w11});
+            const hmmNote=w11===0?" ⚠️ silenced but voting":"";
+            log(`  [11] HMM         → ${v11.toUpperCase()} (weight: ${w11})${hmmNote}`);
+            
+            log(`\n📊 Weighted Vote Totals:`);
+            log(`   LONG  = ${votes.long}`);
+            log(`   SHORT = ${votes.short}`);
             
             const majoritySide=votes.long>=votes.short?'long':'short';
             const majorityCount=Math.max(votes.long,votes.short);
             const minorityCount=Math.min(votes.long,votes.short);
             const confidenceBoost=majorityCount-minorityCount;
+            const totalVotes=votes.long+votes.short;
             
-            log(`✅ DECISION: ${majoritySide.toUpperCase()} +${confidenceBoost} (${(majorityCount/11*100).toFixed(1)}% agree)`);
+            log(`✅ DECISION: ${majoritySide.toUpperCase()} +${confidenceBoost} (${(totalVotes > 0 ? (majorityCount/totalVotes*100) : 0).toFixed(1)}% by weight)`);
             if(majoritySide!==originalSide)log(`⚠️  SIDE FLIPPED: ${originalSide}→${majoritySide}`);
             log(`==========================================\n`);
             
-            return {ensemble_side:majoritySide,votes_long:votes.long,votes_short:votes.short,confidence_boost:confidenceBoost,agreement:(majorityCount/11).toFixed(2),details:votes.details};
+            return {ensemble_side:majoritySide,votes_long:votes.long,votes_short:votes.short,confidence_boost:confidenceBoost,agreement:(totalVotes > 0 ? (majorityCount/totalVotes) : 0).toFixed(2),details:votes.details,original_side:originalSide};
           }
+
+          function learnFromClosedTrades(state){
+            const unlearned=(state.closed||[]).filter(c=>
+              c.reconciliation==="exchange_trade_history" &&
+              c.ml_ensemble?.details &&
+              !c.weights_learned
+            );
+            
+            if(!unlearned.length){
+              log("📚 No closed trades to learn weights from.");
+              return;
+            }
+            
+            log(`\n📚 ===== LEARNING WEIGHTS FROM ${unlearned.length} CLOSED TRADES =====`);
+            
+            if(!state.ml_model_weights) state.ml_model_weights={
+              original_side:13,xgboost:10,lightgbm:10,catboost:10,random_forest:10,
+              logistic:10,svm:10,cnn1d:10,lstm:10,cnn_lstm:10,tft:10,hmm:10
+            };
+            if(!state.ml_weight_history) state.ml_weight_history=[];
+            
+            for(const c of unlearned){
+              const pnl=c.pnl_bps||0;
+              const tradeSide=c.side;
+              const correctSide=pnl>0 ? tradeSide : (tradeSide==="long"?"short":"long");
+              
+              log(`\n📊 Trade: ${c.symbolFull||c.symbol} ${tradeSide.toUpperCase()} pnl=${pnl}bps`);
+              log(`   ${pnl>0?"✅ PROFITABLE":"❌ LOSS"} → correct_side = ${correctSide.toUpperCase()}`);
+              log(`\n   📊 Weight Updates:`);
+              
+              const updates=[];
+              const weights=state.ml_model_weights;
+              
+              // Process all 12 voters
+              const allVotes=[
+                {model:"Original_Side", vote:c.ml_ensemble.original_side},
+                ...c.ml_ensemble.details
+              ];
+              
+              for(const v of allVotes){
+                const model=v.model.toLowerCase().replace(/\s/g,"_").replace(/[^a-z_]/g,"");
+                const before=weights[model]||10;
+                const votedSide=v.vote;
+                const correct=(votedSide===correctSide);
+                const after=correct 
+                  ? Math.min(20, before+1)
+                  : Math.max(0, before-1);
+                
+                weights[model]=after;
+                
+                const emoji=correct?"✅":"❌";
+                const arrow=after>before?"↗": (after < before ? "↘" : "→");
+                const note=(before===0&&after===1)?"🎉 REDEEMED!":"";
+                log(`   ${emoji} ${v.model.padEnd(15)} voted ${votedSide.toUpperCase().padEnd(5)} ${before} ${arrow} ${after} ${note}`);
+                
+                updates.push({
+                  voter:model,
+                  vote:votedSide,
+                  before,
+                  after,
+                  correct
+                });
+              }
+              
+              c.weights_learned=true;
+              c.weights_learned_at=Date.now();
+              
+              state.ml_weight_history.push({
+                ts:new Date().toISOString(),
+                ts_ms:Date.now(),
+                trade:`${c.symbolFull} ${tradeSide.toUpperCase()} ${pnl>0?"+":""}${pnl}bps`,
+                correct_side:correctSide,
+                updates
+              });
+            }
+            
+            if(state.ml_weight_history.length>100) state.ml_weight_history=state.ml_weight_history.slice(-100);
+            
+            log(`\n📊 Updated Weight Summary:`);
+            const weights=state.ml_model_weights;
+            const sorted=Object.entries(weights).sort((a,b)=>b[1]-a[1]);
+            for(const [model,weight] of sorted){
+              const star=weight>=18?"⭐":"";
+              const warn=weight<=2?"⚠️":"";
+              log(`   ${model.padEnd(15)}: ${String(weight).padStart(2)} ${star}${warn}`);
+            }
+            
+            log(`\n✅ Weight learning complete. Saved to state.`);
+          }
+
           function getSymbolAdj(state, base) {
             const real = state.sym_stats_real?.[base];
             const s = real || state.sym_stats?.[base];
@@ -1015,13 +1501,13 @@ jobs:
                 realized:{ tp_hit:exit_reason==="tp", sl_hit:exit_reason==="sl", ttl_exit:exit_reason==="ttl", max_favorable_excursion_bps:mfe, max_adverse_excursion_bps:mae }
               };
             }catch(e){ return { status:"sim_error", error:e?.message||String(e), closed:false }; }
-          }
-          
+          }   
           // ---------- Main ----------
           let reason="ok", selectionTier="confidence";
           try{
             const { state, persist } = await loadState();
             learnFromGistRealFills(state);
+            learnFromClosedTrades(state); // ⭐ NEW: Learn adaptive weights
             const calibHealth = validateCalibration(state);
 
             // Heartbeat existing pending
@@ -1309,6 +1795,9 @@ jobs:
             // Just in case refined was tiny, ensure we never exceed target
             if (selected.length > TARGET_TOP_N) selected.splice(TARGET_TOP_N);
 
+            log(`🔴 DEBUG CHECKPOINT: About to apply ML ensemble. selected.length=${selected.length}`);
+            log(`🔴 First pick:`, selected[0]?.symbol, selected[0]?.confidence);
+
             // ========== APPLY ML ENSEMBLE VOTING ==========
             log(`\n🤖 ===== APPLYING ML ENSEMBLE TO TOP 10 PICKS =====`);
 
@@ -1340,18 +1829,21 @@ jobs:
                 pick.tfAlign||0
               );
               
-              const ensemble=await mlEnsembleVote(pick.symbol,features,pick.side,state);
-              
               const oldSide=pick.side;
+              const ensemble=await mlEnsembleVote(pick.symbol,features,oldSide,state);
+              
               const oldConf=pick.confidence;
               
               pick.side=ensemble.ensemble_side;
               pick.confidence+=ensemble.confidence_boost;
+              ensemble.original_side = oldSide;
               pick.ml_ensemble=ensemble;
               pick.ml_features=features;
               
               log(`  📝 RESULT: side=${oldSide}→${pick.side}, conf=${oldConf}→${pick.confidence} (+${ensemble.confidence_boost})`);
             }
+
+            log(`🟢 DEBUG CHECKPOINT: ML ensemble complete. selected[0].confidence=${selected[0]?.confidence}`);
 
             log(`\n✅ ML ensemble complete. Re-sorting...`);
             selected.sort((a,b)=>b.confidence-a.confidence);
@@ -1362,8 +1854,48 @@ jobs:
               log(`  ${i+1}. ${p.symbol} ${p.side.toUpperCase()} conf=${p.confidence} (${p.ml_ensemble?.votes_long}L/${p.ml_ensemble?.votes_short}S)`);
             }
 
+            // ⭐ NEW: Save voting record to Gist
+            log(`\n💾 Saving ML voting record to Gist...`);
+            if(!state.ml_voting_history) state.ml_voting_history=[];
+            const votingRecord={
+              ts: new Date().toISOString(),
+              ts_ms: Date.now(),
+              votes: selected.slice(0,10).map(p=>({
+                symbol: p.symbol,
+                original_side: p.ml_ensemble?.original_side || p.side,
+                final_side: p.side,
+                votes_long: p.ml_ensemble?.votes_long||0,
+                votes_short: p.ml_ensemble?.votes_short||0,
+                confidence_before: p.ml_ensemble ? (p.confidence - p.ml_ensemble.confidence_boost) : p.confidence,
+                confidence_after: p.confidence,
+                boost: p.ml_ensemble?.confidence_boost||0,
+                agreement_pct: p.ml_ensemble?.agreement||'0.00',
+                model_votes: p.ml_ensemble?.details||[]
+              }))
+            };
+            state.ml_voting_history.push(votingRecord);
+            if(state.ml_voting_history.length>20) state.ml_voting_history=state.ml_voting_history.slice(-20);
+
+            // Save to Gist BEFORE building picks
+            try {
+              const auditOut=buildAuditOutputs(state);
+              await saveState(persist, state, auditOut, 2, true);
+              log(`✅ ML voting record saved to Gist (${votingRecord.votes.length} votes)`);
+            } catch(e) {
+              log(`⚠️  Failed to save voting record:`, e?.message||e);
+            }
+
             // Risk weights via softmax of EV (unchanged)
             const wEv=softmax(selected.map(x=>x.exp_lcb_bps),20);
+
+            // Log sizing mode
+            if(FIXED_SIZE_BPS > 0) {
+              log(`\n💰 Using FIXED capital allocation: ${CAPITAL_PCT_PER_TRADE}% per trade (${FIXED_SIZE_BPS} bps)`);
+            } else if(Number(process.env.FORCE_SIZE_BPS||"0")>0) {
+              log(`\n💰 Using FORCE_SIZE_BPS: ${process.env.FORCE_SIZE_BPS} bps per trade`);
+            } else {
+              log(`\n💰 Using DYNAMIC risk-based sizing (max ${TARGET_PORT_RISK_BPS} bps portfolio risk)`);
+            }
 
             // Build full v2 ideas (all code2 semantics kept)
             let picksV2 = selected.map((x,i)=>{
@@ -1389,9 +1921,11 @@ jobs:
               const client_order_id = mkClientOrderId("mxu");
 
               const ttl = clamp(Math.round((x.hold_sec || 720)+i*12), TTL_MIN, TTL_MAX);
-              const size_bps = (Number(process.env.FORCE_SIZE_BPS||"0")>0)
-                  ? Math.round(Number(process.env.FORCE_SIZE_BPS))
-                  : (x.sl_bps>0?Math.min(220,Math.round((wEv[i]*TARGET_PORT_RISK_BPS/x.sl_bps)*100)):0);
+              const size_bps = FIXED_SIZE_BPS > 0 
+                  ? FIXED_SIZE_BPS  // Use fixed % if set
+                  : (Number(process.env.FORCE_SIZE_BPS||"0")>0)
+                      ? Math.round(Number(process.env.FORCE_SIZE_BPS))  // Fallback to old FORCE_SIZE_BPS
+                      : (x.sl_bps>0?Math.min(220,Math.round((wEv[i]*TARGET_PORT_RISK_BPS/x.sl_bps)*100)):0);  // Dynamic risk-based
 
               return {
                 idea_id, client_order_id,
