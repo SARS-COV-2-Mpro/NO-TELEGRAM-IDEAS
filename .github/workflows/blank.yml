@@ -45,7 +45,7 @@ jobs:
       ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
       MEXC_BASE: ${{ vars.MEXC_BASE }}
       FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}
-      CAPITAL_PCT_PER_TRADE: ${{ vars.CAPITAL_PCT_PER_TRADE }}  # ⭐ NEW: e.g., 10 for 10%
+      CAPITAL_PCT_PER_TRADE: ${{ vars.CAPITAL_PCT_PER_TRADE }}
 
       # New Confidence Model Knobs
       DIRECTION: ${{ vars.DIRECTION }}
@@ -72,16 +72,10 @@ jobs:
       SCHEMA_VERSION: ${{ vars.SCHEMA_VERSION }}
       GIT_SHA: ${{ github.sha }}
 
-        steps:
+    steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node 20
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          
-        steps:
       - name: Setup Node 20
         uses: actions/setup-node@v4
         with:
