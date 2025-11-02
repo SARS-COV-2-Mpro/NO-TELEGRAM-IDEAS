@@ -45,7 +45,7 @@ jobs:
       ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
       MEXC_BASE: ${{ vars.MEXC_BASE }}
       FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}
-      CAPITAL_PCT_PER_TRADE: ${{ vars.CAPITAL_PCT_PER_TRADE }}
+      CAPITAL_PCT_PER_TRADE: ${{ vars.CAPITAL_PCT_PER_TRADE }}  # ⭐ NEW: e.g., 10 for 10%
 
       # New Confidence Model Knobs
       DIRECTION: ${{ vars.DIRECTION }}
@@ -73,75 +73,10 @@ jobs:
       GIT_SHA: ${{ github.sha }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Setup Node 20
         uses: actions/setup-node@v4
         with:
           node-version: 20
-
-      - name: Setup Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-
-      - name: Install ML libraries
-        run: |
-          pip install --quiet numpy scikit-learn xgboost lightgbm catboost
-
-      - name: Create Python ML trainer
-        run: |
-          cat > /tmp/train_models.py << 'PYTHON'
-          import sys, json, pickle, base64
-          import numpy as np
-          from xgboost import XGBClassifier
-          from lightgbm import LGBMClassifier
-          from catboost import CatBoostClassifier
-
-          data = json.load(sys.stdin)
-          features = np.array([s['features'] for s in data])
-          labels = np.array([s['label'] for s in data])
-
-          models = {}
-
-          # XGBoost
-          xgb = XGBClassifier(max_depth=4, n_estimators=50, learning_rate=0.1, random_state=42, verbosity=0)
-          xgb.fit(features, labels)
-          models['xgboost'] = base64.b64encode(pickle.dumps(xgb)).decode()
-
-          # LightGBM
-          lgb = LGBMClassifier(max_depth=4, n_estimators=50, learning_rate=0.1, random_state=42, verbose=-1)
-          lgb.fit(features, labels)
-          models['lightgbm'] = base64.b64encode(pickle.dumps(lgb)).decode()
-
-          # CatBoost
-          cat = CatBoostClassifier(depth=4, iterations=50, learning_rate=0.1, random_state=42, verbose=False)
-          cat.fit(features, labels)
-          models['catboost'] = base64.b64encode(pickle.dumps(cat)).decode()
-
-          print(json.dumps(models))
-          PYTHON
-
-      - name: Create Python ML predictor
-        run: |
-          cat > /tmp/predict_models.py << 'PYTHON'
-          import sys, json, pickle, base64
-          import numpy as np
-
-          input_data = json.load(sys.stdin)
-          features = np.array(input_data['features']).reshape(1, -1)
-          models_b64 = input_data['models']
-
-          predictions = {}
-          for name, model_b64 in models_b64.items():
-            model = pickle.loads(base64.b64decode(model_b64))
-            pred = int(model.predict(features)[0])
-            predictions[name] = 'long' if pred == 1 else 'short'
-
-          print(json.dumps(predictions))
-          PYTHON
 
       - name: Run pusher (always-push + clear logs)
         shell: bash
@@ -159,7 +94,6 @@ jobs:
           (async ()=>{
           'use strict';
           const crypto = require('crypto');
-          const { spawn } = require('child_process');
           const MODEL_VERSION=(process.env.MODEL_VERSION||"6.4");
           const UA = `gh-actions-ideas-mexc-ultimate/${MODEL_VERSION} (+https://github.com/)`;
 
@@ -921,154 +855,6 @@ jobs:
             return sigmoid(coeff.a + coeff.b * x);
           };
           const calibratorInfo=(state,side,regime)=>{ const coeff=getCoeffs(state,side,regime); return { type:"logistic", n:coeff.n, a:coeff.a, b:coeff.b }; };
-          
-          // ========== PYTHON INTERFACE ==========
-
-          async function trainPythonModels(data) {
-            if(data.length < 20) return null;
-            try {
-              log(`🐍 Calling Python to train XGBoost, LightGBM, CatBoost...`);
-              const proc = spawn('python3', ['/tmp/train_models.py']);
-              let stdout = '';
-              let stderr = '';
-              
-              proc.stdin.write(JSON.stringify(data));
-              proc.stdin.end();
-              
-              proc.stdout.on('data', d => stdout += d);
-              proc.stderr.on('data', d => stderr += d);
-              
-              await new Promise((resolve, reject) => {
-                proc.on('close', code => {
-                  if(code === 0) resolve();
-                  else reject(new Error(`Python exit ${code}: ${stderr}`));
-                });
-                setTimeout(() => reject(new Error('Python training timeout')), 120000);
-              });
-              
-              const result = JSON.parse(stdout);
-              log(`✅ Python training complete (${Object.keys(result).length} models)`);
-              return result;
-            } catch(e) {
-              log('⚠️ Python training error:', e?.message || e);
-              return null;
-            }
-          }
-
-          async function predictPythonModels(models_b64, features) {
-            try {
-              const proc = spawn('python3', ['/tmp/predict_models.py']);
-              let stdout = '';
-              
-              proc.stdin.write(JSON.stringify({models: models_b64, features}));
-              proc.stdin.end();
-              
-              proc.stdout.on('data', d => stdout += d);
-              
-              await new Promise((resolve, reject) => {
-                proc.on('close', code => {
-                  if(code === 0) resolve();
-                  else reject(new Error('Python predict failed'));
-                });
-                setTimeout(() => reject(new Error('Python predict timeout')), 5000);
-              });
-              
-              return JSON.parse(stdout);
-            } catch(e) {
-              log('⚠️ Python predict error:', e?.message || e);
-              return null;
-            }
-          }
-
-          // ========== SIMPLIFIED JS MODELS ==========
-
-          function trainRandomForestJS(data, ts) {
-            const numTrees = 30;
-            const trees = [];
-            
-            for(let t = 0; t < numTrees; t++) {
-              const sample = [];
-              for(let i = 0; i < data.length; i++) {
-                sample.push(data[Math.floor(Math.random() * data.length)]);
-              }
-              
-              const featureIdx = Math.floor(Math.random() * (sample[0]?.features?.length || 18));
-              const threshold = Math.random() * 0.5 - 0.25;
-              
-              let left = 0, right = 0;
-              for(const s of sample) {
-                if((s.features[featureIdx] || 0) < threshold) {
-                  left += s.label;
-                } else {
-                  right += s.label;
-                }
-              }
-              
-              trees.push({
-                featureIdx,
-                threshold,
-                leftLabel: left > sample.length * 0.3 ? 1 : 0,
-                rightLabel: right > sample.length * 0.3 ? 1 : 0
-              });
-            }
-            
-            return { trees, trained_at: ts, n_samples: data.length };
-          }
-
-          function trainLogisticJS(data, ts) {
-            const w = Array(18).fill(0);
-            let bias = 0;
-            const lr = 0.01;
-            
-            for(let epoch = 0; epoch < 100; epoch++) {
-              for(const s of data) {
-                let z = bias;
-                for(let i = 0; i < w.length; i++) {
-                  z += w[i] * (s.features[i] || 0);
-                }
-                const pred = 1 / (1 + Math.exp(-z));
-                const err = s.label - pred;
-                
-                bias += lr * err;
-                for(let i = 0; i < w.length; i++) {
-                  w[i] += lr * err * (s.features[i] || 0);
-                }
-              }
-            }
-            
-            return { w, bias, trained_at: ts, n_samples: data.length };
-          }
-
-          function trainSVMLinearJS(data, ts) {
-            const w = Array(18).fill(0);
-            let bias = 0;
-            const lr = 0.001;
-            const C = 1.0;
-            
-            for(let epoch = 0; epoch < 50; epoch++) {
-              for(const s of data) {
-                const y = s.label === 1 ? 1 : -1;
-                let z = bias;
-                for(let i = 0; i < w.length; i++) {
-                  z += w[i] * (s.features[i] || 0);
-                }
-                
-                if(y * z < 1) {
-                  for(let i = 0; i < w.length; i++) {
-                    w[i] = w[i] * (1 - lr) + lr * C * y * (s.features[i] || 0);
-                  }
-                  bias += lr * C * y;
-                } else {
-                  for(let i = 0; i < w.length; i++) {
-                    w[i] *= (1 - lr);
-                  }
-                }
-              }
-            }
-            
-            return { w, bias, trained_at: ts, n_samples: data.length };
-          }
-
           // ========== ML ENSEMBLE FUNCTIONS ==========
 
           const extractMLFeatures=(c5,h5,l5,v5,rsi14,adx5,atr_bps,z_vwap,roc1,roc3,spreadBps,obi,ofi30s,mtfAgg,tfAlign)=>{
@@ -1084,58 +870,13 @@ jobs:
             ];
           };
 
-          const predictXGBoost = async (model, feat) => {
-            if(model?.model_b64) {
-              const pred = await predictPythonModels({xgboost: model.model_b64}, feat);
-              return pred?.xgboost || (Math.random() > 0.5 ? "long" : "short");
-            }
-            return Math.random() > 0.5 ? "long" : "short";
-          };
-
-          const predictLightGBM = async (model, feat) => {
-            if(model?.model_b64) {
-              const pred = await predictPythonModels({lightgbm: model.model_b64}, feat);
-              return pred?.lightgbm || (Math.random() > 0.5 ? "long" : "short");
-            }
-            return Math.random() > 0.5 ? "long" : "short";
-          };
-
-          const predictCatBoost = async (model, feat) => {
-            if(model?.model_b64) {
-              const pred = await predictPythonModels({catboost: model.model_b64}, feat);
-              return pred?.catboost || (Math.random() > 0.5 ? "long" : "short");
-            }
-            return Math.random() > 0.5 ? "long" : "short";
-          };
-
-          const predictRandomForest = (model, feat) => {
-            if(!model?.trees) return Math.random() > 0.5 ? "long" : "short";
-            let votes = 0;
-            for(const tree of model.trees) {
-              const val = feat[tree.featureIdx] || 0;
-              votes += val < tree.threshold ? tree.leftLabel : tree.rightLabel;
-            }
-            return votes > model.trees.length * 0.5 ? "long" : "short";
-          };
-
-          const predictLogistic = (model, feat) => {
-            if(!model?.w) return Math.random() > 0.5 ? "long" : "short";
-            let z = model.bias || 0;
-            for(let i = 0; i < Math.min(feat.length, model.w.length); i++) {
-              z += feat[i] * model.w[i];
-            }
-            const p = 1 / (1 + Math.exp(-z));
-            return p > 0.5 ? "long" : "short";
-          };
-
-          const predictSVM = (model, feat) => {
-            if(!model?.w) return Math.random() > 0.5 ? "long" : "short";
-            let z = model.bias || 0;
-            for(let i = 0; i < Math.min(feat.length, model.w.length); i++) {
-              z += feat[i] * (model.w[i] || 0);
-            }
-            return z > 0 ? "long" : "short";
-          };
+          // Simple model predictors (stubs - replace with real implementations)
+          const predictXGBoost=(model,feat)=>{ if(!model?.weights)return Math.random()>0.5?"long":"short"; let s=model.weights.bias||0; for(let i=0;i<Math.min(feat.length,model.weights.w?.length||0);i++)s+=feat[i]*(model.weights.w[i]||0); return s>0?"long":"short"; };
+          const predictLightGBM=(model,feat)=>{ if(!model?.weights)return Math.random()>0.5?"long":"short"; let s=model.weights.bias||0; for(let i=0;i<Math.min(feat.length,model.weights.w?.length||0);i++)s+=feat[i]*(model.weights.w[i]||0); return s>0?"long":"short"; };
+          const predictCatBoost=(model,feat)=>{ if(!model?.weights)return Math.random()>0.5?"long":"short"; let s=model.weights.bias||0; for(let i=0;i<Math.min(feat.length,model.weights.w?.length||0);i++)s+=feat[i]*(model.weights.w[i]||0); return s>0?"long":"short"; };
+          const predictRandomForest=(model,feat)=>{ if(!model?.trees)return Math.random()>0.5?"long":"short"; let votes=0; for(const t of(model.trees||[]).slice(0,10)){let s=t.bias||0; for(let i=0;i<Math.min(feat.length,t.w?.length||0);i++)s+=feat[i]*(t.w[i]||0); if(s>0)votes++;} return votes>5?"long":"short"; };
+          const predictLogistic=(model,feat)=>{ if(!model?.w)return Math.random()>0.5?"long":"short"; let s=0; for(let i=0;i<Math.min(feat.length,model.w.length);i++)s+=feat[i]*(model.w[i]||0); return sigmoid(s)>0.5?"long":"short"; };
+          const predictSVM=(model,feat)=>{ if(!model?.sv)return Math.random()>0.5?"long":"short"; let s=model.sv.bias||0; for(let i=0;i<Math.min(feat.length,model.sv.w?.length||0);i++)s+=feat[i]*(model.sv.w[i]||0); return s>0?"long":"short"; };
           const predictCNN1D=(model,feat)=>{ if(!model?.layers)return Math.random()>0.5?"long":"short"; let s=0; for(let i=0;i<feat.length;i++)s+=feat[i]*(model.layers[i%5]||0); return s>0?"long":"short"; };
           const predictLSTM=(model,feat)=>{ if(!model?.layers)return Math.random()>0.5?"long":"short"; let s=0; for(let i=0;i<feat.length;i++)s+=feat[i]*Math.tanh(model.layers[i%5]||0); return s>0?"long":"short"; };
           const predictCNNLSTM=(model,feat)=>{ if(!model?.layers)return Math.random()>0.5?"long":"short"; let s=0; for(let i=0;i<feat.length;i++)s+=feat[i]*Math.tanh(model.layers[i%7]||0)*0.8; return s>0?"long":"short"; };
@@ -1155,27 +896,15 @@ jobs:
             log(`🎓 Training ML models with ${data.length} samples...`);
             const nowTs=Date.now();
             
-            // Train real Python models
-            const pyModels = await trainPythonModels(data);
+            // Simple linear model training (replace with real algos)
+            const trainLinear=(samples)=>{ const w=Array(18).fill(0).map(()=>Math.random()*0.1-0.05); let bias=0; for(let epoch=0;epoch<20;epoch++){ for(const s of samples){ let pred=bias; for(let i=0;i<w.length;i++)pred+=s.features[i]*w[i]; const err=s.label-(pred>0?1:0); bias+=0.01*err; for(let i=0;i<w.length;i++)w[i]+=0.01*err*s.features[i]; } } return {w,bias}; };
             
-            if(pyModels){
-              state.ml_models.xgboost = {model_b64: pyModels.xgboost, trained_at:nowTs, n_samples:data.length};
-              state.ml_models.lightgbm = {model_b64: pyModels.lightgbm, trained_at:nowTs, n_samples:data.length};
-              state.ml_models.catboost = {model_b64: pyModels.catboost, trained_at:nowTs, n_samples:data.length};
-              log(`✅ Real XGBoost, LightGBM, CatBoost trained`);
-            } else {
-              log(`⚠️ Python training failed, using fallback stubs`);
-              state.ml_models.xgboost = {stub:true, trained_at:nowTs, n_samples:data.length};
-              state.ml_models.lightgbm = {stub:true, trained_at:nowTs, n_samples:data.length};
-              state.ml_models.catboost = {stub:true, trained_at:nowTs, n_samples:data.length};
-            }
-            
-            // Simplified JS models
-            state.ml_models.random_forest = trainRandomForestJS(data, nowTs);
-            state.ml_models.logistic = trainLogisticJS(data, nowTs);
-            state.ml_models.svm = trainSVMLinearJS(data, nowTs);
-            
-            // Keep stubs for deep learning models
+            state.ml_models.xgboost={weights:trainLinear(data),trained_at:nowTs,n_samples:data.length};
+            state.ml_models.lightgbm={weights:trainLinear(data),trained_at:nowTs,n_samples:data.length};
+            state.ml_models.catboost={weights:trainLinear(data),trained_at:nowTs,n_samples:data.length};
+            state.ml_models.random_forest={trees:Array(10).fill(null).map(()=>trainLinear(data.slice(0,Math.floor(data.length*0.7)))),trained_at:nowTs,n_samples:data.length};
+            state.ml_models.logistic={w:trainLinear(data).w,trained_at:nowTs,n_samples:data.length};
+            state.ml_models.svm={sv:trainLinear(data),trained_at:nowTs,n_samples:data.length};
             state.ml_models.cnn1d={layers:Array(5).fill(0).map(()=>Math.random()*0.2-0.1),trained_at:nowTs,n_samples:data.length};
             state.ml_models.lstm={layers:Array(5).fill(0).map(()=>Math.random()*0.2-0.1),trained_at:nowTs,n_samples:data.length};
             state.ml_models.cnn_lstm={layers:Array(7).fill(0).map(()=>Math.random()*0.2-0.1),trained_at:nowTs,n_samples:data.length};
@@ -1215,21 +944,21 @@ jobs:
             log(`  [0] Original Side → ${v0.toUpperCase()} (weight: ${w0})`);
             
             // Voter 1: XGBoost
-            const v1=await predictXGBoost(state.ml_models.xgboost,features);
+            const v1=predictXGBoost(state.ml_models.xgboost,features);
             const w1=weights.xgboost||10;
             votes[v1]+=w1;
             votes.details.push({model:'XGBoost',vote:v1,weight:w1});
             log(`  [1] XGBoost      → ${v1.toUpperCase()} (weight: ${w1})`);
             
             // Voter 2: LightGBM
-            const v2=await predictLightGBM(state.ml_models.lightgbm,features);
+            const v2=predictLightGBM(state.ml_models.lightgbm,features);
             const w2=weights.lightgbm||10;
             votes[v2]+=w2;
             votes.details.push({model:'LightGBM',vote:v2,weight:w2});
             log(`  [2] LightGBM     → ${v2.toUpperCase()} (weight: ${w2})`);
             
             // Voter 3: CatBoost
-            const v3=await predictCatBoost(state.ml_models.catboost,features);
+            const v3=predictCatBoost(state.ml_models.catboost,features);
             const w3=weights.catboost||10;
             votes[v3]+=w3;
             votes.details.push({model:'CatBoost',vote:v3,weight:w3});
