@@ -72,7 +72,16 @@ jobs:
       SCHEMA_VERSION: ${{ vars.SCHEMA_VERSION }}
       GIT_SHA: ${{ github.sha }}
 
-    steps:
+        steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          
+        steps:
       - name: Setup Node 20
         uses: actions/setup-node@v4
         with:
