@@ -1,8 +1,6 @@
 name: Ideas Pusher (MEXC Ultimate 7.7.7)
 
 on:
-  schedule:
-    - cron: "0 */3 * * *"
   repository_dispatch:
     types: [run_B]
   workflow_dispatch: {}
@@ -1297,6 +1295,7 @@ jobs:
                           const err = y_signed[i] - output;
                           b2 += lr * err;
                           for (let h = 0; h < hidden_size; h++) {
+                              w2[h] += lr * err * hidden[h];
                               if (hidden[h] > 0) {
                                   const delta_h = err * w2[h];
                                   b1[h] += lr * delta_h;
