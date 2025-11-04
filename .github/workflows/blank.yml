@@ -1057,7 +1057,7 @@ jobs:
             
             return score >= 0 ? "long" : "short";
           };
-// 11. Momentum (Rule-based)
+          // 11. Momentum (Rule-based)
           const predictMomentum = (model, feat) => {
             // feat indices: [roc1, roc3, atr_bps, rsi, adx, z_vwap, ...]
             const roc1 = feat[0] || 0;
