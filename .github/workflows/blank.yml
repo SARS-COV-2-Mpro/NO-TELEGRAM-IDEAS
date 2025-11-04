@@ -490,6 +490,7 @@ jobs:
                 "Momentum": 10,
                 "HMM": 10
               };
+              if(!s.model_weights_prev)s.model_weights_prev={};
 
               return { state:s, persist:{ id, token, etag } };
             }catch(e){ log("loadState warn", e?.message||e); return { state:init, persist:null }; }
@@ -1057,7 +1058,7 @@ jobs:
             
             return score >= 0 ? "long" : "short";
           };
-          // 11. Momentum (Rule-based)
+// 11. Momentum (Rule-based)
           const predictMomentum = (model, feat) => {
             // feat indices: [roc1, roc3, atr_bps, rsi, adx, z_vwap, ...]
             const roc1 = feat[0] || 0;
@@ -1118,49 +1119,49 @@ jobs:
             log(`🎓 Training 12 ML models with ${n} samples...`);
             const nowTs = Date.now();
             
-            // Shared tree builder for all tree-based models
-            const buildTree = (X_subset, y_subset, depth = 0, max_depth = 5) => {
-              if (depth >= max_depth || X_subset.length < 5) {
-                return { type: 'leaf', value: mean(y_subset.map(v => v === 1 ? 1 : -1)) };
-              }
+// Shared tree builder for all tree-based models
+const buildTree = (X_subset, y_subset, depth = 0, max_depth = 5) => {
+  if (depth >= max_depth || X_subset.length < 5) {
+    return { type: 'leaf', value: mean(y_subset.map(v => v === 1 ? 1 : -1)) };
+  }
   
-              // Find best split (minimize impurity)
-              let best_gain = Infinity, best_feature = 0, best_threshold = 0;
+  // Find best split (minimize impurity)
+  let best_gain = Infinity, best_feature = 0, best_threshold = 0;
   
-              for (let f = 0; f < X_subset[0].length; f++) {
-                const values = X_subset.map(x => x[f]).sort((a, b) => a - b);
-                const threshold = values[Math.floor(values.length / 2)];
+  for (let f = 0; f < X_subset[0].length; f++) {
+    const values = X_subset.map(x => x[f]).sort((a, b) => a - b);
+    const threshold = values[Math.floor(values.length / 2)];
     
-                const left_y = y_subset.filter((_, i) => X_subset[i][f] < threshold);
-                const right_y = y_subset.filter((_, i) => X_subset[i][f] >= threshold);
+    const left_y = y_subset.filter((_, i) => X_subset[i][f] < threshold);
+    const right_y = y_subset.filter((_, i) => X_subset[i][f] >= threshold);
     
-                if (left_y.length === 0 || right_y.length === 0) continue;
+    if (left_y.length === 0 || right_y.length === 0) continue;
     
-                const gain = left_y.length * std(left_y) + right_y.length * std(right_y);
-                if (gain < best_gain) {
-                  best_gain = gain;
-                  best_feature = f;
-                  best_threshold = threshold;
-                }
-              }
+    const gain = left_y.length * std(left_y) + right_y.length * std(right_y);
+    if (gain < best_gain) {
+      best_gain = gain;
+      best_feature = f;
+      best_threshold = threshold;
+    }
+  }
   
-              if (best_gain === Infinity) {
-                return { type: 'leaf', value: mean(y_subset.map(v => v === 1 ? 1 : -1)) };
-              }
+  if (best_gain === Infinity) {
+    return { type: 'leaf', value: mean(y_subset.map(v => v === 1 ? 1 : -1)) };
+  }
   
-              const left_X = X_subset.filter((x) => x[best_feature] < best_threshold);
-              const left_y = y_subset.filter((_, i) => X_subset[i][best_feature] < best_threshold);
-              const right_X = X_subset.filter((x) => x[best_feature] >= best_threshold);
-              const right_y = y_subset.filter((_, i) => X_subset[i][best_feature] >= best_threshold);
+  const left_X = X_subset.filter((x) => x[best_feature] < best_threshold);
+  const left_y = y_subset.filter((_, i) => X_subset[i][best_feature] < best_threshold);
+  const right_X = X_subset.filter((x) => x[best_feature] >= best_threshold);
+  const right_y = y_subset.filter((_, i) => X_subset[i][best_feature] >= best_threshold);
   
-              return {
-                type: 'split',
-                feature: best_feature,
-                threshold: best_threshold,
-                left: buildTree(left_X, left_y, depth + 1, max_depth),
-                right: buildTree(right_X, right_y, depth + 1, max_depth)
-              };
-            };
+  return {
+    type: 'split',
+    feature: best_feature,
+    threshold: best_threshold,
+    left: buildTree(left_X, left_y, depth + 1, max_depth),
+    right: buildTree(right_X, right_y, depth + 1, max_depth)
+  };
+};
             // Prepare X (features) and y (labels: 1 for long/win, 0 for short/loss)
             const X = data.map(d => d.features);
             const y = data.map(d => d.label); // 1 or 0
@@ -1367,26 +1368,37 @@ jobs:
           async function mlEnsembleVote(symbol, features, originalSide, state) {
             const weights = state.model_weights || {};
             
+            // 🛡️ Bulletproof weight getter (handles ALL edge cases)
+            const getWeight = (model) => {
+              const w = weights[model];
+              // Only accept valid numbers in [0, 20]
+              if (typeof w === 'number' && Number.isFinite(w) && w >= 0 && w <= 20) {
+                return w;
+              }
+              // Fallback to 10 for anything invalid
+              return 10;
+            };
+            
             log(`\n========== ML ENSEMBLE: ${symbol} ==========`);
             log(`Original side: ${originalSide}`);
-            log(`📊 Current weights:`, Object.entries(weights).sort((a,b)=>b[1]-a[1]).map(([m,w])=>`${m}:${w}`).join(", "));
+            log(`📊 Current weights:`, Object.entries(weights).sort((a,b)=>b[1]-a[1]).map(([m,w])=>`${m}:${getWeight(m)}`).join(", "));
             
             let longScore = 0;
             let shortScore = 0;
             const details = [];
-            const votes = {}; // for learning: {model: "long"/"short"}
+            const votes = {};
             
-            // Voter 0: Original Side Selection
-            const w0 = weights["Original"] || 10;
+            // Voter 0: Original
+            const w0 = getWeight("Original");
             if (originalSide === "long") longScore += w0;
             else shortScore += w0;
             details.push({ model: "Original", vote: originalSide, weight: w0 });
             votes["Original"] = originalSide;
             log(`  [0] Original           → ${originalSide.toUpperCase()} (w=${w0})`);
             
-            // Voter 1: Logistic Regression
+            // Voter 1: Logistic
             const v1 = predictLogistic(state.ml_models.logistic, features);
-            const w1 = weights["Logistic"] || 10;
+            const w1 = getWeight("Logistic");
             if (v1 === "long") longScore += w1;
             else shortScore += w1;
             details.push({ model: "Logistic", vote: v1, weight: w1 });
@@ -1395,7 +1407,7 @@ jobs:
             
             // Voter 2: Naive Bayes
             const v2 = predictNaiveBayes(state.ml_models.naivebayes, features);
-            const w2 = weights["NaiveBayes"] || 10;
+            const w2 = getWeight("NaiveBayes");
             if (v2 === "long") longScore += w2;
             else shortScore += w2;
             details.push({ model: "NaiveBayes", vote: v2, weight: w2 });
@@ -1404,7 +1416,7 @@ jobs:
             
             // Voter 3: k-NN
             const v3 = predictKNN(state.ml_models.knn, features);
-            const w3 = weights["KNN"] || 10;
+            const w3 = getWeight("KNN");
             if (v3 === "long") longScore += w3;
             else shortScore += w3;
             details.push({ model: "KNN", vote: v3, weight: w3 });
@@ -1413,7 +1425,7 @@ jobs:
             
             // Voter 4: Perceptron
             const v4 = predictPerceptron(state.ml_models.perceptron, features);
-            const w4 = weights["Perceptron"] || 10;
+            const w4 = getWeight("Perceptron");
             if (v4 === "long") longScore += w4;
             else shortScore += w4;
             details.push({ model: "Perceptron", vote: v4, weight: w4 });
@@ -1422,7 +1434,7 @@ jobs:
             
             // Voter 5: Decision Tree
             const v5 = predictDecisionTree(state.ml_models.decisiontree, features);
-            const w5 = weights["DecisionTree"] || 10;
+            const w5 = getWeight("DecisionTree");
             if (v5 === "long") longScore += w5;
             else shortScore += w5;
             details.push({ model: "DecisionTree", vote: v5, weight: w5 });
@@ -1431,7 +1443,7 @@ jobs:
             
             // Voter 6: Random Forest
             const v6 = predictRandomForest(state.ml_models.randomforest, features);
-            const w6 = weights["RandomForest"] || 10;
+            const w6 = getWeight("RandomForest");
             if (v6 === "long") longScore += w6;
             else shortScore += w6;
             details.push({ model: "RandomForest", vote: v6, weight: w6 });
@@ -1440,7 +1452,7 @@ jobs:
             
             // Voter 7: Gradient Boosting
             const v7 = predictGradientBoosting(state.ml_models.gradientboosting, features);
-            const w7 = weights["GradientBoosting"] || 10;
+            const w7 = getWeight("GradientBoosting");
             if (v7 === "long") longScore += w7;
             else shortScore += w7;
             details.push({ model: "GradientBoosting", vote: v7, weight: w7 });
@@ -1449,7 +1461,7 @@ jobs:
             
             // Voter 8: XGBoost-lite
             const v8 = predictXGBoost(state.ml_models.xgboost, features);
-            const w8 = weights["XGBoost"] || 10;
+            const w8 = getWeight("XGBoost");
             if (v8 === "long") longScore += w8;
             else shortScore += w8;
             details.push({ model: "XGBoost", vote: v8, weight: w8 });
@@ -1458,7 +1470,7 @@ jobs:
             
             // Voter 9: Neural Net
             const v9 = predictNeuralNet(state.ml_models.neuralnet, features);
-            const w9 = weights["NeuralNet"] || 10;
+            const w9 = getWeight("NeuralNet");
             if (v9 === "long") longScore += w9;
             else shortScore += w9;
             details.push({ model: "NeuralNet", vote: v9, weight: w9 });
@@ -1467,7 +1479,7 @@ jobs:
             
             // Voter 10: Mean Reversion
             const v10 = predictMeanReversion(state.ml_models.meanreversion, features);
-            const w10 = weights["MeanReversion"] || 10;
+            const w10 = getWeight("MeanReversion");
             if (v10 === "long") longScore += w10;
             else shortScore += w10;
             details.push({ model: "MeanReversion", vote: v10, weight: w10 });
@@ -1476,7 +1488,7 @@ jobs:
             
             // Voter 11: Momentum
             const v11 = predictMomentum(state.ml_models.momentum, features);
-            const w11 = weights["Momentum"] || 10;
+            const w11 = getWeight("Momentum");
             if (v11 === "long") longScore += w11;
             else shortScore += w11;
             details.push({ model: "Momentum", vote: v11, weight: w11 });
@@ -1485,7 +1497,7 @@ jobs:
             
             // Voter 12: HMM
             const v12 = predictHMM(state.ml_models.hmm, features);
-            const w12 = weights["HMM"] || 10;
+            const w12 = getWeight("HMM");
             if (v12 === "long") longScore += w12;
             else shortScore += w12;
             details.push({ model: "HMM", vote: v12, weight: w12 });
@@ -1497,7 +1509,7 @@ jobs:
             const majoritySide = longScore >= shortScore ? 'long' : 'short';
             const confidenceBoost = Math.round(Math.abs(longScore - shortScore) / 10); // scale down
             const totalWeight = longScore + shortScore;
-            const agreement = (Math.max(longScore, shortScore) / totalWeight).toFixed(2);
+            const agreement = (Math.max(longScore, shortScore) / (totalWeight || 1)).toFixed(2);
             
             log(`✅ DECISION: ${majoritySide.toUpperCase()} (${(agreement*100).toFixed(1)}% weighted agreement)`);
             if (majoritySide !== originalSide) {
@@ -1512,7 +1524,7 @@ jobs:
               confidence_boost: confidenceBoost,
               agreement: agreement,
               details: details,
-              votes: votes // ⭐ CRITICAL: Store for learning
+              votes: votes
             };
           }
           function getSymbolAdj(state, base) {
@@ -1658,35 +1670,52 @@ jobs:
                 const wrong = [];
                 
                 for (const [model, votedSide] of Object.entries(votes)) {
-                  const currentWeight = state.model_weights[model];
-                  const isValid = (
-                    typeof currentWeight === 'number' &&
-                    Number.isFinite(currentWeight) &&
-                    currentWeight >= 0 &&
-                    currentWeight <= 20
-                  );
-                  if (!isValid) {
-                    state.model_weights[model] = 10;
-                  }
-                  
-                  const oldWeight = state.model_weights[model];
-                  let newWeight = oldWeight;
-                  
-                  // Model was correct if:
-                  // - Voted for taken side AND trade won
-                  // - Voted against taken side AND trade lost
-                  const votedForTakenSide = (votedSide === takenSide);
-                  const wasCorrect = (votedForTakenSide && isWin) || (!votedForTakenSide && !isWin);
-                  
-                  if (wasCorrect) {
-                    newWeight = Math.min(20, oldWeight + 1);
-                    correct.push(`${model}(${oldWeight}→${newWeight})`);
-                  } else {
-                    newWeight = Math.max(0, oldWeight - 1);
-                    wrong.push(`${model}(${oldWeight}→${newWeight})`);
-                  }
-                  
-                  state.model_weights[model] = Math.max(0, Math.min(20, newWeight));
+                    // Ensure model_weights_prev exists for safety
+                    if (!state.model_weights_prev) state.model_weights_prev = {};
+                    
+                    const cur = state.model_weights[model];
+                    const prev = state.model_weights_prev[model];
+
+                    const isValid = (w) => (
+                        typeof w === 'number' && Number.isFinite(w) && w >= 0 && w <= 20
+                    );
+
+                    // 1. Sanitize the current weight before using it.
+                    // If current is bad, try to restore from `prev`. If `prev` is also bad, reset to 10.
+                    if (!isValid(cur)) {
+                        const fallback = isValid(prev) ? prev : 10;
+                        log(`⚠️  Corrupted/missing weight for ${model}: ${cur}, restoring to ${fallback}`);
+                        state.model_weights[model] = fallback;
+                    }
+
+                    // `oldWeight` is now guaranteed to be a valid number.
+                    const oldWeight = state.model_weights[model];
+                    let newWeight = oldWeight;
+
+                    // 2. Calculate the new weight based on correctness.
+                    const votedForTakenSide = (votedSide === takenSide);
+                    const wasCorrect = (votedForTakenSide && isWin) || (!votedForTakenSide && !isWin);
+
+                    if (wasCorrect) {
+                        newWeight = oldWeight + 1;
+                    } else {
+                        newWeight = oldWeight - 1;
+                    }
+
+                    // 3. Clamp the new weight to its valid range.
+                    newWeight = Math.max(0, Math.min(20, newWeight));
+                    
+                    // 4. Log the result.
+                    if (wasCorrect) {
+                        correct.push(`${model}(${oldWeight}→${newWeight})`);
+                    } else {
+                        wrong.push(`${model}(${oldWeight}→${newWeight})`);
+                    }
+                    
+                    // 5. Assign the validated, clamped new weight and update history.
+                    // The `newWeight` is guaranteed to be valid at this point.
+                    state.model_weights[model] = newWeight;
+                    state.model_weights_prev[model] = newWeight; // Update history
                 }
                 
                 if (correct.length > 0) {
