@@ -406,7 +406,12 @@ jobs:
                 "Perceptron": 10, "DecisionTree": 10, "RandomForest": 10,
                 "NeuralNet": 10, "MeanReversion": 10, "Momentum": 10
               },
-              model_weights_prev:{}
+              model_weights_prev:{},
+              model_performance:{
+                "Original": {wins:0, total:0}, "Logistic": {wins:0, total:0}, "NaiveBayes": {wins:0, total:0}, "KNN": {wins:0, total:0},
+                "Perceptron": {wins:0, total:0}, "DecisionTree": {wins:0, total:0}, "RandomForest": {wins:0, total:0},
+                "NeuralNet": {wins:0, total:0}, "MeanReversion": {wins:0, total:0}, "Momentum": {wins:0, total:0}
+              }
             };
 
             if(!token||!id) return { state:init, persist:null };
@@ -440,6 +445,13 @@ jobs:
                 };
               }
               if(!s.model_weights_prev)s.model_weights_prev={};
+              if(!s.model_performance){
+                s.model_performance={
+                  "Original": {wins:0, total:0}, "Logistic": {wins:0, total:0}, "NaiveBayes": {wins:0, total:0}, "KNN": {wins:0, total:0},
+                  "Perceptron": {wins:0, total:0}, "DecisionTree": {wins:0, total:0}, "RandomForest": {wins:0, total:0},
+                  "NeuralNet": {wins:0, total:0}, "MeanReversion": {wins:0, total:0}, "Momentum": {wins:0, total:0}
+                };
+              }
 
               return { state:s, persist:{ id, token, etag } };
             }catch(e){ log("loadState warn", e?.message||e); return { state:init, persist:null }; }
@@ -465,6 +477,9 @@ jobs:
             merged.cooldown_side = local.cooldown_side || {};
             merged.mr_lockout = local.mr_lockout || {};
             merged.calibCoeffs = local.calibCoeffs || remote.calibCoeffs || {};
+
+            // ADDED: Merge performance data
+            merged.model_performance = remote.model_performance || local.model_performance || {};
 
             const keyClosed = (c) => { const cid = c?.trade_details?.client_order_id || c.client_order_id || c.idea_id || ""; const tx  = c?.ts_exit_ms || c?.exit_ts_ms || ""; return `${cid}|${tx}`; };
             const localClosedMap = new Map((local.closed||[]).map(c => [keyClosed(c), c]));
@@ -630,7 +645,11 @@ jobs:
               if (!learnable.length) { log("🎯 No new votes to learn from this cycle"); return; }
               
               log(`\n🎯 ===== LEARNING WEIGHTS FROM ${learnable.length} CLOSED TRADES =====`);
-              log("📊 Weights BEFORE:", Object.entries(state.model_weights).sort((a,b)=>b[1]-a[1]).map(([m,w])=>`${m}:${w}`).join(", "));
+              log("📊 Weights BEFORE:", Object.entries(state.model_weights).sort((a,b)=>b[1]-a[1]).map(([m,w])=>{
+                const perf=state.model_performance?.[m]||{wins:0,total:0};
+                const wr=perf.total>0?(perf.wins/perf.total*100).toFixed(1):'0.0';
+                return `${m}:${w} WR=${wr}% (${perf.wins}/${perf.total})`;
+              }).join(", "));
               
               for (const trade of learnable) {
                 const isWin = (trade.pnl_bps || 0) > 0;
@@ -653,6 +672,12 @@ jobs:
                     const oldWeight = state.model_weights[model];
                     let newWeight = oldWeight;
                     const wasCorrect = ((votedSide === takenSide) && isWin) || ((votedSide !== takenSide) && !isWin);
+                    
+                    // ✅ ADDED: Track performance (doesn't affect weights)
+                    if(!state.model_performance[model]) state.model_performance[model]={wins:0,total:0};
+                    state.model_performance[model].total++;
+                    if(wasCorrect) state.model_performance[model].wins++;
+
                     if (wasCorrect) newWeight++; else newWeight--;
                     newWeight = Math.max(0, Math.min(20, newWeight));
                     
@@ -670,7 +695,11 @@ jobs:
                 trade.weights_learned_at = Date.now();
               }
               
-              log("\n📊 Weights AFTER:", Object.entries(state.model_weights).sort((a,b)=>b[1]-a[1]).map(([m,w])=>`${m}:${w}`).join(", "));
+              log("\n📊 Weights AFTER:", Object.entries(state.model_weights).sort((a,b)=>b[1]-a[1]).map(([m,w])=>{
+                const perf=state.model_performance?.[m]||{wins:0,total:0};
+                const wr=perf.total>0?(perf.wins/perf.total*100).toFixed(1):'0.0';
+                return `${m}:${w} WR=${wr}% (${perf.wins}/${perf.total})`;
+              }).join(", "));
               log("==========================================\n");
             }
             
