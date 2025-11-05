@@ -1,4 +1,4 @@
-name: Ideas Pusher (MEXC Ultimate 7.2 - Final Fixes)
+name: Ideas Pusher (MEXC Ultimate 7.7.7 - Pure Voting & Weighting)
 
 on:
   schedule:
@@ -86,6 +86,7 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Hard fail only on true misconfig (so setup problems aren't hidden)
           if [[ -z "${WORKER_PUSH_URL:-}" || -z "${PUSH_TOKEN:-}" ]]; then
             echo "[gha] Missing WORKER_PUSH_URL or PUSH_TOKEN"
             exit 1
@@ -96,7 +97,7 @@ jobs:
           (async ()=>{
           'use strict';
           const crypto = require('crypto');
-          const MODEL_VERSION=(process.env.MODEL_VERSION||"7.2-final-fixes");
+          const MODEL_VERSION=(process.env.MODEL_VERSION||"7.1-no-calib");
           const UA = `gh-actions-ideas-mexc-ultimate/${MODEL_VERSION} (+https://github.com/)`;
 
           // ---------------- Utils ----------------
@@ -117,7 +118,13 @@ jobs:
           const softmax=(arr,t=20)=>{ const m=Math.max(...arr,0); const ex=arr.map(x=>Math.exp((x-m)/t)); const s=ex.reduce((a,b)=>a+b,0)||1; return ex.map(x=>x/s); };
           const sigmoid=(z)=>1/(1+Math.exp(-z));
           const logit=(p)=>{ const eps=1e-6; const pp=Math.min(1-eps,Math.max(eps,p)); return Math.log(pp/(1-pp)); };
-          
+          let bmSpare=null;
+          const randn=()=>{ if(bmSpare!=null){ const v=bmSpare; bmSpare=null; return v; } let u=0,v=0; while(u===0) u=Math.random(); while(v===0) v=Math.random(); const r=Math.sqrt(-2*Math.log(u)); const th=2*Math.PI*v; bmSpare=r*Math.sin(th); return r*Math.cos(th); };
+          const randt=(df)=>{ if(df<=2) df=2.01; const z=randn(); let x2=0; for(let i=0;i<Math.floor(df);i++){ const z2=randn(); x2+=z2*z2; } const frac=df-Math.floor(df); if(frac>0){ const zf=randn(); x2+=frac*zf*zf; } const chi=x2||1e-6; return z / Math.sqrt(chi/df); };
+          const kalman1D=(obs,{q=1e-5,r=1e-3,x0=null,p0=1e-2}={})=>{ if(!obs?.length) return []; let x=(x0==null?obs[0]:x0), p=p0; const out=[]; for(const z of obs){ p+=q; const K=p/(p+r); x=x+K*(z-x); p=(1-K)*p; out.push(x); } return out; };
+          const pathEVHeavy=({entry,tp_bps,sl_bps,side,retSeries,mu,sigma,steps,N=192,cost_bps=10,t_df=5,boot_block=3})=>{ const up=(side==="long"), tpF=tp_bps/10000, slF=sl_bps/10000; let ev=0, wins=0; const rets=retSeries||[]; const boot1=()=>{ if(rets.length<8) return Array(steps).fill(0).map(()=> sigma*Math.sqrt(1/steps)*randn()); const out=[]; while(out.length<steps){ const start=Math.floor(Math.random()*(rets.length-boot_block)); for(let k=0;k<boot_block && out.length<steps;k++) out.push(rets[start+k]||0); } return out.slice(0,steps); }; for(let n=0;n<N;n++){ const mode=(n%2===0)?"t":"boot"; let S=entry, tp=up? entry*(1+tpF):entry*(1-tpF), sl=up? entry*(1-slF):entry*(1+slF); let pnl_bps=0,win=0; const rs=(mode==="t")? Array(steps).fill(0).map(()=> mu + sigma*randt(t_df)/Math.sqrt(steps)) : boot1(); for(let t=0;t<steps;t++){ S*=(1+rs[t]); if(up){ if(S>=tp){ pnl_bps=tp_bps-cost_bps; win=1; break;} if(S<=sl){ pnl_bps=-sl_bps-cost_bps; win=0; break;} } else { if(S<=tp){ pnl_bps=tp_bps-cost_bps; win=1; break;} if(S>=sl){ pnl_bps=-sl_bps-cost_bps; win=0; break;} } if(t===steps-1){ const ret=up? (S/entry-1):(entry/S-1); pnl_bps=Math.round(ret*10000)-cost_bps; win=pnl_bps>0?1:0; } } ev+=pnl_bps; wins+=win; } const p=wins/N, ev_mean=ev/N; return { p, ev_bps:Math.round(ev_mean) }; };
+
+          // ---------- New Helpers ----------
           const uuidv4=()=>{ try{ return crypto.randomUUID(); }catch{ const b=crypto.randomBytes(16); b[6]=(b[6]&0x0f)|0x40; b[8]=(b[8]&0x3f)|0x80; const h=b.toString("hex"); return [h.slice(0,8),h.slice(8,12),h.slice(12,16),h.slice(16,20),h.slice(20)].join("-"); } };
           const mkClientOrderId = (prefix="mxu") => {
             const raw = (crypto.randomUUID ? crypto.randomUUID() : uuidv4()).replace(/-/g, "");
@@ -127,27 +134,113 @@ jobs:
           const hashObj=(o)=>{ const norm=(x)=>{ if(x&&typeof x==="object"&&!Array.isArray(x)){ const ks=Object.keys(x).sort(); const y={}; for(const k of ks) y[k]=norm(x[k]); return y; } if(Array.isArray(x)) return x.map(norm); return x; }; const s=JSON.stringify(norm(o)); return crypto.createHash("sha256").update(s).digest("hex"); };
           const toCSVLine=(row,keys)=> keys.map(k=>{ let v=row?.[k]; if(v==null) return ""; if(typeof v==="object") v=JSON.stringify(v); const s=String(v); return s.includes(",")||s.includes("\n")||s.includes('"')? `"${s.replace(/"/g,'""')}"`: s; }).join(",");
 
+          const slopeBps=(arr,len=21)=>{ if(!arr?.length||arr.length<Math.max(5,len)) return 0; const s=arr.slice(-len); const n=s.length; const last=s[n-1]||1; const mx=(n-1)/2; let num=0,den=0; for(let i=0;i<n;i++){ const x=i, y=((s[i]||last)-last)/last*10000; num+=(x-mx)*y; den+=(x-mx)*(x-mx); } return den>0? num/den : 0; };
+
           const computeMTFIndicators=(km,weights)=>{ const TFs=["1m","3m","5m","15m","30m","1h","2h","4h","12h","1d"]; const wNorm=(()=>{ let out={}; let sw=0; for(const tf of TFs){ const w=+((weights&&weights[tf])||0); if(w>0){ out[tf]=w; sw+=w; } } if(sw<=0){ out={"1m":0.08,"3m":0.08,"5m":0.12,"15m":0.15,"30m":0.12,"1h":0.12,"2h":0.10,"4h":0.08,"12h":0.07,"1d":0.08}; sw=1; } for(const k of Object.keys(out)) out[k]=out[k]/sw; return out; })();
-            const perTF={}; const agg={ rsi:0, adx:0, atr_bps:0, roc1:0, roc3:0 }; let ww=0;
+            const perTF={}; const agg={ rsi:0, adx:0, atr_bps:0, roc1:0, roc3:0 }; let ww=0; const retSeries={};
             for(const tf of Object.keys(wNorm)){
               const k=km?.[tf]; if(!k?.length) continue;
               const c=k.map(x=>+x[4]), h=k.map(x=>+x[2]), l=k.map(x=>+x[3]);
-              perTF[tf]={ rsi:rsi(c,14)||50, adx:(computeADX_ATR(h,l,c,14)?.adx)||0 };
-              const w=wNorm[tf]; agg.rsi+=w*perTF[tf].rsi; agg.adx+=w*perTF[tf].adx; ww+=w;
+              const rsi14=rsi(c,14)||50;
+              const adx14=(computeADX_ATR(h,l,c,14)?.adx)||0;
+              const atr=(computeADX_ATR(h,l,c,14)?.atr)||0;
+              const atr_bps=Math.round((atr/(c.at(-1)||1))*10000);
+              const roc1=(c.at(-1)/(c.at(-2)||c.at(-1)) - 1);
+              const roc3=(c.at(-1)/(c.at(-4)||c.at(-1)) - 1);
+              perTF[tf]={ rsi:rsi14, adx:adx14, atr_bps, roc1, roc3, close:c.at(-1) };
+              const w=wNorm[tf]; agg.rsi+=w*rsi14; agg.adx+=w*adx14; agg.atr_bps+=w*atr_bps; agg.roc1+=w*roc1; agg.roc3+=w*roc3; ww+=w;
+              const rets=[]; for(let i=1;i<c.length;i++) rets.push(Math.log(c[i]/c[i-1])); retSeries[tf]=rets.slice(-120);
             }
-            if(ww<=0) return { agg:{ rsi:50, adx:0 }, tfAlign:0 };
-            return { agg, weights:wNorm };
+            if(ww<=0) return { agg:{ rsi:50, adx:0, atr_bps:0, roc1:0, roc3:0 }, tfAlign:0, perTF:{} };
+            const tfs=Object.keys(perTF); let pairs=0, acc=0;
+            for(let i=0;i<tfs.length;i++) for(let j=i+1;j<tfs.length;j++){ const a=retSeries[tfs[i]]||[], b=retSeries[tfs[j]]||[]; const r=corr(a,b); acc+=r; pairs++; }
+            const tfAlign=pairs>0? acc/pairs : 0;
+            return { agg, tfAlign, perTF, weights:wNorm };
           };
+
+          const getTradeFingerprint=(t)=>{ try{
+            const sym=(t.symbol||"").toUpperCase();
+            const side=(t.isBuyer===true||t.side==="BUY")?"B":"S";
+            const oid=t.orderId!=null?t.orderId:(t.orderID!=null?t.orderID:"");
+            const tid=t.id!=null?t.id:(t.tradeId!=null?t.tradeId:"");
+            const q=Math.round((+t.qty||+t.executedQty||0)*1e8);
+            const p=Math.round((+t.price||0)*1e8);
+            const cmA=(t.commissionAsset||t.cma||"").toUpperCase();
+            const mk=(t.isMaker===true)?"M":(t.isMaker===false)?"T":"?";
+            return [sym,side,oid,tid,q,p,cmA,mk].join(":");
+          }catch{ return String(t?.id||t?.orderId||Math.random()); } };
+
+          const DROPPABLE_STATUSES = new Set(["planned","placed","pending","queued","ready"]);
+
+          async function cleanupPendingBeforePlanning(state, heartbeat) {
+            let openAll = null;
+            try { openAll = await fetchOpenOrders(); } catch (e) { log("openOrders err", e?.message || e); }
+
+            if (!Array.isArray(openAll)) {
+              log("cleanup: openOrders unavailable; skipping this cycle");
+              return { dropped: 0, dropCIDs: [], scanned: state.pending?.length || 0, droppable: 0, orphans: 0 };
+            }
+
+            const byClient = new Map(openAll.map(o => [String(o.clientOrderId || o.clientOrderID || "").trim(), o]));
+            const zombieSet = new Set((heartbeat?.details || []).filter(d => d.type === "zombie").map(d => String(d.client_order_id || "").trim()).filter(Boolean));
+
+            const keep = [], dropCIDs = [];
+            let scanned = 0, droppable = 0, orphans = 0;
+            const idOf = (p)=> String(p?.client_order_id || p?.clientOrderId || p?.idea_id || "").trim();
+
+            for (const p of (state.pending || [])) {
+              scanned++;
+              const cid = idOf(p);
+              const status = (p.status || "planned").toLowerCase();
+              const noEntryYet = !p.entry_ts_ms;
+              const onEx = cid && byClient.has(cid);
+              const orphan = !onEx || zombieSet.has(cid);
+              const canDrop = DROPPABLE_STATUSES.has(status) && noEntryYet;
+
+              if (canDrop) droppable++;
+              if (canDrop && orphan) { orphans++; dropCIDs.push(cid || p.idea_id || ""); continue; }
+              keep.push(p);
+            }
+
+            if (dropCIDs.length) {
+              state.pending = keep;
+              state.__drop_pending_cids = [...new Set([...(state.__drop_pending_cids || []), ...dropCIDs])];
+              log(`cleanup: scanned=${scanned} droppable=${droppable} orphans=${orphans} dropped=${dropCIDs.length}`);
+            } else {
+              log(`cleanup: scanned=${scanned} droppable=${droppable} orphans=${orphans} dropped=0`);
+            }
+            return { dropped: dropCIDs.length, dropCIDs, scanned, droppable, orphans };
+          }
           
+          // ---------- Microstructure / Heavy Features helpers ----------
+          const computeOBI=(depth, topN=12)=>{ if(!depth?.asks?.length || !depth?.bids?.length) return 0; const w=(i)=>Math.exp(-i*0.18); let bidNot=0, askNot=0; for(let i=0;i<Math.min(topN, depth.bids.length); i++){ const p=+depth.bids[i][0], q=+depth.bids[i][1]; if(p>0&&q>0) bidNot += p*q*w(i); } for(let i=0;i<Math.min(topN, depth.asks.length); i++){ const p=+depth.asks[i][0], q=+depth.asks[i][1]; if(p>0&&q>0) askNot += p*q*w(i); } return (bidNot+askNot>0) ? (bidNot-askNot)/(bidNot+askNot) : 0; };
+          const vwapFillLevels=(levels,targetUSD)=>{ let remain=targetUSD,val=0,qty=0; for(const [ps,qs] of levels){ const p=+ps, q=+qs; if(!(p>0&&q>0)) continue; const can=p*q, take=Math.min(remain,can), tq=take/p; val+=p*tq; qty+=tq; remain-=take; if(remain<=1e-6) break; } return { px: qty>0? val/qty : null, filledUSD: (targetUSD-remain) }; };
+          const slipFromDepth=(depth,mid,side,notionalUSD)=>{ if(!depth?.asks?.length || !depth?.bids?.length || !(mid>0)) return { slip_bps:null, fill_prob:null }; if(side==="long"){ const buy=vwapFillLevels(depth.asks, Math.max(50,notionalUSD)); const slip = buy.px? Math.max(0, Math.round((buy.px - mid)/mid*10000)) : null; const fill = Math.min(1, (buy.filledUSD||0)/Math.max(1,notionalUSD)); return { slip_bps: slip, fill_prob: +fill.toFixed(4) }; }else{ const sell=vwapFillLevels(depth.bids, Math.max(50,notionalUSD)); const slip = sell.px? Math.max(0, Math.round((mid - sell.px)/mid*10000)) : null; const fill = Math.min(1, (sell.filledUSD||0)/Math.max(1,notionalUSD)); return { slip_bps: slip, fill_prob: +fill.toFixed(4) }; } };
+          const depthWithinPctUSD=(depth, mid, pct=0.01)=>{ if(!depth?.asks?.length || !depth?.bids?.length || !(mid>0)) return { bidsUSD:0, asksUSD:0 }; const askLim=mid*(1+pct), bidLim=mid*(1-pct); let asksUSD=0, bidsUSD=0; for(const [ps,qs] of depth.asks){ const p=+ps, q=+qs; if(!(p>0&&q>0)) continue; if(p<=askLim) asksUSD += p*q; else break; } for(const [ps,qs] of depth.bids){ const p=+ps, q=+qs; if(!(p>0&&q>0)) continue; if(p>=bidLim) bidsUSD += p*q; else break; } return { bidsUSD, asksUSD }; };
+          const confidenceScore=({ p_cal, ev_bps, atr_bps, micro, regime, reliability, riskAdj })=>{ const ev_norm = atr_bps>0? ev_bps/atr_bps : 0; const ev_sig = 1/(1+Math.exp(-ev_norm)); const base = 0.6*p_cal + 0.4*ev_sig; const mult = (micro||1)*(regime||1)*(reliability||1)*(riskAdj||1); return Math.round(100*base*mult); };
+          const microprice=(bid,ask,qb,qa)=>{ const d=(qb||1)+(qa||1); return (ask*qb + bid*qa)/d; };
+          const ofiProxy=(d0,d1)=>{ const lev=(side,d)=>d?.[side]?.slice(0,3).map(x=>+x[1]||0)||[]; const sum=a=>a.reduce((x,y)=>x+y,0); if(!d0||!d1) return 0; return (sum(lev("bids",d1))-sum(lev("bids",d0))) - (sum(lev("asks",d1))-sum(lev("asks",d0))); };
+          const bookSlope=(depth, mid)=>{ const toPts=(levels)=>{ let cum=0; const pts=[]; for(const [ps,qs] of (levels||[])){ const p=+ps,q=+qs; if(!(p>0&&q>0)) continue; cum+=p*q; const x=Math.log(Math.abs(p-mid)/mid + 1e-6), y=Math.log(cum+1); pts.push([x,y]); if(pts.length>=10) break; } return pts; }; if(!depth?.asks?.length||!depth?.bids?.length||!(mid>0)) return { slope:0, r2:0 }; const pts=toPts(depth.asks).concat(toPts(depth.bids)); if(pts.length<6) return { slope:0, r2:0 }; const xs=pts.map(p=>p[0]), ys=pts.map(p=>p[1]), mx=mean(xs), my=mean(ys); let num=0,den=0,vy=0; for(let i=0;i<xs.length;i++){ const dx=xs[i]-mx, dy=ys[i]-my; num+=dx*dy; den+=dx*dx; vy+=dy*dy; } return { slope: den>1e-9? num/den : 0, r2: den>1e-9 && vy>1e-9? (num*num)/(den*vy):0 }; };
+          const reasonBuilder=(ctx)=>{ const out=[]; if((ctx.adx1h||0)>22) out.push({ factor:"ADX_1h", value:+(ctx.adx1h||0).toFixed(1), contribution:+Math.min(12,(ctx.adx1h-22)*0.6).toFixed(1) }); if((ctx.ofi30s||0)>0) out.push({ factor:"OFI_30s", value:+(ctx.ofi30s||0).toFixed(3), contribution:+Math.min(10, ctx.ofi30s*10).toFixed(1) }); if((ctx.spread_bps||0)>8) out.push({ factor:"Spread_bps", value:ctx.spread_bps, contribution:-Math.min(8,(ctx.spread_bps-8)) }); if((ctx.slip_bps_est||0)>4) out.push({ factor:"Slip_est_bps", value:ctx.slip_bps_est, contribution:-Math.min(6,(ctx.slip_bps_est-4)) }); if((ctx.tfAlign||0)>=0.7) out.push({ factor:"TF_alignment", value:+(ctx.tfAlign||0).toFixed(2), contribution:+6.0 }); if((ctx.mtf_rsi||0)>55) out.push({ factor:"MTF_RSI", value:+(ctx.mtf_rsi||0).toFixed(1), contribution:+3.0 }); return out.sort((a,b)=>Math.abs(b.contribution)-Math.abs(a.contribution)).slice(0,5); };
+          const cholesky=(A)=>{ const n=A.length; const L=Array.from({length:n},()=>Array(n).fill(0)); for(let i=0;i<n;i++){ for(let j=0;j<=i;j++){ let s=0; for(let k=0;k<j;k++) s+=L[i][k]*L[j][k]; const v=A[i][j]-s; if(i===j){ if(v<=1e-12) return null; L[i][j]=Math.sqrt(Math.max(v,1e-12)); } else L[i][j]=v/(L[j][j]||1e-12); } } return L; };
+          const choleskySafe=(S)=>{ const L=cholesky(S); if(L) return L; const n=S.length; const Sc=S.map((r,i)=> r.map((v,j)=> v + (i===j?1e-6:0))); return cholesky(Sc); };
+          const sampleMultiT=(muVec,Sigma,df=6,M=1000)=>{ const n=muVec.length; const L=choleskySafe(Sigma); if(!L) return []; const out=[]; for(let m=0;m<M;m++){ const z=Array(n).fill(0).map(()=>randn()); const y=Array(n).fill(0); for(let i=0;i<n;i++){ let s=0; for(let k=0;k<=i;k++) s+=L[i][k]*z[k]; y[i]=s; } let chi=0; for(let i=0;i<df;i++){ const zc=randn(); chi+=zc*zc; } const scale=Math.sqrt(df/Math.max(1e-9,chi)); out.push(y.map((yi,i)=> (muVec[i]||0) + yi*scale)); } return out; };
+          const portfolioVaR_ES_tCopula=(picks, df=6)=>{ if(!picks.length) return { VaR95_bps:0, ES95_bps:0 }; const n=picks.length, mu=Array(n).fill(0), sd=Array(n).fill(0); for(let i=0;i<n;i++){ const r5=picks[i].ret5||[]; const rMean=mean(r5), rStd=std(r5)||1e-4; const steps=Math.max(1, Math.round((picks[i].ttl_sec||600)/300)); mu[i]=rMean*steps*10000; sd[i]=rStd*Math.sqrt(steps)*10000; } const R=Array.from({length:n},()=>Array(n).fill(0)); for(let i=0;i<n;i++){ for(let j=i;j<n;j++) R[i][j]=corr(picks[i].ret5||[], picks[j].ret5||[]); R[i][i]=1; } const Sigma=Array.from({length:n},()=>Array(n).fill(0)); for(let i=0;i<n;i++) for(let j=0;j<n;j++) Sigma[i][j]=R[i][j]*sd[i]*sd[j]; const draws=sampleMultiT(mu,Sigma,df,1200); if(!draws.length) return { VaR95_bps:0, ES95_bps:0 }; const w0=picks.map(p=> p.size_bps||0); const ws=sum(w0)||1; const w=w0.map(x=> x/ws); const port=draws.map(d=> d.reduce((acc,di,ii)=> acc + w[ii]*di, 0)); port.sort((a,b)=>a-b); const idx=Math.floor(0.05*port.length); const VaR95=port[idx]||0; const ES=mean(port.slice(0,idx+1)); return { VaR95_bps:Math.round(VaR95), ES95_bps:Math.round(ES) }; };
+
           // ---------- HTTP + Concurrency ----------
           async function fetchWithTimeout(url,opts={},ms=12000){ const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms); try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts?.headers||{})}});} finally{ clearTimeout(t);} }
           async function getJSON(url,ms=12000,tries=2){ for(let a=0;a<tries;a++){ try{ const r=await fetchWithTimeout(url,{},ms); if(r?.ok){ return await r.json(); } }catch{} await sleep(jitter(220)); } return null; }
           const cache={ k:new Map(), depth:new Map(), bt:new Map(), conv:new Map() };
           const TTL={ k: 60_000, depth: 8_000, bt: 5_000, conv: 60_000 };
+
           const getCached=(map,key,ttl)=>{ const e=map.get(key); return e && (Date.now()-e.ts<ttl)? e.v : null; };
           const setCached=(map,key,v)=>map.set(key,{ v, ts: Date.now() });
 
           // ---------- Config / ENV ----------
+          const TARGET_EXCHANGE = "bybit_futures_testnet";
+          const MARKET_TYPE     = "futures";
+          const MARGIN_MODE     = "isolated";
+          const LEVERAGE        = 1;
           const EXCHANGE=(process.env.EXCHANGE||"mexc").toLowerCase().replace("mexci","mexc");
           if(EXCHANGE!=="mexc"){ log("This build targets MEXC. Set EXCHANGE=mexc"); process.exit(1); }
           const MEXC_API_KEY = process.env.MEXC_API_KEY || "";
@@ -159,184 +252,560 @@ jobs:
           const SCHEMA_VERSION=(process.env.SCHEMA_VERSION||"1");
           const GIT_SHA=(process.env.GIT_SHA||"unknown");
           
+          // ❌ Calibration constants removed.
+          
+          const PUSHER_MODE=(process.env.PUSHER_MODE||"plan_only").toLowerCase();
+
+          const MIN_QV_ENV = Number(process.env.MIN_QV_USD||"0") || 0;
+          const UNIV_TARGET_MIN=100, UNIV_TARGET_MAX=120, DYN_QV_MIN=Number(process.env.DYN_QV_MIN||"10000000"), DYN_QV_STEP=5_000_000;
           const TOP_N=Number(process.env.TOP_N||"3"), MAX_SPREAD_BPS=Number(process.env.MAX_SPREAD_BPS||"12");
           const EXP_LCB_MIN_BPS_BASE=Number(process.env.EXP_LCB_MIN_BPS||"12");
-          const EMA_FAST=21, EMA_SLOW=50, ADX_P=14, ATR_P=14, K5M=300, K1H=300;
-          const COST_BPS=Number(process.env.FEES_BPS||"10"), NOTIONAL=Number(process.env.NOTIONAL_USD||"300");
+          const EMA_FAST=21, EMA_SLOW=50, ADX_P=14, ATR_P=14, K1M=240, K5M=300, K15M=300, K1H=300, K4H=300;
+          const VWAP_5M_WIN=36, COST_BPS=Number(process.env.FEES_BPS||"10"), NOTIONAL=Number(process.env.NOTIONAL_USD||"300");
           const DEPTH_LIMIT=Number(process.env.MEXC_DEPTH_LIMIT||"50"), OBI_TOPN=Number(process.env.OBI_TOPN||"12");
-          const COOLDOWN_MS=3*60*60*1000, TTL_MIN=540, TTL_MAX=1200;
+          const COOLDOWN_MS=3*60*60*1000, FLIP_GUARD_MS=30*60*1000;
+          const DD_24H_LIMIT_BPS=-150, DD_PEAK_LIMIT_BPS=-300;
+          const WILSON_Z=1.34, TARGET_PORT_RISK_BPS=52, TTL_MIN=540, TTL_MAX=1200;
           const S_H=process.env.ACTIVE_UTC_START?Number(process.env.ACTIVE_UTC_START):null;
           const E_H=process.env.ACTIVE_UTC_END?Number(process.env.ACTIVE_UTC_END):null;
           const nowH=new Date().getUTCHours();
           const todOK=(S_H==null||E_H==null)?true:(S_H<=E_H?(nowH>=S_H&&nowH<=E_H):(nowH>=S_H||nowH<=E_H));
+          const STABLES=new Set(["USDT","USDC","USD","USDE","USDD","BUSD","FDUSD","TUSD","DRKUSD","DAI","USDP","PAX","USTC"]);
           const DIRECTION=(process.env.DIRECTION||"both").trim().toLowerCase();
-          const MR_BREAKOUT_DC_N=Number(process.env.MR_BREAKOUT_DC_N||"120"), MR_LOCKOUT_SEC=Number(process.env.MR_LOCKOUT_SEC||"1800");
+          const MR_ADX_MAX_DEFAULT=20, MR_BREAKOUT_DC_N=Number(process.env.MR_BREAKOUT_DC_N||"120");
+          const MR_BREAKOUT_RET15_ATR=Number(process.env.MR_BREAKOUT_RET15_ATR||"1.5"), MR_LOCKOUT_SEC=Number(process.env.MR_LOCKOUT_SEC||"1800");
+          const MAX_COST_BPS_HARD=Number(process.env.MAX_COST_BPS_HARD||"15");
           const MIN_VOL_1H_USD=Number(process.env.MIN_VOL_1H_USD||"5000000"), DEPTH_1P_MIN_USD=Number(process.env.DEPTH_1P_MIN_USD||"200000");
           const NO_LONG_DOWN_ENABLE=(process.env.NO_LONG_DOWN_ENABLE||"true").toLowerCase()==="true";
           const LONG_DOWN_RSI_CUTOFF=Number(process.env.LONG_DOWN_RSI_CUTOFF||"40");
+          const LONG_MR_DIVERGENCE_REQ=(process.env.LONG_MR_DIVERGENCE_REQ||"true").toLowerCase()==="true";
           const LONG_EDGE_MULT_MIN=Number(process.env.LONG_EDGE_MULT_MIN||"4");
           const LONG_BOUNCE_SL_ATR=Number(process.env.LONG_BOUNCE_SL_ATR||"0.50"), LONG_BOUNCE_TP_ATR=Number(process.env.LONG_BOUNCE_TP_ATR||"0.90");
+          const LONG_SIMILARITY_RHO=Number(process.env.LONG_SIMILARITY_RHO||"0.84");
+
           const CAPITAL_PCT_PER_TRADE=Number(process.env.CAPITAL_PCT_PER_TRADE||"0");
           const FIXED_SIZE_BPS = CAPITAL_PCT_PER_TRADE > 0 ? Math.min(2000, Math.round(CAPITAL_PCT_PER_TRADE * 100)) : 0;
-          
-          const CONFIG_HASH=(()=>{ try{ return hashObj({ DIRECTION, MR_BREAKOUT_DC_N, MR_LOCKOUT_SEC, MIN_VOL_1H_USD, DEPTH_1P_MIN_USD, NO_LONG_DOWN_ENABLE, LONG_DOWN_RSI_CUTOFF, LONG_EDGE_MULT_MIN, LONG_BOUNCE_SL_ATR, LONG_BOUNCE_TP_ATR, TOP_N, MAX_SPREAD_BPS, EXP_LCB_MIN_BPS_BASE, COST_BPS, NOTIONAL, DEPTH_LIMIT, OBI_TOPN, MIN_TF_ALIGN, TF_WEIGHTS }); }catch{ return "cfg-unknown"; } })();
 
+          const CONFIG_HASH=(()=>{ try{
+            const knobs={
+              DIRECTION, MR_BREAKOUT_DC_N, MR_BREAKOUT_RET15_ATR, MR_LOCKOUT_SEC,
+              MAX_COST_BPS_HARD, MIN_VOL_1H_USD, DEPTH_1P_MIN_USD, NO_LONG_DOWN_ENABLE,
+              LONG_DOWN_RSI_CUTOFF, LONG_MR_DIVERGENCE_REQ, LONG_EDGE_MULT_MIN,
+              LONG_BOUNCE_SL_ATR, LONG_BOUNCE_TP_ATR, LONG_SIMILARITY_RHO, TOP_N, MAX_SPREAD_BPS,
+              EXP_LCB_MIN_BPS_BASE, COST_BPS, NOTIONAL, DEPTH_LIMIT, OBI_TOPN, MIN_TF_ALIGN, TF_WEIGHTS
+            };
+            return hashObj(knobs);
+          }catch{ return "cfg-unknown"; } })();
+
+          // ---------- Worker endpoints ----------
           const PUSH_URL=process.env.WORKER_PUSH_URL||"", PUSH_TOKEN=process.env.PUSH_TOKEN||"";
           const PUSH_URL_V2 = process.env.WORKER_PUSH_URL_V2 || "";
+          const HEALTH_URL=(()=>{ try{ const u=new URL(PUSH_URL); return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;}catch{return PUSH_URL.replace(/\/signals\/push(\?.*)?$/,"/health");}})();
+          log("health GET", HEALTH_URL);
+          try{ const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`,"User-Agent":UA }},5000); let t=""; try{ t=await r.text(); }catch{} log("health status", r?.status||"ERR", (t||"").slice(0,160)); }catch(e){ log("health error", e?.message||e); }
 
           // ---------- MEXC Adapter ----------
           async function pickMexcBase(){ for(const b of MEXC_BASES){ try{ const r=await fetchWithTimeout(`${b}/api/v3/time`,{},4000); if(r?.ok) return b; }catch{} } throw new Error("No healthy MEXC base"); }
           const BASE=await pickMexcBase();
           const api=(path,params={})=>{ const u=new URL(path,BASE); for(const [k,v] of Object.entries(params)){ if(v!==undefined&&v!==null) u.searchParams.set(k,String(v)); } return u.toString(); };
-          async function mexcSignedRequest(path, params = {}, method = 'GET') { if (!MEXC_API_KEY || !MEXC_SECRET_KEY) return null; const timestamp = Date.now(); const queryString = new URLSearchParams({ ...params, timestamp }).toString(); const signature = crypto.createHmac('sha256', MEXC_SECRET_KEY).update(queryString).digest('hex'); const url = new URL(path, BASE); url.search = queryString + `&signature=${signature}`; const options = { method, headers: { 'X-MEXC-APIKEY': MEXC_API_KEY, 'Content-Type': 'application/json', 'User-Agent': UA } }; try { const r = await fetchWithTimeout(url.toString(), options, 15000); if (r.ok) return await r.json(); return null; } catch (e) { return null; } }
-          async function fetchOpenOrders(symbol) { return await mexcSignedRequest('/api/v3/openOrders', symbol?{symbol}:{}); }
-          async function fetchK(sym,interval,limit){ const u=api("/api/v3/klines",{symbol:sym,interval,limit}); return await getJSON(u,10000,2); }
-          async function fetchAll24hr(){ return await getJSON(api("/api/v3/ticker/24hr"),10000,2); }
+          async function mexcSignedRequest(path, params = {}, method = 'GET') {
+              if (!MEXC_API_KEY || !MEXC_SECRET_KEY) return null;
+              const timestamp = Date.now();
+              const queryString = new URLSearchParams({ ...params, timestamp }).toString();
+              const signature = crypto.createHmac('sha256', MEXC_SECRET_KEY).update(queryString).digest('hex');
+              const url = new URL(path, BASE);
+              url.search = queryString + `&signature=${signature}`;
+              const options = { method, headers: { 'X-MEXC-APIKEY': MEXC_API_KEY, 'Content-Type': 'application/json', 'User-Agent': UA } };
+              try {
+                  const r = await fetchWithTimeout(url.toString(), options, 15000);
+                  if (r.ok) return await r.json();
+                  log(`MEXC signed request failed: ${r.status}`, (await r.text()||'').slice(0,100));
+                  return null;
+              } catch (e) {
+                  log(`MEXC signed request error: ${e?.message||e}`);
+                  return null;
+              }
+          }
+          async function fetchMyTrades(symbol, startTime) { return await mexcSignedRequest('/api/v3/myTrades', { symbol, startTime, limit: 1000 }); }
+          async function fetchOpenOrders(symbol) {
+            const r = await mexcSignedRequest('/api/v3/openOrders', symbol?{symbol}:{});
+            return Array.isArray(r) ? r : null; // null => unavailable
+          }
+          async function fetchK(sym,interval,limit,startTime,endTime){ const u=api("/api/v3/klines",{symbol:sym,interval,limit,startTime,endTime}); const r=await getJSON(u,10000,2); return Array.isArray(r)?r:null; }
+          async function fetchDepth(symbol){ return await getJSON(api("/api/v3/depth",{symbol,limit:DEPTH_LIMIT}), 10000, 2); }
+          async function fetchAll24hr(){
+            let all=await getJSON(api("/api/v3/ticker/24hr"),10000,2); if(Array.isArray(all)&&all.length) return all;
+            const exi=await getJSON(api("/api/v3/exchangeInfo"),10000,2); const syms=(exi?.symbols||[]).filter(s=>s.status==="TRADING").map(s=>s.symbol).slice(0,300);
+            const out=[]; for(let i=0;i<syms.length;i+=24){ const chunk=syms.slice(i,i+24); const got=await Promise.all(chunk.map(s=>getJSON(api("/api/v3/ticker/24hr",{symbol:s}),6000,1))); for(const x of got) if(x) out.push(x); await sleep(180); } return out;
+          }
           async function fetchBookTicker(symbol){ return await getJSON(api("/api/v3/ticker/bookTicker",{symbol}), 8000, 1); }
-          async function getKCached(symbol,interval,limit){ const key=[symbol,interval,limit].join("|"); const c=getCached(cache.k,key,TTL.k); if(c) return c; const v=await fetchK(symbol,interval,limit); if(v) setCached(cache.k,key,v); return v; }
-          async function getDepthCached(symbol){ const c=getCached(cache.depth,symbol,TTL.depth); if(c) return c; const v=await getJSON(api("/api/v3/depth",{symbol,limit:DEPTH_LIMIT}), 10000, 2); if(v) setCached(cache.depth,symbol,v); return v; }
-          async function getBookTickerCached(symbol){ const c=getCached(cache.bt,symbol,TTL.bt); if(c) return c; const v=await fetchBookTicker(symbol); if(v) setCached(cache.bt,symbol,v); return v; }
-          async function getKMultiTF(symbol){ const pairs=[["1m",300],["3m",300],["5m",K5M],["15m",300],["30m",300],["1h",K1H],["2h",200],["4h",300],["12h",120],["1d",90]]; const out={}; for(const [tf,lim] of pairs){ out[tf]=await getKCached(symbol, tf, lim); } return out; }
 
-          // ---------- State (Gist) & Heartbeat ----------
+          async function getKCached(symbol,interval,limit,startTime,endTime){ const key=[symbol,interval,limit,startTime||"",endTime||""].join("|"); const c=getCached(cache.k,key,TTL.k); if(c) return c; const v=await fetchK(symbol,interval,limit,startTime,endTime); if(v) setCached(cache.k,key,v); return v; }
+          async function getDepthCached(symbol){ const c=getCached(cache.depth,symbol,TTL.depth); if(c) return c; const v=await fetchDepth(symbol); if(v) setCached(cache.depth,symbol,v); return v; }
+          async function getBookTickerCached(symbol){ const c=getCached(cache.bt,symbol,TTL.bt); if(c) return c; const v=await fetchBookTicker(symbol); if(v) setCached(cache.bt,symbol,v); return v; }
+          async function getKMultiTF(symbol){ const pairs=[["1m",300],["3m",300],["5m",K5M],["15m",K15M],["30m",300],["1h",K1H],["2h",200],["4h",K4H],["12h",120],["1d",90]]; const out={}; for(const [tf,lim] of pairs){ out[tf]=await getKCached(symbol, tf, lim); } return out; }
+          const tfInd=(k)=>{ if(!k?.length) return null; const h=k.map(x=>+x[2]), l=k.map(x=>+x[3]), c=k.map(x=>+x[4]); const adxatr=computeADX_ATR(h,l,c,14)||{adx:0,atr:0}; const up=c.at(-1)>=ema(c,21)&&c.at(-1)>=ema(c,50); return {adx:adxatr.adx||0,atr:adxatr.atr||0,up}; };
+
+          // ---------- Conversion rate helper for commissions ----------
+          async function getConversionRate(asset, quote="USDT"){
+            try{
+              if(!asset||asset.toUpperCase()===quote.toUpperCase()) return 1;
+              const key=asset.toUpperCase()+"_"+quote.toUpperCase();
+              const c=getCached(cache.conv,key,TTL.conv); if(c) return c;
+              const sym1=asset.toUpperCase()+quote.toUpperCase();
+              const sym2=quote.toUpperCase()+asset.toUpperCase();
+              let px=null;
+              let bt=await getBookTickerCached(sym1);
+              if(bt?.askPrice) px=+bt.askPrice;
+              if(px==null){ bt=await getBookTickerCached(sym2); if(bt?.bidPrice) px=1/(+bt.bidPrice||1); }
+              if(px==null) return 1;
+              setCached(cache.conv,key,px);
+              return px;
+            }catch{ return 1; }
+          }
+
+          // ---------- Secondary store stub (no-op) ----------
+          async function pushAuditSecondary(path, payload){
+            try{
+              return { ok:true, path };
+            }catch(e){ log("secondary store stub error", e?.message||e); return { ok:false, error:String(e) }; }
+          }
+
+          // ---------- Heartbeat & Zombie detection ----------
+          async function heartbeatCheck(state){
+            const res={ mismatches:0, zombies:0, details:[] };
+            if(!MEXC_API_KEY||!MEXC_SECRET_KEY) return res;
+            try{
+              const openAll=await fetchOpenOrders();
+              if (!Array.isArray(openAll)) return res;
+
+              const byClient=new Map();
+              for(const o of openAll){ const cid=(o.clientOrderId||o.clientOrderID||"").trim(); if(cid) byClient.set(cid,o); }
+              for(const p of state.pending||[]){
+                const cid=(p.client_order_id||p.clientOrderId||"").trim();
+                if(!cid) continue;
+                const onEx=byClient.has(cid);
+                if(!onEx){
+                  res.zombies++; res.details.push({ type:"zombie", symbol:p.symbolFull, client_order_id:cid, ts_ms:p.ts_ms });
+                }
+              }
+              res.mismatches=res.zombies;
+            }catch(e){ log("heartbeat warn", e?.message||e); }
+            return res;
+          }
+          
+          // ---------- State (Gist) + Calibration + Audit ----------
           async function loadState(){
             const token=process.env.GIST_TOKEN, id=process.env.GIST_ID;
-            const init={ v:"mexc-ultimate-7.2-final-fixes", cooldown:{}, cooldown_side:{}, pending:[], equity:[], closed:[], mr_lockout:{}, sym_stats:{}, sym_stats_real:{}, lastReconcileTs:0, ml_voting_history:[], model_weights:{ "Original":10, "Logistic":10, "NaiveBayes":10, "KNN":10, "Perceptron":10, "DecisionTree":10, "RandomForest":10, "NeuralNet":10, "MeanReversion":10, "Momentum":10 }, model_weights_prev:{} };
+            const init={ v:"mexc-ultimate-7.1-no-calib",
+              cooldown:{}, cooldown_side:{}, pending:[], equity:[], closed:[],
+              mr_lockout:{}, sym_stats:{}, sym_stats_real:{}, calibCoeffs:{}, lastReconcileTs:0,
+              ml_voting_history:[],
+              model_weights:{
+                "Original": 10, "Logistic": 10, "NaiveBayes": 10, "KNN": 10,
+                "Perceptron": 10, "DecisionTree": 10, "RandomForest": 10,
+                "NeuralNet": 10, "MeanReversion": 10, "Momentum": 10
+              },
+              model_weights_prev:{}
+            };
+
             if(!token||!id) return { state:init, persist:null };
             try{
-              const r=await fetchWithTimeout(`https://api.github.com/gists/${id}`,{ headers:{Authorization:`Bearer ${token}`,"Accept":"application/vnd.github+json","User-Agent":UA} });
+              const r=await fetchWithTimeout(`https://api.github.com/gists/${id}`,{
+                headers:{Authorization:`Bearer ${token}`,"Accept":"application/vnd.github+json","User-Agent":UA}
+              });
               if(!r.ok) return { state:init, persist:null };
-              const g=await r.json(); const c=g.files?.["state.json"]?.content; const s=c?JSON.parse(c):init;
-              if(!s.cooldown)s.cooldown={}; if(!s.cooldown_side)s.cooldown_side={}; if(!Array.isArray(s.pending))s.pending=[]; if(!Array.isArray(s.closed))s.closed=[]; if(!Array.isArray(s.equity))s.equity=[]; if(!s.mr_lockout)s.mr_lockout={}; if(!s.sym_stats)s.sym_stats={}; if(!s.sym_stats_real)s.sym_stats_real={}; if(!s.lastReconcileTs)s.lastReconcileTs=0; if(!Array.isArray(s.ml_voting_history))s.ml_voting_history=[];
-              if(!s.model_weights || Object.keys(s.model_weights).length < 10) s.model_weights={ "Original":10, "Logistic":10, "NaiveBayes":10, "KNN":10, "Perceptron":10, "DecisionTree":10, "RandomForest":10, "NeuralNet":10, "MeanReversion":10, "Momentum":10 };
+              const etag=r.headers.get("etag");
+              const g=await r.json();
+              const c=g.files?.["state.json"]?.content;
+              const s=c?JSON.parse(c):init;
+
+              if(!s.cooldown)s.cooldown={};
+              if(!s.cooldown_side)s.cooldown_side={};
+              if(!Array.isArray(s.pending))s.pending=[];
+              if(!Array.isArray(s.closed))s.closed=[];
+              if(!Array.isArray(s.equity))s.equity=[];
+              if(!s.mr_lockout)s.mr_lockout={};
+              if(!s.sym_stats)s.sym_stats={};
+              if(!s.sym_stats_real)s.sym_stats_real={};
+              if(!s.calibCoeffs)s.calibCoeffs={};
+              if(!s.lastReconcileTs)s.lastReconcileTs=0;
+              if(!Array.isArray(s.ml_voting_history))s.ml_voting_history=[];
+              
+              if(!s.model_weights){
+                s.model_weights={
+                  "Original": 10, "Logistic": 10, "NaiveBayes": 10, "KNN": 10,
+                  "Perceptron": 10, "DecisionTree": 10, "RandomForest": 10,
+                  "NeuralNet": 10, "MeanReversion": 10, "Momentum": 10
+                };
+              }
               if(!s.model_weights_prev)s.model_weights_prev={};
-              return { state:s, persist:{ id, token, etag:r.headers.get("etag") } };
+
+              return { state:s, persist:{ id, token, etag } };
             }catch(e){ log("loadState warn", e?.message||e); return { state:init, persist:null }; }
           }
           
-          async function saveState(persist, state) { if (!persist) return; const gistUrl = `https://api.github.com/gists/${persist.id}`; const mkFiles = (s) => ({ "state.json": { content: JSON.stringify(s) } }); async function patch(files, etag) { const headers = { Authorization: `Bearer ${persist.token}`, "Accept": "application/vnd.github+json", "Content-Type": "application/json", "User-Agent": UA }; if (etag) headers["If-Match"] = etag; return await fetchWithTimeout(gistUrl, { method: "PATCH", headers, body: JSON.stringify({ files }) }, 15000); } let r = await patch(mkFiles(state), persist.etag); if (r.ok) { persist.etag = r.headers.get("etag") || persist.etag; return log("SUCCESS: Gist updated!"); } log("WARN: Gist save failed status=", r.status, ". Retrying with blind PATCH."); const r2 = await patch(mkFiles(state), null); if(!r2.ok) log("ERROR: Blind save failed status=", r2.status); }
+          function mergeStates(remote, local) {
+            const merged = { ...remote };
+            const dropSet = new Set((local.__drop_pending_cids || []).map(x => String(x).trim()).filter(Boolean));
+            const id = (p) => String(p?.client_order_id || p?.clientOrderId || p?.idea_id || "").trim();
+
+            const remotePending = (remote.pending || []).filter(p => !dropSet.has(id(p)));
+            const remoteIds = new Set(remotePending.map(id));
+            const newLocalPending = (local.pending || []).filter(p => { const k = id(p); return k && !remoteIds.has(k); });
+            merged.pending = [...remotePending, ...newLocalPending];
+
+            merged.equity = Array.isArray(remote.equity) ? remote.equity : [];
+            merged.sym_stats_real = remote.sym_stats_real || {};
+            merged.sym_stats = remote.sym_stats || {};
+            merged.lastReconcileTs = remote.lastReconcileTs || 0;
+            if ('fees' in remote) merged.fees = remote.fees;
+
+            merged.cooldown = local.cooldown || {};
+            merged.cooldown_side = local.cooldown_side || {};
+            merged.mr_lockout = local.mr_lockout || {};
+            merged.calibCoeffs = local.calibCoeffs || remote.calibCoeffs || {};
+
+            const keyClosed = (c) => { const cid = c?.trade_details?.client_order_id || c.client_order_id || c.idea_id || ""; const tx  = c?.ts_exit_ms || c?.exit_ts_ms || ""; return `${cid}|${tx}`; };
+            const localClosedMap = new Map((local.closed||[]).map(c => [keyClosed(c), c]));
+            merged.closed = (remote.closed || []).map(rc => {
+              const lc = localClosedMap.get(keyClosed(rc));
+              if (!lc) return rc;
+              const learned = Boolean(rc.learned || lc.learned);
+              const learned_at_ts = learned ? (rc.learned_at_ts || lc.learned_at_ts || Date.now()) : undefined;
+              return { ...rc, learned, learned_at_ts };
+            });
+            merged.version_ts = Date.now();
+            return merged;
+          }
+
+          async function saveState(persist, state, auditOut, retries=2, blindFallback=true) {
+            if (!persist) { log("WARN: No persist—skipping Gist save."); return; }
+
+            const gistUrl = `https://api.github.com/gists/${persist.id}`;
+            const mkFiles = (s) => ({ "state.json": { content: JSON.stringify(s) } });
+
+            async function patch(files, etag) {
+              const headers = { Authorization: `Bearer ${persist.token}`, "Accept": "application/vnd.github+json", "Content-Type": "application/json", "User-Agent": UA };
+              if (etag) headers["If-Match"] = etag;
+              return await fetchWithTimeout(gistUrl, { method: "PATCH", headers, body: JSON.stringify({ files }) }, 15000);
+            }
+
+            let toSave = state, etag = persist.etag || null;
+
+            for (let attempt = 0; attempt <= retries; attempt++) {
+              const r = await patch(mkFiles(toSave), etag);
+              if (r.ok) {
+                persist.etag = r.headers.get("etag") || persist.etag;
+                log("SUCCESS: Gist updated! Status=", r.status);
+                return;
+              }
+              log("WARN: saveState failed status=", r.status);
+
+              if (r.status === 412) {
+                const r2 = await fetchWithTimeout(gistUrl, { headers: { Authorization: `Bearer ${persist.token}`, "Accept": "application/vnd.github+json", "User-Agent": UA } }, 12000);
+                if (!r2.ok) { log("ERROR: Refetch for merge failed status=", r2.status); break; }
+                const remoteGist = await r2.json();
+                toSave = mergeStates(remoteGist.files?.["state.json"]?.content ? JSON.parse(remoteGist.files["state.json"].content) : {}, state);
+                etag = r2.headers.get("etag") || null;
+                await sleep(250 + Math.floor(Math.random()*250));
+                continue;
+              }
+              break;
+            }
+
+            if (blindFallback) {
+              log("WARN: Falling back to blind PATCH (no If-Match).");
+              try {
+                  const r2 = await fetchWithTimeout(gistUrl, { headers: { Authorization: `Bearer ${persist.token}`, "Accept": "application/vnd.github+json", "User-Agent": UA } }, 12000);
+                  if (r2.ok) {
+                    const remoteGist = await r2.json();
+                    toSave = mergeStates(remoteGist.files?.["state.json"]?.content ? JSON.parse(remoteGist.files["state.json"].content) : {}, state);
+                  }
+              } catch (e) { log("ERROR: Exception during pre-blind-patch re-fetch:", e?.message || String(e)); }
+              
+              const r3 = await patch(mkFiles(toSave), null);
+              if (r3.ok) log("SUCCESS: Blind Gist update ok.");
+              else log("ERROR: Blind save failed status=", r3.status);
+            }
+          }
           
+          // ❌ Calibration-related functions are removed.
+          const calibrateP=(state, side, regime, pRaw)=>{
+            // Passthrough, no calibration learning.
+            return pRaw != null ? pRaw : 0.5;
+          };
+          const calibratorInfo=(state,side,regime)=>{
+            // Return dummy info
+            return { type:"none", n:0, a:0, b:1 };
+          };
+
           // ========== FEATURE EXTRACTION & VOTING SYSTEM ==========
-          const extractMLFeatures=(c5,h5,l5,v5,rsi14,adx5,atr_bps,z_vwap,roc1,roc3,spreadBps,obi,ofi30s,mtfAgg)=>{ return [ (roc1||0), (roc3||0), ((atr_bps||0)/100), ((rsi14||50)/100), ((adx5||0)/100), (z_vwap||0), ((spreadBps||0)/100), (obi||0), (ofi30s||0), ((mtfAgg.rsi||50)/100), ((mtfAgg.adx||0)/100), 0,0,0,0, (mean(v5.slice(-20))||0)/1e6, (std(v5.slice(-20))||0)/1e6, (std(c5.slice(-20))||0)/100 ]; };
-          const predictLogistic = (feat) => { const score = (feat[0] * 2) + (feat[1] * 1.5) - (feat[6] * 3); return score > 0 ? "long" : "short"; };
-          const predictNaiveBayes = (feat) => { let bullishSignals = 0; if (feat[3] < 0.35) bullishSignals++; if (feat[5] < -1.2) bullishSignals++; if (feat[7] < -0.25) bullishSignals++; return bullishSignals >= 2 ? "long" : "short"; };
+          const extractMLFeatures=(c5,h5,l5,v5,rsi14,adx5,atr_bps,z_vwap,roc1,roc3,spreadBps,obi,ofi30s,mtfAgg,tfAlign)=>{
+            const volMean=mean(v5.slice(-20));
+            const volStd=std(v5.slice(-20));
+            const priceStd=std(c5.slice(-20));
+            return [
+              roc1||0, roc3||0, (atr_bps||0)/100, (rsi14||50)/100, (adx5||0)/100,
+              z_vwap||0, (spreadBps||0)/100, obi||0, ofi30s||0,
+              (mtfAgg.rsi||50)/100, (mtfAgg.adx||0)/100, tfAlign||0,
+              (mtfAgg.roc1||0)*100, (mtfAgg.roc3||0)*100, (mtfAgg.atr_bps||0)/100,
+              (volMean||0)/1e6, (volStd||0)/1e6, (priceStd||0)/100
+            ];
+          };
+
+          // ========== RULE-BASED HEURISTIC "PREDICTION" FUNCTIONS ==========
+          const predictLogistic = (feat) => { const score = (feat[0] * 2) + (feat[1] * 1.5) - (feat[6] * 3) + (feat[11] * 4); return score > 0 ? "long" : "short"; };
+          const predictNaiveBayes = (feat) => { let bullishSignals = 0; if (feat[3] < 0.35) bullishSignals++; if (feat[5] < -1.2) bullishSignals++; if (feat[7] < -0.25) bullishSignals++; if (feat[11] > 0.75) bullishSignals++; return bullishSignals >= 2 ? "long" : "short"; };
           const predictKNN = (feat) => { const idealLong = [0.01, 0.02, 0.5, 0.3, 0.4, -1.2, 0.05, -0.3]; const idealShort = [-0.01, -0.02, 0.5, 0.7, 0.4, 1.2, 0.05, 0.3]; const distLong = feat.slice(0,8).reduce((s,f,i)=>s + (f-idealLong[i])**2, 0); const distShort = feat.slice(0,8).reduce((s,f,i)=>s + (f-idealShort[i])**2, 0); return distLong < distShort ? "long" : "short"; };
           const predictPerceptron = (feat) => { const score = (feat[3] - 0.5) * -2 + (feat[5] * -1.5) + (feat[7] * -2); return score > 0 ? "long" : "short"; };
-          const predictDecisionTree = (feat) => { if (feat[4] > 0.3) return feat[0] > 0 ? "long" : "short"; else return feat[5] < 0 ? "long" : "short"; };
+          const predictDecisionTree = (feat) => { if (feat[4] > 0.3) { return feat[0] > 0 ? "long" : "short"; } else { return feat[5] < 0 ? "long" : "short"; } };
           const predictRandomForest = (feat) => { let votes = 0; if (feat[3] < 0.4) votes++; else votes--; if (feat[5] < -0.5) votes++; else votes--; if (feat[7] < -0.1) votes++; else votes--; return votes > 0 ? "long" : "short"; };
           const predictNeuralNet = (feat) => { const hidden1 = Math.tanh(feat[0]*3 + feat[5]*2); const hidden2 = Math.tanh(feat[3]*-2 + feat[7]*-1.5); const output = hidden1 * 0.6 + hidden2 * 0.4; return output > 0 ? "long" : "short"; };
-          const predictMeanReversion = (feat) => { const z_vwap = feat[5] || 0; const rsi = feat[3] * 100 || 50; const obi = feat[7] || 0; let score = 0; if ((rsi < 30 && z_vwap < -1.5) || obi < -0.3) score++; if ((rsi > 70 && z_vwap > 1.5) || obi > 0.3) score--; return score >= 0 ? "long" : "short"; };
-          const predictMomentum = (feat) => { const adx = feat[4] * 100 || 0; let score = 0; if (adx > 25 && (feat[0] > 0 && feat[1] > 0)) score = 1; if (adx > 25 && (feat[0] < 0 && feat[1] < 0)) score = -1; return score >= 0 ? "long" : "short"; };
-          
-          async function mlEnsembleVote(symbol, features, originalSide, state) { const weights = state.model_weights || {}; const getWeight = (model) => { const w = weights[model]; return (typeof w === 'number' && w >= 0 && w <= 20) ? w : 10; }; let longScore = 0, shortScore = 0; const details = [], votes = {}; const w0 = getWeight("Original"); if (originalSide === "long") longScore += w0; else shortScore += w0; details.push({ model: "Original", vote: originalSide, weight: w0 }); votes["Original"] = originalSide; const v1 = predictLogistic(features); const w1 = getWeight("Logistic"); if(v1 === "long") longScore += w1; else shortScore += w1; details.push({model:"Logistic", vote:v1, weight:w1}); votes["Logistic"]=v1; const v2 = predictNaiveBayes(features); const w2 = getWeight("NaiveBayes"); if(v2 === "long") longScore += w2; else shortScore += w2; details.push({model:"NaiveBayes", vote:v2, weight:w2}); votes["NaiveBayes"]=v2; const v3 = predictKNN(features); const w3 = getWeight("KNN"); if(v3 === "long") longScore += w3; else shortScore += w3; details.push({model:"KNN", vote:v3, weight:w3}); votes["KNN"]=v3; const v4 = predictPerceptron(features); const w4 = getWeight("Perceptron"); if(v4 === "long") longScore += w4; else shortScore += w4; details.push({model:"Perceptron", vote:v4, weight:w4}); votes["Perceptron"]=v4; const v5 = predictDecisionTree(features); const w5 = getWeight("DecisionTree"); if(v5 === "long") longScore += w5; else shortScore += w5; details.push({model:"DecisionTree", vote:v5, weight:w5}); votes["DecisionTree"]=v5; const v6 = predictRandomForest(features); const w6 = getWeight("RandomForest"); if(v6 === "long") longScore += w6; else shortScore += w6; details.push({model:"RandomForest", vote:v6, weight:w6}); votes["RandomForest"]=v6; const v7 = predictNeuralNet(features); const w7 = getWeight("NeuralNet"); if(v7 === "long") longScore += w7; else shortScore += w7; details.push({model:"NeuralNet", vote:v7, weight:w7}); votes["NeuralNet"]=v7; const v8 = predictMeanReversion(features); const w8 = getWeight("MeanReversion"); if(v8 === "long") longScore += w8; else shortScore += w8; details.push({model:"MeanReversion", vote:v8, weight:w8}); votes["MeanReversion"]=v8; const v9 = predictMomentum(features); const w9 = getWeight("Momentum"); if(v9 === "long") longScore += w9; else shortScore += w9; details.push({model:"Momentum", vote:v9, weight:w9}); votes["Momentum"]=v9; const majoritySide = longScore >= shortScore ? 'long' : 'short'; const confidenceBoost = Math.round(Math.abs(longScore - shortScore) / 10); const totalWeight = longScore + shortScore; const agreement = (Math.max(longScore, shortScore) / (totalWeight || 1)).toFixed(2); return { ensemble_side: majoritySide, votes_long: longScore, votes_short: shortScore, confidence_boost: confidenceBoost, agreement: agreement, details: details, votes: votes }; }
+          const predictMeanReversion = (model, feat) => { const z_vwap = feat[5] || 0; const rsi = feat[3] * 100 || 50; const obi = feat[7] || 0; const oversold = rsi < 30 && z_vwap < -1.5; const overbought = rsi > 70 && z_vwap > 1.5; let score = 0; if (oversold || obi < -0.3) score++; if (overbought || obi > 0.3) score--; return score >= 0 ? "long" : "short"; };
+          const predictMomentum = (model, feat) => { const roc1 = feat[0] || 0; const roc3 = feat[1] || 0; const adx = feat[4] * 100 || 0; const strong_trend = adx > 25; const bullish = roc1 > 0 && roc3 > 0; const bearish = roc1 < 0 && roc3 < 0; let score = 0; if (strong_trend && bullish) score = 1; if (strong_trend && bearish) score = -1; return score >= 0 ? "long" : "short"; };
+
+          async function mlEnsembleVote(symbol, features, originalSide, state) {
+            const weights = state.model_weights || {};
+            const getWeight = (model) => { const w = weights[model]; if (typeof w === 'number' && Number.isFinite(w) && w >= 0 && w <= 20) return w; return 10; };
+            log(`\n========== ML ENSEMBLE: ${symbol} ==========`);
+            log(`Original side: ${originalSide}`);
+            log(`📊 Current weights:`, Object.entries(weights).sort((a,b)=>b[1]-a[1]).map(([m,w])=>`${m}:${getWeight(m)}`).join(", "));
+            
+            let longScore = 0, shortScore = 0; const details = [], votes = {};
+            
+            const w0 = getWeight("Original"); if (originalSide === "long") longScore += w0; else shortScore += w0; details.push({ model: "Original", vote: originalSide, weight: w0 }); votes["Original"] = originalSide; log(`  [0] Original        → ${originalSide.toUpperCase()} (w=${w0})`);
+            const v1 = predictLogistic(features); const w1 = getWeight("Logistic"); if(v1 === "long") longScore += w1; else shortScore += w1; details.push({model:"Logistic", vote:v1, weight:w1}); votes["Logistic"]=v1; log(`  [1] Logistic        → ${v1.toUpperCase()} (w=${w1})`);
+            const v2 = predictNaiveBayes(features); const w2 = getWeight("NaiveBayes"); if(v2 === "long") longScore += w2; else shortScore += w2; details.push({model:"NaiveBayes", vote:v2, weight:w2}); votes["NaiveBayes"]=v2; log(`  [2] NaiveBayes      → ${v2.toUpperCase()} (w=${w2})`);
+            const v3 = predictKNN(features); const w3 = getWeight("KNN"); if(v3 === "long") longScore += w3; else shortScore += w3; details.push({model:"KNN", vote:v3, weight:w3}); votes["KNN"]=v3; log(`  [3] KNN             → ${v3.toUpperCase()} (w=${w3})`);
+            const v4 = predictPerceptron(features); const w4 = getWeight("Perceptron"); if(v4 === "long") longScore += w4; else shortScore += w4; details.push({model:"Perceptron", vote:v4, weight:w4}); votes["Perceptron"]=v4; log(`  [4] Perceptron      → ${v4.toUpperCase()} (w=${w4})`);
+            const v5 = predictDecisionTree(features); const w5 = getWeight("DecisionTree"); if(v5 === "long") longScore += w5; else shortScore += w5; details.push({model:"DecisionTree", vote:v5, weight:w5}); votes["DecisionTree"]=v5; log(`  [5] DecisionTree    → ${v5.toUpperCase()} (w=${w5})`);
+            const v6 = predictRandomForest(features); const w6 = getWeight("RandomForest"); if(v6 === "long") longScore += w6; else shortScore += w6; details.push({model:"RandomForest", vote:v6, weight:w6}); votes["RandomForest"]=v6; log(`  [6] RandomForest    → ${v6.toUpperCase()} (w=${w6})`);
+            const v7 = predictNeuralNet(features); const w7 = getWeight("NeuralNet"); if(v7 === "long") longScore += w7; else shortScore += w7; details.push({model:"NeuralNet", vote:v7, weight:w7}); votes["NeuralNet"]=v7; log(`  [7] NeuralNet       → ${v7.toUpperCase()} (w=${w7})`);
+            const v8 = predictMeanReversion(null, features); const w8 = getWeight("MeanReversion"); if(v8 === "long") longScore += w8; else shortScore += w8; details.push({model:"MeanReversion", vote:v8, weight:w8}); votes["MeanReversion"]=v8; log(`  [8] MeanReversion   → ${v8.toUpperCase()} (w=${w8})`);
+            const v9 = predictMomentum(null, features); const w9 = getWeight("Momentum"); if(v9 === "long") longScore += w9; else shortScore += w9; details.push({model:"Momentum", vote:v9, weight:w9}); votes["Momentum"]=v9; log(`  [9] Momentum        → ${v9.toUpperCase()} (w=${w9})`);
+
+            log(`\n📊 Weighted Score: LONG=${longScore} SHORT=${shortScore}`);
+            const majoritySide = longScore >= shortScore ? 'long' : 'short';
+            const confidenceBoost = Math.round(Math.abs(longScore - shortScore) / 10);
+            const totalWeight = longScore + shortScore;
+            const agreement = (Math.max(longScore, shortScore) / (totalWeight || 1)).toFixed(2);
+            log(`✅ DECISION: ${majoritySide.toUpperCase()} (${(agreement*100).toFixed(1)}% weighted agreement)`);
+            if (majoritySide !== originalSide) log(`⚠️  SIDE FLIPPED: ${originalSide}→${majoritySide}`);
+            log(`==========================================\n`);
+            return { ensemble_side: majoritySide, votes_long: longScore, votes_short: shortScore, confidence_boost: confidenceBoost, agreement: agreement, details: details, votes: votes };
+          }
+          function getSymbolAdj(state, base) {
+            const real = state.sym_stats_real?.[base];
+            const s = real || state.sym_stats?.[base];
+            if (!s || s.n < 6) return 1.0;
+            const winRate = s.wins / s.n;
+            const avgPnL = s.pnl_sum / s.n;
+            let m = 1.0;
+            if (winRate < 0.4) m *= 0.7;
+            if (avgPnL < 0) m *= 0.8;
+            return clamp(m, 0.5, 1.2);
+          }
+
+          const TRADE_CSV_KEYS=["ts_close_iso","idea_id","client_order_id","symbol","side","pnl_bps","entry_ts_ms","exit_ts_ms","entry_price","exit_price","qty","commission_bps","commission_quote_usdt","commission_asset_entry","commission_asset_exit","maker_taker_entry","maker_taker_exit","slip_realized_bps","reconciliation","fingerprint_entry","fingerprint_exit","calib_key","p_raw","p_pred","regime","source"];
+          function buildAuditOutputs(state){
+            const lastNClosed=(state.closed||[]).slice(-5000);
+            const rows=[];
+            for(const c of lastNClosed){
+              const td=c.trade_details||{};
+              const row={ ts_close_iso: new Date(c.ts_exit_ms||Date.now()).toISOString(), idea_id: td.idea_id||"", client_order_id: td.client_order_id||"", symbol: c.symbolFull||"", side: c.side||"", pnl_bps: c.pnl_bps, entry_ts_ms: c.ts_entry_ms||"", exit_ts_ms: c.ts_exit_ms||"", entry_price: c.price_entry||"", exit_price: c.price_exit||"", qty: c.qty||"", commission_bps: td.commission_bps, commission_quote_usdt: td.commission_quote_usdt, commission_asset_entry: td.commission_asset_entry||"", commission_asset_exit: td.commission_asset_exit||"", maker_taker_entry: td.maker_taker_entry||"", maker_taker_exit: td.maker_taker_exit||"", slip_realized_bps: td.slip_realized_bps, reconciliation: c.reconciliation||"", fingerprint_entry: td.fingerprint_entry||"", fingerprint_exit: td.fingerprint_exit||"", calib_key: c.calib_key||"", p_raw: c.p_raw, p_pred: c.p_pred, regime: c.regime||"", source: c.reconciliation||"" };
+              rows.push(toCSVLine(row, TRADE_CSV_KEYS));
+            }
+            const header=TRADE_CSV_KEYS.join(",");
+            const tradesCsv=[header,...rows].join("\n");
+            return { closedAudit: (state.closed||[]).slice(-5000).map(x=>JSON.stringify(x)).join("\n"), disagreements: (state.calibration_holdout||[]).slice(-500).map(x=>JSON.stringify(x)).join("\n"), tradesCsv };
+          }
           
           // ---------- Main ----------
+          let reason="ok", selectionTier="confidence";
           try{
             const { state, persist } = await loadState();
             function updateModelWeights(state) {
               const learnable = (state.closed || []).filter(c => c.ml_ensemble?.votes && c.pnl_bps != null && !c.weights_learned);
-              if (!learnable.length) return;
-              log(`🎯 LEARNING WEIGHTS FROM ${learnable.length} CLOSED TRADES`);
+              if (!learnable.length) { log("🎯 No new votes to learn from this cycle"); return; }
+              
+              log(`\n🎯 ===== LEARNING WEIGHTS FROM ${learnable.length} CLOSED TRADES =====`);
+              log("📊 Weights BEFORE:", Object.entries(state.model_weights).sort((a,b)=>b[1]-a[1]).map(([m,w])=>`${m}:${w}`).join(", "));
+              
               for (const trade of learnable) {
-                const isWin = (trade.pnl_bps || 0) > 0, takenSide = trade.side, votes = trade.ml_ensemble?.votes || {};
+                const isWin = (trade.pnl_bps || 0) > 0;
+                const takenSide = trade.side;
+                const votes = trade.ml_ensemble?.votes || {};
+                
+                log(`\n📈 ${trade.symbolFull || trade.symbol} ${takenSide.toUpperCase()} ${isWin ? "✅ WIN" : "❌ LOSS"} (${trade.pnl_bps} bps)`);
+                
+                const correct = [], wrong = [];
                 for (const [model, votedSide] of Object.entries(votes)) {
-                    if (!state.model_weights[model]) continue;
-                    const oldWeight = state.model_weights[model];
-                    const wasCorrect = ((votedSide === takenSide) && isWin) || ((votedSide !== takenSide) && !isWin);
-                    state.model_weights[model] = clamp(oldWeight + (wasCorrect ? 1 : -1), 0, 20);
-                }
-                trade.weights_learned = true;
-              }
-            }
-            updateModelWeights(state);
+                    if (!state.model_weights_prev) state.model_weights_prev = {};
+                    const cur = state.model_weights[model];
+                    const isValid = (w) => (typeof w === 'number' && Number.isFinite(w) && w >= 0 && w <= 20);
+                    if (!isValid(cur)) {
+                        const fallback = isValid(state.model_weights_prev[model]) ? state.model_weights_prev[model] : 10;
+                        log(`⚠️  Corrupted weight for ${model}: ${cur}, restoring to ${fallback}`);
+                        state.model_weights[model] = fallback;
+                    }
 
-            const ALL24 = await fetchAll24hr() || [];
-            const booksRaw=await getJSON(api("/api/v3/ticker/bookTicker")) || [];
-            const bookMap=new Map(booksRaw.map(b=>[b.symbol,{ bid:+b.bidPrice, ask:+b.askPrice }]));
+                    const oldWeight = state.model_weights[model];
+                    let newWeight = oldWeight;
+                    const wasCorrect = ((votedSide === takenSide) && isWin) || ((votedSide !== takenSide) && !isWin);
+                    if (wasCorrect) newWeight++; else newWeight--;
+                    newWeight = Math.max(0, Math.min(20, newWeight));
+                    
+                    if (wasCorrect) correct.push(`${model}(${oldWeight}→${newWeight})`);
+                    else wrong.push(`${model}(${oldWeight}→${newWeight})`);
+                    
+                    state.model_weights[model] = newWeight;
+                    state.model_weights_prev[model] = newWeight;
+                }
+                
+                if (correct.length > 0) log(`   ✅ Correct (${correct.length}): ${correct.join(", ")}`);
+                if (wrong.length > 0) log(`   ❌ Wrong (${wrong.length}): ${wrong.join(", ")}`);
+                
+                trade.weights_learned = true;
+                trade.weights_learned_at = Date.now();
+              }
+              
+              log("\n📊 Weights AFTER:", Object.entries(state.model_weights).sort((a,b)=>b[1]-a[1]).map(([m,w])=>`${m}:${w}`).join(", "));
+              log("==========================================\n");
+            }
             
+            // ❌ No calibration learning. Only voter weight adaptation.
+            updateModelWeights(state);
+            const calibHealth = {}; // Dummy object, calibration is removed.
+
+            const heartbeat = await heartbeatCheck(state);
+            if((heartbeat?.zombies||0)>0) log("heartbeat zombies", heartbeat.zombies, (heartbeat.details||[]).slice(0,5));
+
+            const cleaned = await cleanupPendingBeforePlanning(state, heartbeat);
+            if (cleaned.dropped > 0) { await saveState(persist, state, buildAuditOutputs(state), 2, true); }
+
+            const ALL24 = await fetchAll24hr();
+            const booksRaw=await getJSON(api("/api/v3/ticker/bookTicker"),10000,2) || [];
+            const bookMap=new Map(booksRaw.map(b=>[b.symbol,{ bid:+b.bidPrice, ask:+b.askPrice }]));
+            if(!todOK) reason="tod_gate";
+
+            const BTC="BTCUSDT";
+            const kBTC1H=await getKCached(BTC,"1h",K1H);
+            const kBTC5=await getKCached(BTC,"5m",K5M);
+            const btcUp1h = (() => { if (!kBTC1H?.length) return false; const c = kBTC1H.map(x => +x[4]); return c.at(-1) >= ema(c, EMA_FAST) && c.at(-1) >= ema(c, EMA_SLOW); })();
+            const btcR5=(()=>{ const c=(kBTC5||[]).map(x=>+x[4]); const r=[]; for(let i=1;i<c.length;i++) r.push(Math.log(c[i]/c[i-1])); return r.slice(-120); })();
+
             const FIXED_120_BASES = ["BTC","ETH","BNB","SOL","XRP","ADA","AVAX","DOGE","DOT","MATIC","LTC","SHIB","TRX","LINK","ATOM","UNI","XLM","ETC","BCH","NEAR","APT","ARB","OP","LDO","STX","IMX","INJ","VET","FIL","HBAR","MKR","AAVE","QNT","GRT","ALGO","RUNE","SAND","MANA","XTZ","AXS","EOS","THETA","FTM","ICP","EGLD","FLOW","XMR","APE","CHZ","KLAY","GALA","SNX","CRV","ZEC","ENJ","DASH","NEO","COMP","KCS","ZIL","BAT","WAVES","IOTA","1INCH","LRC","SUSHI","YFI","RVN","CELO","HOT","OMG","ZRX","ICX","ONT","QTUM","SKL","AR","GMT","JST","RSR","ONE","AUDIO","ANKR","CKB","MASK","DYDX","BLUR","SUI","SEI","TIA","JUP","WLD","PEPE","FET","RENDER","AGIX","ORDI","WIF","BONK","FLOKI","PYTH","JTO","STRK","MEME","DYM","PORTAL","XAI","ALT","PIXEL","AEVO","NFP","ACE","RDNT","MAV","PENDLE","AI","ID","JOE"];
             const QUOTES=["USDT","USDC","USD"];
-            const all24Map=new Map(ALL24.map(t=>[t.symbol,t]));
+            const all24Map=new Map(); for(const t of ALL24||[]){ const sym=t.symbol||t.s; if(sym) all24Map.set(sym,t); }
             const universe=[];
             for(const base of FIXED_120_BASES){
-              for(const q of QUOTES){ const t=all24Map.get(base+q); if(t?.quoteVolume>0){ universe.push({ symbol:base+q, base, quote:q, qv:+t.quoteVolume }); break; } }
+              for(const q of QUOTES){
+                const t=all24Map.get(base+q);
+                if(t?.quoteVolume>0){ universe.push({ symbol:base+q, base, quote:q, qv:+t.quoteVolume }); break; }
+              }
             }
+            log("universe (fixed 120)", universe.length);
+
+            const { pnl24_bps, peak_dd_bps } = (()=>{ const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of state.equity||[]){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd) }; })();
+            const throttle=(pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
             
-            const picksRaw=[];
-            for(let i=0;i<universe.length;i+=10){
-              const batch=await Promise.all(universe.slice(i,i+10).map(async c=>{ try{
+            const picksRaw=[]; const B=10;
+            for(let i=0;i<(universe||[]).length;i+=B){
+              const batch=await Promise.all(universe.slice(i,i+B).map(async c=>{ try{
                 if((state.cooldown?.[c.base]||0) > Date.now()-COOLDOWN_MS) return null;
-                const book=bookMap.get(c.symbol) || await getBookTickerCached(c.symbol); if(!book?.bid || !book?.ask) return null;
-                const mid=(+book.bid + +book.ask)/2; if(!mid) return null;
-                const k5=await getKCached(c.symbol,"5m",K5M); if(!k5||k5.length<EMA_SLOW+5) return null;
+                const book=bookMap.get(c.symbol) || await getBookTickerCached(c.symbol); if(!book?.bid||!book?.ask) return null;
+                const mid=(+book.bid + +book.ask)/2; if(!(mid>0)) return null;
+                const spreadBps=Math.round(((book.ask-book.bid)/mid)*10000);
+                const k5=await getKCached(c.symbol,"5m",K5M); if(!k5||k5.length<Math.max(EMA_SLOW+5,ATR_P+5)) return null;
                 const c5_raw=k5.map(x=>+x[4]), c5=kalman1D(c5_raw,{q:1e-4,r:5e-4});
                 const h5=k5.map(x=>+x[2]), l5=k5.map(x=>+x[3]), v5=k5.map(x=>+x[5]);
-                const {adx:adx5, atr:atr5} = computeADX_ATR(h5,l5,c5,ADX_P)||{}; if(!atr5) return null;
+                const adxatr=computeADX_ATR(h5,l5,c5,ADX_P)||{}, adx5=adxatr.adx||0, atr5=adxatr.atr||0;
                 const atr_bps=Math.round((atr5/(c5.at(-1)||1))*10000); if(atr_bps<4||atr_bps>260) return null;
-                const last=c5.at(-1), roc1=(last/(c5.at(-2)||last))-1, roc3=(last/(c5.at(-4)||last))-1;
-                const z_vwap=(last-vwapAnchored(h5,l5,c5,v5,36))/(atr5||1);
-                const pTrend=clamp(0.5+0.27*(0.6*tanh(roc1/0.003)+0.4*tanh(roc3/0.0065))*clamp((adx5-16)/14,0,1),0.32,0.93);
-                const pMR=clamp(0.5+0.23*(0.7*tanh(Math.abs(z_vwap))*Math.sign(-z_vwap)+0.3*(-(rsi(c5,14)-50)/50))*(1-clamp((adx5-16)/14,0,1)),0.35,0.90);
-                return {c,p_raw:clamp(0.45*pTrend+0.55*pMR,0.3,0.97), c5_raw,h5_raw:h5,l5_raw:l5,v5_raw:v5,z_vwap,rsi14:rsi(c5,14),adx5,atr_bps,obi:0,ofi30s:0};
+                const vwap5=vwapAnchored(h5,l5,c5,v5,VWAP_5M_WIN), last=c5.at(-1), roc1=(last/(c5.at(-2)||last))-1, roc3=(last/(c5.at(-4)||last))-1, z_vwap=(last-vwap5)/(atr5||1);
+                const rsi14=rsi(c5,14);
+                const win=MR_BREAKOUT_DC_N, dcHi=Math.max(...h5.slice(-win)), dcLo=Math.min(...l5.slice(-win)), breakout=(last>dcHi)||(last<dcLo);
+                if(breakout) state.mr_lockout[c.symbol]=Date.now()+MR_LOCKOUT_SEC*1000;
+                const mrLocked=(Date.now()<(state.mr_lockout?.[c.symbol]||0));
+                const noLongDown=NO_LONG_DOWN_ENABLE&&((rsi14||100)<LONG_DOWN_RSI_CUTOFF);
+                const adxF=clamp((adx5-16)/14,0,1), pTrend=clamp(0.5+0.27*(0.6*tanh(roc1/0.003)+0.4*tanh(roc3/0.0065))*adxF,0.32,0.93), pMR=clamp(0.5+0.23*(0.7*tanh(Math.abs(z_vwap))*Math.sign(-z_vwap)+0.3*(-(rsi14-50)/50))*(1-adxF),0.35,0.90);
+                const pLong0=clamp(0.45*pTrend+0.55*pMR,0.3,0.97), pShort0=clamp(0.45*(1-pTrend)+0.55*(1-pMR),0.3,0.97);
+                return {c,k5,c5,h5,l5,v5,adx5,atr_bps,atr5,spreadBps,pLong0,pShort0,mrLocked,noLongDown,vol1h_est_usd:c.qv/24 };
               }catch{ return null; } }));
               for(const x of batch) if(x) picksRaw.push(x);
             }
 
-            const prelim=picksRaw.sort((a,b)=>Math.abs(b.p_raw-0.5)-Math.abs(a.p_raw-0.5)).slice(0,30);
+            const prelim=picksRaw.map(p=>{ const pW=Math.max(p.pLong0||0,p.pShort0||0), adxN=clamp((p.adx5-16)/14,0,1), sP=Math.max(0,(p.spreadBps||0)-6)/12; return {p,score:0.6*pW+0.3*adxN-0.1*sP}; }).sort((a,b)=>b.score-a.score).slice(0,30).map(x=>x.p);
 
-            const refined = [];
-            for (let p of prelim) {
-              const book=bookMap.get(p.c.symbol);
-              const mid = book ? (+book.bid + +book.ask)/2 : null;
-              if (!mid) continue;
-              
-              const side = p.p_raw > 0.5 ? "long" : "short";
-              const tp = side === "long" ? Math.round(LONG_BOUNCE_TP_ATR * p.atr_bps) : Math.round(p.atr_bps * 1.0);
-              const sl = side === "long" ? Math.min(Math.round(LONG_BOUNCE_SL_ATR * p.atr_bps), 80) : Math.min(Math.round(p.atr_bps * 0.5), 80);
-              if (tp/sl < 1.4) continue;
+            const refined=[];
+            for(let p of prelim){
+              try{
+                const book=bookMap.get(p.c.symbol)||await getBookTickerCached(p.c.symbol); if(!book?.bid||!book?.ask) continue;
+                const mid=(+book.bid + +book.ask)/2; if(!(mid>0)) continue;
+                const depthA=await getDepthCached(p.c.symbol); await sleep(180+Math.floor(Math.random()*120)); const depthB=await fetchDepth(p.c.symbol);
+                const depth=depthB||depthA; if(!depth?.bids?.length || !depth?.asks?.length) continue;
+                const obi=computeOBI(depth,OBI_TOPN), ofi30s=ofiProxy(depthA,depthB);
+                const km=await getKMultiTF(p.c.symbol);
+                const mtf=computeMTFIndicators(km, TF_WEIGHTS);
+                const {slip_bps:slipL} = slipFromDepth(depth,mid,"long",NOTIONAL), {slip_bps:slipS} = slipFromDepth(depth,mid,"short",NOTIONAL);
+                const costLong=COST_BPS+(slipL??Math.round(p.spreadBps/2)), costShort=COST_BPS+(slipS??Math.round(p.spreadBps/2));
+                const {bidsUSD, asksUSD} = depthWithinPctUSD(depth,mid,0.01);
+                const regime=p.mrLocked?"trend":"meanrevert";
+                
+                // ❌ No calibration. Use raw `p.pLong0` and `p.pShort0`.
+                const pLong=p.pLong0, pShort=p.pShort0;
 
-              const mtf = computeMTFIndicators(await getKMultiTF(p.c.symbol), TF_WEIGHTS);
-              const confidence = Math.round(100 * p.p_raw * (0.6 + 0.5 * mtf.tfAlign) );
-              refined.push({ symbol: p.c.symbol, base: p.c.base, quote: p.c.quote, side, p_raw: p.p_raw, confidence, tp_bps: tp, sl_bps: sl, mtf_agg: mtf.agg, ...p });
+                const yR=[]; for(let i=1;i<p.c5.length;i++) yR.push(Math.log(p.c5[i]/p.c5[i-1]));
+                const mu5=mean(yR)||0, sig5=Math.max(1e-4,std(yR));
+                let candLong=null, candShort=null;
+                if(DIRECTION!=="short"){
+                  let tp=Math.round(LONG_BOUNCE_TP_ATR*p.atr_bps), sl=Math.min(Math.round(LONG_BOUNCE_SL_ATR*p.atr_bps),80);
+                  const sim=pathEVHeavy({entry:mid,tp_bps:tp,sl_bps:sl,side:"long",retSeries:yR,mu:mu5,sigma:sig5,steps:4,cost_bps:costLong});
+                  candLong={ side:"long", p_raw:p.pLong0, ev_bps:sim.ev_bps, tp_bps:tp, sl_bps:sl, cost_bps:costLong, regime };
+                }
+                if(DIRECTION!=="long"){
+                  let tp=Math.round(p.atr_bps*1.0), sl=Math.min(Math.round(p.atr_bps*0.5),80);
+                  const sim=pathEVHeavy({entry:mid,tp_bps:tp,sl_bps:sl,side:"short",retSeries:yR,mu:mu5,sigma:sig5,steps:4,cost_bps:costShort});
+                  candShort={ side:"short", p_raw:p.pShort0, ev_bps:sim.ev_bps, tp_bps:tp, sl_bps:sl, cost_bps:costShort, regime };
+                }
+                const chosen=candLong&&candShort?(candLong.ev_bps>=candShort.ev_bps?candLong:candShort):(candLong||candShort||null);
+                if(!chosen) continue;
+                
+                const gateMult = clamp(1 - Math.max(0,(p.spreadBps - MAX_SPREAD_BPS))/MAX_SPREAD_BPS, 0.2, 1.1) * clamp(1 - Math.max(0,(chosen.cost_bps - COST_BPS))/20, 0.2, 1.1) * clamp((p.vol1h_est_usd||0)/MIN_VOL_1H_USD, 0.2, 1.1) * clamp((bidsUSD+asksUSD)/DEPTH_1P_MIN_USD, 0.2, 1.1) * (p.mrLocked?0.7:1.05) * ((chosen.side==="long"&&p.noLongDown)?0.8:1.0) * ((chosen.side==="long"&&!btcUp1h)?0.85:1.0) * clamp(0.4+0.8*mtf.tfAlign,0.2,1.2);
+                const conf = confidenceScore({ p_cal: chosen.p_raw, ev_bps: chosen.ev_bps, atr_bps: p.atr_bps, micro:1, regime:1, reliability:1, riskAdj:1 }) * gateMult;
+                
+                refined.push({ symbol:p.c.symbol, base:p.c.base, quote:p.c.quote, qv:p.c.qv, side:chosen.side, p_raw:+chosen.p_raw.toFixed(3), ev_bps:chosen.ev_bps, tp_bps:chosen.tp_bps, sl_bps:chosen.sl_bps, rrr:+(chosen.tp_bps/chosen.sl_bps).toFixed(2), spread_bps:p.spreadBps, cost_bps:chosen.cost_bps, regime:chosen.regime, hold_sec:clamp(720,TTL_MIN,TTL_MAX), confidence:Math.round(conf), mtf_agg:mtf.agg, tfAlign:mtf.tfAlign, c5_raw:p.c5.slice(-40),h5_raw:p.h5.slice(-40),l5_raw:p.l5.slice(-40),v5_raw:p.v5.slice(-40),z_vwap:(()=>{const vw=vwapAnchored(p.h5,p.l5,p.c5,p.v5,VWAP_5M_WIN);return(p.c5.at(-1)-vw)/(p.atr5||1)})(),rsi14:rsi(p.c5,14)||50,adx:p.adx5,obi,ofi30s });
+              }catch(e){ log("heavy refine warn",e?.message||e); }
             }
             refined.sort((a,b)=>b.confidence-a.confidence);
 
-            let selected=refined.slice(0, TOP_N);
+            const selected=[]; for(const c of refined){ if(selected.length >= TOP_N) break; selected.push(c); }
             
-            for(let pick of selected.slice(0, 10)){
-              const features=extractMLFeatures(pick.c5_raw, pick.h5_raw, pick.l5_raw, pick.v5_raw, pick.rsi14, pick.adx5, pick.atr_bps, pick.z_vwap, 0,0,0, pick.obi, pick.ofi30s, pick.mtf_agg);
-              const oldSide=pick.side;
+            const TOP_ML_COUNT=Math.min(10,selected.length);
+            for(let i=0;i<TOP_ML_COUNT;i++){
+              const pick=selected[i];
+              const features=extractMLFeatures( pick.c5_raw, pick.h5_raw, pick.l5_raw, pick.v5_raw, pick.rsi14, pick.adx, pick.atr_bps, pick.z_vwap, (pick.mtf_agg?.roc1||0), (pick.mtf_agg?.roc3||0), pick.spread_bps, pick.obi, pick.ofi30s, pick.mtf_agg, pick.tfAlign );
+              const oldSide=pick.side, oldConf=pick.confidence;
               const ensemble=await mlEnsembleVote(pick.symbol,features,oldSide,state);
               pick.side=ensemble.ensemble_side; pick.confidence+=ensemble.confidence_boost;
-              pick.ml_ensemble=ensemble; pick.ml_features=features;
+              ensemble.original_side = oldSide; pick.ml_ensemble=ensemble; pick.ml_features=features;
+              log(`  📝 RESULT: side=${oldSide}→${pick.side}, conf=${oldConf}→${pick.confidence} (+${ensemble.confidence_boost})`);
             }
             selected.sort((a,b)=>b.confidence-a.confidence);
 
-            let picks = selected.map(p => {
-              const book = bookMap.get(p.symbol);
-              if (!book || !isFinite(+book.bid) || !isFinite(+book.ask)) return null;
-              const mid = (+book.bid + +book.ask) / 2;
-              const size = FIXED_SIZE_BPS > 0 ? FIXED_SIZE_BPS : (Number(process.env.FORCE_SIZE_BPS||"0")>0) ? Number(process.env.FORCE_SIZE_BPS) : (p.sl_bps>0?Math.min(220,Math.round((52/p.sl_bps)*100)):0);
-              const entry_limit = p.side === 'long' ? mid * (1 - p.sl_bps/20000) : mid * (1 + p.sl_bps/20000);
-              return { ...p, idea_id:uuidv4(), client_order_id:mkClientOrderId("mxu"), symbol_full:p.symbol, p_win:p.p_raw, ev_bps: p.p_raw * p.tp_bps - (1-p.p_raw)*p.sl_bps, size_bps: size, ttl_sec: TTL_MIN, cost_bps: COST_BPS, entry_policy:"maker_join", entry_limit, tp_abs: entry_limit * (1 + (p.side==='long'?1:-1)*p.tp_bps/10000), sl_abs: entry_limit * (1 - (p.side==='long'?1:-1)*p.sl_bps/10000), predicted:{meta:{}} };
-            }).filter(Boolean);
+            const votingRecord={ ts:new Date().toISOString(), ts_ms:Date.now(), votes: selected.slice(0,10).map(p=>({ symbol: p.symbol, original_side: p.ml_ensemble?.original_side || p.side, final_side: p.side, confidence_after: p.confidence, ...p.ml_ensemble })) };
+            state.ml_voting_history.push(votingRecord);
+            if(state.ml_voting_history.length>20) state.ml_voting_history.shift();
+            await saveState(persist, state, buildAuditOutputs(state), 2, true);
 
-            const nowMs = Date.now();
-            for (const p of picks) {
-              state.cooldown[p.base] = nowMs;
-              state.cooldown_side[p.base] = { side: p.side, ts_ms: nowMs };
-              state.pending.push({
-                ts: new Date(nowMs).toISOString(), ts_ms: nowMs, ttl_ts_ms: nowMs + p.ttl_sec * 1000,
-                symbolFull: p.symbol_full, base: p.base, side: p.side, idea_id: p.idea_id, client_order_id: p.client_order_id,
-                hold_sec: p.ttl_sec, tp_bps: p.tp_bps, sl_bps: p.sl_bps, size_bps: p.size_bps, p_raw: p.p_raw,
-                predicted: p.predicted, status: "planned", entry_ts_ms: null, entry_price: null, qty: null
-              });
-            }
-            if (state.pending.length > 550) state.pending = state.pending.slice(-550);
-            
-            await saveState(persist, state);
+            const wEv=softmax(selected.map(x=>x.ev_bps),20);
+            let picks = selected.map((x,i)=>{
+              const mid = (bookMap.get(x.symbol)?.bid + bookMap.get(x.symbol)?.ask)/2;
+              const size_bps = FIXED_SIZE_BPS > 0 ? FIXED_SIZE_BPS : (Number(process.env.FORCE_SIZE_BPS||"0")>0) ? Number(process.env.FORCE_SIZE_BPS) : (x.sl_bps>0?Math.min(220,Math.round((wEv[i]*TARGET_PORT_RISK_BPS/x.sl_bps)*100)):0);
+              return { idea_id:uuidv4(), client_order_id:mkClientOrderId("mxu"), symbol:x.base, symbol_full:x.symbol, side:x.side, p_win:x.p_raw, p_raw:x.p_raw, ev_bps:x.ev_bps, tp_bps:x.tp_bps, sl_bps:x.sl_bps, size_bps, confidence:x.confidence, ml_ensemble:x.ml_ensemble, ml_features:x.ml_features, predicted:{meta:{strategy:STRATEGY_NAME,model_version:MODEL_VERSION}} };
+            });
 
-            const payload = { ts:new Date().toISOString(), source:"external_pusher", meta:{}, top_n:picks.length, ideas:picks };
+            const payload = { ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta:{}, top_n:picks.length, ideas:picks };
             log(`pushing ${picks.length} ideas to ${PUSH_URL}`);
             const r = await fetchWithTimeout(PUSH_URL,{ method:"POST", headers:{ "Content-Type":"application/json", "Authorization":"Bearer " + PUSH_TOKEN }, body: JSON.stringify(payload) },15000);
             log("push status", r?.status||"ERR", (await r.text()||"").slice(0,400));
@@ -352,7 +821,7 @@ jobs:
           if [[ $EXIT_CODE -ne 0 ]]; then
             echo "[gha] pusher exited with code $EXIT_CODE — sending minimal payload"
             raw_push_url="$(printf '%s' "${WORKER_PUSH_URL}" | tr -d '\r\n')"
-            payload='{"ts":"'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'","source":"external_pusher","meta":{"reason":"fallback_node_error"},"top_n":0,"ideas":[]}'
+            payload='{"ts":"'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'","mode":"normal","source":"external_pusher","meta":{"origin":"github_actions","reason":"fallback_node_error"},"top_n":0,"ideas":[]}'
             curl -g -sS -o /dev/null -w "%{http_code}" -X POST -H "Content-Type: application/json" -H "Authorization: Bearer ${PUSH_TOKEN}" --data-raw "${payload}" --max-time 12 "${raw_push_url}" || true
             exit 0
           fi
