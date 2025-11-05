@@ -435,7 +435,8 @@ jobs:
                 lstm:{layers:null,trained_at:0,n_samples:0},
                 cnn_lstm:{layers:null,trained_at:0,n_samples:0},
                 tft:{attention:null,trained_at:0,n_samples:0},
-                hmm:{transition:null,emission:null,trained_at:0,n_samples:0}
+                hmm:{transition:null,emission:null,trained_at:0,n_samples:0},
+                antioriginal:{trained_at:0,n_samples:0}
               },
               ml_training_buffer:[]
             };
@@ -473,7 +474,8 @@ jobs:
                 lstm:{layers:null,trained_at:0,n_samples:0},
                 cnn_lstm:{layers:null,trained_at:0,n_samples:0},
                 tft:{attention:null,trained_at:0,n_samples:0},
-                hmm:{transition:null,emission:null,trained_at:0,n_samples:0}
+                hmm:{transition:null,emission:null,trained_at:0,n_samples:0},
+                antioriginal:{trained_at:0,n_samples:0}
               };
               if(!Array.isArray(s.ml_training_buffer))s.ml_training_buffer=[];
               if(!Array.isArray(s.ml_voting_history))s.ml_voting_history=[]; // ⭐ NEW
@@ -491,7 +493,8 @@ jobs:
                 "NeuralNet": 10,
                 "MeanReversion": 10,
                 "Momentum": 10,
-                "HMM": 10
+                "HMM": 10,
+                "AntiOriginal": 10
               };
               if(!s.model_weights_prev)s.model_weights_prev={};
 
@@ -1102,6 +1105,11 @@ jobs:
             return next_state === 1 ? "long" : "short";
           };
 
+          // 13. AntiOriginal (contrarian)
+          const predictAntiOriginal = (model, feat, originalSide) => {
+            return originalSide === "long" ? "short" : "long";
+          };
+
           function shouldRetrainModels(state){
             const MIN_SAMPLES=50;
             const RETRAIN_INTERVAL_MS=6*3600*1000;
@@ -1119,7 +1127,7 @@ jobs:
               return;
             }
             
-            log(`🎓 Training 12 ML models with ${n} samples...`);
+            log(`🎓 Training 13 ML models with ${n} samples...`);
             const nowTs = Date.now();
             
             // Shared tree builder for all tree-based models
@@ -1365,7 +1373,10 @@ jobs:
               };
             }
             
-            log(`✅ All 12 models trained successfully`);
+            // 13. AntiOriginal (rule-based, contrarian)
+            state.ml_models.antioriginal = { trained_at: nowTs, n_samples: n };
+
+            log(`✅ All 13 models trained successfully`);
           }
 
           async function mlEnsembleVote(symbol, features, originalSide, state) {
@@ -1506,6 +1517,15 @@ jobs:
             details.push({ model: "HMM", vote: v12, weight: w12 });
             votes["HMM"] = v12;
             log(`  [12] HMM               → ${v12.toUpperCase()} (w=${w12})`);
+            
+            // Voter 13: AntiOriginal
+            const v13 = predictAntiOriginal(state.ml_models.antioriginal, features, originalSide);
+            const w13 = getWeight("AntiOriginal");
+            if (v13 === "long") longScore += w13;
+            else shortScore += w13;
+            details.push({ model: "AntiOriginal", vote: v13, weight: w13 });
+            votes["AntiOriginal"] = v13;
+            log(`  [13] AntiOriginal      → ${v13.toUpperCase()} (w=${w13})`);
             
             log(`\n📊 Weighted Score: LONG=${longScore} SHORT=${shortScore}`);
             
