@@ -1,8 +1,6 @@
 name: Ideas Pusher (MEXC Ultimate 7.7.7)
 
 on:
-  schedule:
-    - cron: "0 */3 * * *"
   repository_dispatch:
     types: [run_B]
   workflow_dispatch: {}
@@ -571,31 +569,17 @@ jobs:
           function mergeStates(remote, local) {
             const merged = { ...remote };
 
+            // ✅ Merge learned_trade_keys (cap 500)
             const remoteKeys = Array.isArray(remote.learned_trade_keys) ? remote.learned_trade_keys : [];
-            const localKeys = Array.isArray(local.learned_trade_keys) ? local.learned_trade_keys : [];
-            
-            const localSet = new Set(localKeys);
-            const uniqueRemote = remoteKeys.filter(k => !localSet.has(k));
-            merged.learned_trade_keys = [...uniqueRemote, ...localKeys].slice(-2000);
+            const localKeys  = Array.isArray(local.learned_trade_keys)  ? local.learned_trade_keys  : [];
+            const mergedKeys = Array.from(new Set([...remoteKeys, ...localKeys])).slice(-500);
+            merged.learned_trade_keys = mergedKeys;
 
-            // ✅ CHANGED: Recompute symbol counts from merged closed trades
-            const recomputeCounts = (closed_trades, learned_keys_set) => {
-              const counts = {};
-              for (const c of closed_trades) {
-                if (!c.learned) continue;
-                const key = buildLearnKey(c);
-                if (!learned_keys_set.has(key)) continue;
-                const sym = c.symbolFull || c.symbol;
-                const side = c.side;
-                const reg = c.regime || "unknown";
-                const count_key = `${side}_${reg}_${sym}`;
-                counts[count_key] = (counts[count_key] || 0) + 1;
-              }
-              return counts;
-            };
-            
-            const learned_keys_set = new Set(merged.learned_trade_keys);
-            merged.calib_symbol_counts = recomputeCounts(merged.closed || [], learned_keys_set);
+            // ✅ Preserve calib_symbol_counts as aggregate (do NOT recompute from closed[])
+            // Pick the one with more coverage to avoid losing accumulated poison-tracking data
+            const rCounts = remote.calib_symbol_counts || {};
+            const lCounts = local.calib_symbol_counts  || {};
+            merged.calib_symbol_counts = (Object.keys(rCounts).length >= Object.keys(lCounts).length) ? rCounts : lCounts;
 
 
             const dropSet = new Set((local.__drop_pending_cids || []).map(x => String(x).trim()).filter(Boolean));
@@ -650,13 +634,18 @@ jobs:
               return `${cid}|${tx}`;
             };
             const localClosedMap = new Map((local.closed||[]).map(c => [keyClosed(c), c]));
-            merged.closed = (remote.closed || []).map(rc => {
-              const lc = localClosedMap.get(keyClosed(rc));
-              if (!lc) return rc;
-              const learned = Boolean(rc.learned || lc.learned);
-              const learned_at_ts = learned ? (rc.learned_at_ts || lc.learned_at_ts || Date.now()) : undefined;
-              return { ...rc, learned, learned_at_ts };
-            });
+            // ✅ Keep remote closed + propagate learned flag from local, then filter out learned
+            merged.closed = (remote.closed || [])
+              .map(rc => {
+                const lc = localClosedMap.get(keyClosed(rc));
+                if (!lc) return rc;
+                const learned = Boolean(rc.learned || lc.learned);
+                const learned_at_ts = learned ? (rc.learned_at_ts || lc.learned_at_ts || Date.now()) : undefined;
+                return { ...rc, learned, learned_at_ts };
+              })
+              .filter(c => !c.learned); // ✅ Only keep unprocessed (learned ones deleted)
+
+            log("[gha] mergeStates: kept", merged.closed.length, "unprocessed trades");
             
             merged.version_ts = Date.now();
 
@@ -665,6 +654,62 @@ jobs:
                         "merged_pending", merged.pending.length);
 
             return merged;
+          }
+
+          function compactStateForGist(s) {
+            const out = { ...s };
+
+            // 1) Keep only unprocessed trades in closed[]
+            out.closed = (out.closed || []).filter(c => !c.learned);
+
+            // 2) Remove transient ML buffers (if Worker added them)
+            delete out.ml_training_buffer;
+            delete out.ml_voting_history;
+            delete out.buffer_at_plan;
+
+            // 3) Cap arrays
+            if (Array.isArray(out.calibration_holdout) && out.calibration_holdout.length > 50)
+              out.calibration_holdout = out.calibration_holdout.slice(-50);
+
+            if (Array.isArray(out.equity) && out.equity.length > 100)
+              out.equity = out.equity.slice(-100);
+
+            if (Array.isArray(out.learned_trade_keys) && out.learned_trade_keys.length > 500)
+              out.learned_trade_keys = out.learned_trade_keys.slice(-500);
+
+            // Important: DO NOT touch pending here. Worker owns it.
+            // Keep original pending logic (cleanupPendingBeforePlanning + existing cap after planning).
+
+            // 4) Clean old cooldowns (>7 days)
+            const COOLDOWN_CLEANUP_MS = 7 * 24 * 60 * 60 * 1000;
+            const now = Date.now();
+            try {
+              for (const k in out.cooldown) {
+                if (now - (out.cooldown[k] || 0) > COOLDOWN_CLEANUP_MS) delete out.cooldown[k];
+              }
+              for (const k in out.cooldown_side) {
+                if (now - (out.cooldown_side[k]?.ts_ms || 0) > COOLDOWN_CLEANUP_MS) delete out.cooldown_side[k];
+              }
+              for (const k in out.mr_lockout) {
+                const until = out.mr_lockout[k] || 0;
+                if (now > until && (now - until) > COOLDOWN_CLEANUP_MS) delete out.mr_lockout[k];
+              }
+            } catch {}
+
+            // 5) Limit symbol stats to top 100 by trade count
+            const capStats = (m) => {
+              if (!m) return m;
+              const entries = Object.entries(m);
+              if (entries.length <= 100) return m;
+              return Object.fromEntries(entries.sort((a,b)=>(b[1]?.n||0)-(a[1]?.n||0)).slice(0,100));
+            };
+            out.sym_stats = capStats(out.sym_stats);
+            out.sym_stats_real = capStats(out.sym_stats_real);
+
+            const gist_kb = (JSON.stringify(out).length / 1024).toFixed(1);
+            log(`🗑️  Gist compacted: ${gist_kb} KB | closed=${out.closed?.length||0} equity=${out.equity?.length||0} pending=${out.pending?.length||0}`);
+
+            return out;
           }
 
           async function saveState(persist, state, auditOut, retries=2, blindFallback=true) {
@@ -693,7 +738,7 @@ jobs:
 
             for (let attempt = 0; attempt <= retries; attempt++) {
               log("DEBUG: saveState attempt", attempt, "etag?", !!etag, "pending=", (toSave.pending||[]).length);
-              const r = await patch(mkFiles(toSave), etag);
+              const r = await patch(mkFiles(compactStateForGist(toSave)), etag); // ✅ COMPACT BEFORE PATCH
               if (r.ok) {
                 const newEtag = r.headers.get("etag");
                 persist.etag = newEtag || persist.etag;
@@ -729,6 +774,7 @@ jobs:
                 const remoteContent = remoteGist.files?.["state.json"]?.content;
                 const remoteState = remoteContent ? JSON.parse(remoteContent) : {};
                 toSave = mergeStates(remoteState, state);
+                toSave = compactStateForGist(toSave); // ✅ COMPACT AFTER MERGE
                 etag = remoteEtag || null;
                 await sleep(250 + Math.floor(Math.random()*250)); // small jitter
                 continue;
@@ -755,6 +801,7 @@ jobs:
                     const remoteContent = remoteGist.files?.["state.json"]?.content;
                     const remoteState = remoteContent ? JSON.parse(remoteContent) : {};
                     toSave = mergeStates(remoteState, state);
+                    toSave = compactStateForGist(toSave); // ✅ COMPACT AFTER PRE-BLIND MERGE
                     log("DEBUG: Pre-blind-patch merge successful.");
                   } else {
                     log("WARN: Pre-blind-patch re-fetch failed status=", r2.status, ". Will save local state.");
@@ -763,7 +810,7 @@ jobs:
                   log("ERROR: Exception during pre-blind-patch re-fetch:", e?.message || String(e));
               }
               
-              const r3 = await patch(mkFiles(toSave), null);
+              const r3 = await patch(mkFiles(compactStateForGist(toSave)), null); // ✅ COMPACT BEFORE BLIND PATCH
               if (r3.ok) {
                 const newEtag = r3.headers.get("etag");
                 persist.etag = newEtag || persist.etag;
@@ -900,8 +947,9 @@ jobs:
               state.calib_symbol_counts = Object.fromEntries(keep);
             }
             
-            state.learned_trade_keys = Array.from(learnedSet).slice(-2000);
+            state.learned_trade_keys = Array.from(learnedSet).slice(-500); // ✅ REDUCED CAP
             log(`📚 Learned: ${stats.learned} | Skipped: TTL=0 Dup=${stats.skipped_dup} Invalid=${stats.skipped_invalid} Poison=${stats.skipped_poison} Outlier=${stats.skipped_outlier}`);
+            // Note: state.closed filtering happens in compactStateForGist (at persist time only)
           }
           
           const getCoeffs = (state, side, regime) => {
@@ -1695,8 +1743,9 @@ jobs:
             }catch(e){ log("state update warn",e?.message||e); }
 
             // Persist state + audit artifacts
-            const auditOut=buildAuditOutputs(state);
-            log("DEBUG: Pre-save: pending length=", (state.pending || []).length);
+            const auditOut = buildAuditOutputs(state);
+            // ✅ Don't compact here; saveState will handle it before each PATCH
+            log("DEBUG: Pre-save: pending=", (state.pending || []).length, "closed=", (state.closed || []).length);
             await saveState(persist, state, auditOut, 2, true);
             log("DEBUG: saveState call complete.");
 
