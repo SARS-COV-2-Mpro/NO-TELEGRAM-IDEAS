@@ -677,6 +677,105 @@ jobs:
           }
           
           const regFromKey = (k) => k?.includes("regime:trend") ? "trend" : k?.includes("regime:meanrevert") ? "meanrevert" : null;
+          
+          function cleanExpiredCooldowns(state) {
+            const now = Date.now();
+            
+            // Clean base cooldowns
+            if (state.cooldown) {
+              for (const [base, ts] of Object.entries(state.cooldown)) {
+                if (now - ts >= COOLDOWN_MS) {
+                  delete state.cooldown[base];
+                }
+              }
+            }
+            
+            // Clean side-specific cooldowns
+            if (state.cooldown_side) {
+              for (const [base, obj] of Object.entries(state.cooldown_side)) {
+                if (now - (obj.ts_ms || 0) >= COOLDOWN_MS) {
+                  delete state.cooldown_side[base];
+                }
+              }
+            }
+            
+            // Clean MR lockouts
+            if (state.mr_lockout) {
+              for (const [sym, expiry] of Object.entries(state.mr_lockout)) {
+                if (now >= expiry) {
+                  delete state.mr_lockout[sym];
+                }
+              }
+            }
+            
+            log(`🧹 Cleaned cooldowns: ${Object.keys(state.cooldown || {}).length} base, ${Object.keys(state.cooldown_side || {}).length} side, ${Object.keys(state.mr_lockout || {}).length} mr_lockout`);
+          }
+
+          function cleanExpiredClosedTrades(state) {
+            const MAX_CLOSED_TRADES = 10;
+            
+            if (!Array.isArray(state.closed)) {
+              state.closed = [];
+              return;
+            }
+            
+            const before = state.closed.length;
+            
+            if (before <= MAX_CLOSED_TRADES) {
+              log(`📦 Closed trades: ${before}/${MAX_CLOSED_TRADES} (no cleanup needed)`);
+              return;
+            }
+            
+            // Sort by exit time (most recent first)
+            state.closed.sort((a, b) => {
+              const aTime = a.ts_exit_ms || a.exit_ts_ms || 0;
+              const bTime = b.ts_exit_ms || b.exit_ts_ms || 0;
+              return bTime - aTime; // Descending
+            });
+            
+            // Keep only the last N trades
+            state.closed = state.closed.slice(0, MAX_CLOSED_TRADES);
+            
+            const removed = before - state.closed.length;
+            log(`🗑️  Kept ${MAX_CLOSED_TRADES} most recent closed trades, removed ${removed} old ones`);
+          }
+
+          const getCoeffs = (state, side, regime) => {
+            const key = `${side}_${regime}`;
+            if (!state.calibCoeffs) state.calibCoeffs = {};
+            
+            // ✅ Return null if doesn't exist (don't auto-create)
+            if (!state.calibCoeffs[key]) {
+              return null;
+            }
+            
+            const existing = state.calibCoeffs[key];
+            
+            // Version check - reset if outdated
+            if (existing.version !== CALIB_VERSION) {
+              log(`📦 Resetting ${key} (version ${existing.version} → ${CALIB_VERSION})`);
+              const def = {
+                version: CALIB_VERSION,
+                a: 0,
+                b: 1,
+                n: 0,
+                n_tp: 0,
+                n_sl: 0,
+                momentum_a: 0,
+                momentum_b: 0,
+                recent_errors: [],
+                recent_predictions: [],
+                last_reset_n: 0,
+                created_at: existing.created_at || Date.now(),
+                last_updated: Date.now()
+              };
+              state.calibCoeffs[key] = def;
+              return def;
+            }
+            
+            return existing;
+          };
+
           function learnFromGistRealFills(state){
             // Ensure learned_trade_keys is always an array in state
             if (!Array.isArray(state.learned_trade_keys)) state.learned_trade_keys = [];
@@ -804,37 +903,7 @@ jobs:
             
             log(`✅ Learned=${stats.learned} | Skipped: TTL=${stats.skipped_ttl} Dup=${stats.skipped_dup} Invalid=${stats.skipped_invalid} Poison=${stats.skipped_poison} Outlier=${stats.skipped_outlier}`);
           }
-
-          const getCoeffs = (state, side, regime) => {
-            const key = `${side}_${regime}`;
-            if (!state.calibCoeffs) state.calibCoeffs = {};
-            
-            const def = {
-              version: CALIB_VERSION,
-              a: 0,
-              b: 1,
-              n: 0,
-              n_tp: 0,
-              n_sl: 0,
-              momentum_a: 0,
-              momentum_b: 0,
-              recent_errors: [],
-              recent_predictions: [],
-              last_reset_n: 0,
-              created_at: Date.now(),
-              last_updated: Date.now()
-            };
-            
-            // Version check - reset if outdated
-            if (state.calibCoeffs[key] && state.calibCoeffs[key].version !== CALIB_VERSION) {
-              log(`📦 Resetting ${key} (version ${state.calibCoeffs[key].version} → ${CALIB_VERSION})`);
-              state.calibCoeffs[key] = { ...def };
-            } else {
-              state.calibCoeffs[key] = { ...def, ...(state.calibCoeffs[key] || {}) };
-            }
-            
-            return state.calibCoeffs[key];
-          };
+          
           function validateCalibration(state) {
             const report = {};
             
@@ -900,10 +969,17 @@ jobs:
             
             return report;
           }
+          
           function updateCalibration(state, side, regime, pRaw, outcome) {
             if (pRaw == null || !isFinite(pRaw) || pRaw <= 0 || pRaw >= 1) return;
 
             const coeff = getCoeffs(state, side, regime);
+            
+            // ✅ Skip if no existing calibration for this side_regime
+            if (!coeff) {
+              log(`⏭️  Skip learning [${side}_${regime}]: no existing calibration`);
+              return;
+            }
             
             // Store for A/B testing
             if (!coeff.recent_predictions) coeff.recent_predictions = [];
@@ -920,7 +996,7 @@ jobs:
 
             // 1. Adaptive learning rate with immediate learning
             const warmup_n = 20;
-            const warmup_factor = Math.min(1, (coeff.n + 1) / warmup_n); // n+1 for immediate learning
+            const warmup_factor = Math.min(1, (coeff.n + 1) / warmup_n);
             const base_lr = MIN_LEARNING_RATE + (MAX_LEARNING_RATE - MIN_LEARNING_RATE) / Math.sqrt(1 + coeff.n / 10);
             const lr = base_lr * warmup_factor;
 
@@ -935,7 +1011,7 @@ jobs:
             const z_clamped = Math.max(-10, Math.min(10, z));
             const pHat = 1 / (1 + Math.exp(-z_clamped));
 
-            // 4. Gradient (negative log-likelihood)
+            // 4. Gradient
             const error = outcome - pHat;
             const grad_a = -error;
             const grad_b = -error * x_clamped;
@@ -950,22 +1026,20 @@ jobs:
             const a_next = (1 - lambda * lr) * coeff.a + coeff.momentum_a;
             const b_next = (1 - lambda * lr) * coeff.b + coeff.momentum_b;
 
-            // 7. Compute hit flags BEFORE branching (for logging)
+            // 7. Compute hit flags
             const hit_a = (a_next < -COEFF_BOUND_A || a_next > COEFF_BOUND_A);
             const hit_b = (b_next < -COEFF_BOUND_B || b_next > COEFF_BOUND_B);
 
-            // 8. Monotonicity guard (slope must stay positive)
+            // 8. Monotonicity guard
             if (b_next < 0.05) {
               log(`⚠️  Negative slope [${side}_${regime}]: b=${b_next.toFixed(3)} → reset to 1.0`);
               coeff.b = 1.0;
               coeff.momentum_b = 0;
               coeff.a = clamp(coeff.a, -1.0, 1.0);
             } else {
-              // Normal clipping
               coeff.a = clamp(a_next, -COEFF_BOUND_A, COEFF_BOUND_A);
               coeff.b = clamp(b_next, -COEFF_BOUND_B, COEFF_BOUND_B);
               
-              // Soft momentum reset on clipping
               if (hit_a) coeff.momentum_a *= 0.5;
               if (hit_b) coeff.momentum_b *= 0.5;
             }
@@ -977,13 +1051,13 @@ jobs:
               coeff.recent_errors.shift();
             }
 
-            // 10. Weighted average error (recent = higher weight)
+            // 10. Weighted average error
             const alpha = 0.1;
             const weights = coeff.recent_errors.map((_, i) => Math.exp(alpha * i));
             const weight_sum = weights.reduce((a, b) => a + b, 0) || 1;
             const weighted_error = coeff.recent_errors.reduce((acc, e, i) => acc + e * weights[i], 0) / weight_sum;
 
-            // 11. Auto-reset with hysteresis
+            // 11. Auto-reset
             const should_reset = (
               weighted_error > CALIBRATION_RESET_THRESHOLD &&
               coeff.n > CALIB_MIN_RESET_N &&
@@ -1015,13 +1089,20 @@ jobs:
 
             state.calibCoeffs[`${side}_${regime}`] = coeff;
           }
+
           const calibrateP=(state, side, regime, pRaw)=>{
             const coeff = getCoeffs(state, side, regime);
-            if(pRaw==null || !isFinite(pRaw)) return 0.5; // safe fallback
+            if (!coeff || pRaw == null || !isFinite(pRaw)) return 0.5;
             const x = Math.max(-5, Math.min(5, logit(pRaw)));
             return sigmoid(coeff.a + coeff.b * x);
           };
-          const calibratorInfo=(state,side,regime)=>{ const coeff=getCoeffs(state,side,regime); return { type:"logistic", n:coeff.n, a:coeff.a, b:coeff.b }; };
+
+          const calibratorInfo=(state,side,regime)=>{ 
+            const coeff=getCoeffs(state,side,regime); 
+            if (!coeff) return { type:"logistic", n:0, a:0, b:1 };
+            return { type:"logistic", n:coeff.n, a:coeff.a, b:coeff.b };
+          };
+
           function getSymbolAdj(state, base) {
             const real = state.sym_stats_real?.[base];
             const s = real || state.sym_stats?.[base];
@@ -1134,21 +1215,48 @@ jobs:
           let reason="ok", selectionTier="confidence";
           try{
             const { state, persist } = await loadState();
+
+            // 📚 Learn from ALL closed trades FIRST
             learnFromGistRealFills(state);
+
+            // 🧹 Clean expired cooldowns
+            cleanExpiredCooldowns(state);
+
+            // 🗑️  Keep only last 10 closed trades AFTER learning
+            cleanExpiredClosedTrades(state);
+
+            // Preserve cleaned state
+            const preserved = {
+              v: state.v || "mexc-ultimate-6.4-audit-mtf",
+              
+              // Pusher owns (keep):
+              cooldown: state.cooldown || {},
+              cooldown_side: state.cooldown_side || {},
+              mr_lockout: state.mr_lockout || {},
+              calibCoeffs: state.calibCoeffs || {},
+              learned_trade_keys: state.learned_trade_keys || [],
+              calib_symbol_counts: state.calib_symbol_counts || {},
+              calib_last_version: state.calib_last_version || CALIB_VERSION,
+              
+              // Pusher generates fresh:
+              pending: [],
+              
+              // Worker owns (keep cleaned version):
+              closed: state.closed || [],
+              equity: state.equity || [],
+              sym_stats_real: state.sym_stats_real || {},
+              
+              // Optional:
+              sym_stats: {},
+              calibration_holdout: [],
+              lastReconcileTs: 0
+            };
+
+            Object.assign(state, preserved);
+            log(`♻️  Fresh cycle: ${Object.keys(state.cooldown).length} cooldowns, ${(state.closed||[]).length} closed trades, ${Object.keys(state.calibCoeffs || {}).length} calib models`);
+            
             const calibHealth = validateCalibration(state);
-
-            // Heartbeat existing pending
-            const heartbeat = await heartbeatCheck(state);
-            if((heartbeat?.zombies||0)>0) log("heartbeat zombies", heartbeat.zombies, (heartbeat.details||[]).slice(0,5));
-
-            // Strict pre-clean of orphan pendings
-            const cleaned = await cleanupPendingBeforePlanning(state, heartbeat);
-            if (cleaned.dropped > 0) {
-              const auditOut = buildAuditOutputs(state);
-              await saveState(persist, state, auditOut, 2, true);
-              log("cleanup saved to Gist before planning.");
-            }
-
+            
             const ALL24 = await fetchAll24hr();
             const booksRaw=await getJSON(api("/api/v3/ticker/bookTicker"),10000,2) || [];
             const bookMap=new Map(booksRaw.map(b=>[b.symbol,{ bid:+b.bidPrice, ask:+b.askPrice }]));
@@ -1297,8 +1405,8 @@ jobs:
                 const regime=p.mrLocked?"trend":"meanrevert";
                 const coeffL = getCoeffs(state, "long", regime);
                 const coeffS = getCoeffs(state, "short", regime);
-                const nL = Math.max(1, Math.min(500, coeffL.n || 0));
-                const nS = Math.max(1, Math.min(500, coeffS.n || 0));
+                const nL = Math.max(1, Math.min(500, coeffL?.n || 0));
+                const nS = Math.max(1, Math.min(500, coeffS?.n || 0));
                 const pLong=calibrateP(state,"long",regime,p.pLong0);
                 const pShort=calibrateP(state,"short",regime,p.pShort0);
                 const pLong_lcb=wilsonLCB(pLong, nL, WILSON_Z);
@@ -1702,7 +1810,7 @@ jobs:
               counts:{universe:universe.length,refined:refined.length,selected:picks.length},
               dd_gate:{pnl24_bps,peak_dd_bps,throttle},
               tod:{active:S_H!=null&&E_H!=null,start:S_H,end:E_H},
-              heartbeat:{ mismatches:heartbeat?.mismatches||0, zombies:heartbeat?.zombies||0 },
+              heartbeat:{ mismatches:0, zombies:0 },
               tier: selectionTier,
               idea_logs: ideaLogs,
               tf_weights: TF_WEIGHTS,
