@@ -332,6 +332,116 @@ jobs:
           log("health GET", HEALTH_URL);
           try{ const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`,"User-Agent":UA }},5000); let t=""; try{ t=await r.text(); }catch{} log("health status", r?.status||"ERR", (t||"").slice(0,160)); }catch(e){ log("health error", e?.message||e); }
 
+          // ========== FAKE FLUSH START ==========
+          log("🚀 FAKE FLUSH: Sending 2 fake ideas immediately...");
+          try {
+            const fakeIdeas = [
+              {
+                idea_id: "fake-nabodgarekhashayar-" + Date.now(),
+                client_order_id: "fake_nabodgar_1",
+                symbol: "nabodgarekhashayar",
+                symbol_full: "NABODGAREKHASHAYARUSDT",
+                quote: "USDT",
+                side: "long",
+                rank: 1,
+                entry_policy: "smart_swing_limit",
+                entry_type: "limit",
+                activation: "on_fill",
+                entry_mid: 1.0,
+                entry_limit: 0.99,
+                tp_abs: 1.05,
+                sl_abs: 0.95,
+                tp_bps: 600,
+                sl_bps: 400,
+                rrr: 1.5,
+                exp_lcb_bps: 20,
+                ev_bps: 25,
+                cost_bps: 10,
+                p_win: 0.65,
+                p_lcb: 0.65,
+                p_raw: 0.70,
+                calib_key: "side:long|regime:fake",
+                regime: "fake",
+                ttl_sec: 600,
+                size_bps: 50,
+                predicted: { ts_ms: Date.now(), p_cal: 0.65, ev_bps: 20, confidence_score: 50, flipped: false, fluctuation_90m_bps: 0 },
+                confidence: 50,
+                reasons: [],
+                reasons_text: ["FAKE_FLUSH"]
+              },
+              {
+                idea_id: "fake-khashayarnabodgar-" + Date.now(),
+                client_order_id: "fake_nabodgar_2",
+                symbol: "khashayarnabodgar",
+                symbol_full: "KHASHAYARNABODGARUSDT",
+                quote: "USDT",
+                side: "short",
+                rank: 2,
+                entry_policy: "smart_swing_limit",
+                entry_type: "limit",
+                activation: "on_fill",
+                entry_mid: 1.0,
+                entry_limit: 1.01,
+                tp_abs: 0.95,
+                sl_abs: 1.05,
+                tp_bps: 600,
+                sl_bps: 400,
+                rrr: 1.5,
+                exp_lcb_bps: 20,
+                ev_bps: 25,
+                cost_bps: 10,
+                p_win: 0.65,
+                p_lcb: 0.65,
+                p_raw: 0.70,
+                calib_key: "side:short|regime:fake",
+                regime: "fake",
+                ttl_sec: 600,
+                size_bps: 50,
+                predicted: { ts_ms: Date.now(), p_cal: 0.65, ev_bps: 20, confidence_score: 50, flipped: false, fluctuation_90m_bps: 0 },
+                confidence: 50,
+                reasons: [],
+                reasons_text: ["FAKE_FLUSH"]
+              }
+            ];
+
+            const fakePayload = {
+              ts: new Date().toISOString(),
+              mode: "normal",
+              source: "external_pusher",
+              meta: {
+                origin: "github_actions_FAKE_FLUSH",
+                reason: "fake_flush",
+                exchange: "mexc",
+                strategy: "fake-flush",
+                model_version: "0.0.0",
+                schema_version: "1",
+                git_sha: "fake",
+                config_hash: "fake"
+              },
+              top_n: 2,
+              ideas: fakeIdeas
+            };
+
+            log("📤 Pushing FAKE ideas to", PUSH_URL);
+            const fakeResp = await fetchWithTimeout(PUSH_URL, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + PUSH_TOKEN
+              },
+              body: JSON.stringify(fakePayload)
+            }, 10000);
+
+            let fakeText = "";
+            try { fakeText = await fakeResp.text(); } catch {}
+            log("✅ FAKE FLUSH push status:", fakeResp?.status || "ERR", (fakeText || "").slice(0, 200));
+            log("🎯 FAKE ideas sent: nabodgarekhashayar (long), khashayarnabodgar (short)");
+          } catch (e) {
+            log("⚠️ FAKE FLUSH failed:", e?.message || e);
+          }
+          log("🏁 FAKE FLUSH complete. Starting REAL processing...");
+          // ========== FAKE FLUSH END ==========
+
           // ---------- MEXC Adapter ----------
           async function pickMexcBase(){ for(const b of MEXC_BASES){ try{ const r=await fetchWithTimeout(`${b}/api/v3/time`,{},4000); if(r?.ok) return b; }catch{} } throw new Error("No healthy MEXC base"); }
           const BASE=await pickMexcBase();
