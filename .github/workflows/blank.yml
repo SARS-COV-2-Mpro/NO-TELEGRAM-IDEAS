@@ -1,4 +1,3 @@
-0
 name: Ideas Pusher (MEXC Ultimate 7.7.7)
 
 on:
@@ -1615,7 +1614,7 @@ jobs:
                 refined.push({
                   symbol:c.symbol, base:c.base, quote:c.quote, qv:c.qv,
                   side:chosen.side,
-                  fluctuation_90m_bps,  // ✅ ADD THIS
+                  fluctuation_90m_bps,
                   p_lcb:+chosen.p_lcb.toFixed(3), p_raw:+chosen.p_raw.toFixed(3),
                   exp_bps:chosen.ev_bps, exp_lcb_bps:chosen.exp_lcb_bps,
                   tp_bps:chosen.tp_bps, sl_bps:chosen.sl_bps,
@@ -1637,7 +1636,7 @@ jobs:
                   btc_corr: +(+btcCorr||0).toFixed(3),
                   trend5m: p.trend5m
                 });
-              }catch{ return null; } }));
+              }catch(e){ log("heavy refine warn", e?.message||e); }
             }
 
             // Uniqueness adjustment
