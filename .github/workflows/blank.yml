@@ -79,29 +79,49 @@ jobs:
         with:
           node-version: 20
 
+      # NEW / FIXED: rotate comment in Cloudflare Worker script
       - name: Rotate Cloudflare Worker comment
         env:
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_WORKER_NAME: ${{ secrets.CF_WORKER_NAME }}
         run: |
-          # Fetch current worker code (script only, no env/bindings)
-          CODE=$(curl -sS -X GET \
-            "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/workers/scripts/${CF_WORKER_NAME}/content" \
+          set -euo pipefail
+
+          API_BASE="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/workers/scripts/${CF_WORKER_NAME}"
+
+          echo "[cf] Fetching current worker script from ${API_BASE}"
+          HTTP_CODE=$(curl -sS -w "%{http_code}" -o /tmp/worker_raw.js \
+            -X GET "${API_BASE}" \
             -H "Authorization: Bearer ${CF_API_TOKEN}" \
-            -H "Accept: application/javascript")
-          
-          # Remove old comment, add new one
-          NEW_CODE=$(echo "$CODE" | sed '/\/\/hey i am here!A\.G/d')
-          echo "${NEW_CODE}" > /tmp/worker.js
-          echo "//hey i am here!A.G" >> /tmp/worker.js
-          
-          # Upload modified code (preserves all env vars/bindings)
-          curl -sS -X PUT \
-            "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/workers/scripts/${CF_WORKER_NAME}" \
+            -H "Accept: application/javascript" || echo "000")
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "[cf] Failed to fetch script, http=${HTTP_CODE}"
+            cat /tmp/worker_raw.js || true
+            exit 1
+          fi
+
+          CODE="$(cat /tmp/worker_raw.js)"
+
+          # Remove old comment line, if present, and append fresh one
+          NEW_CODE="$(printf "%s\n" "$CODE" | sed '/\/\/hey i am here!A\.G/d')"
+          printf "%s\n//hey i am here!A.G\n" "$NEW_CODE" > /tmp/worker.js
+
+          echo "[cf] Uploading modified script"
+          HTTP_CODE_PUT=$(curl -sS -w "%{http_code}" -o /tmp/worker_put_resp.txt \
+            -X PUT "${API_BASE}" \
             -H "Authorization: Bearer ${CF_API_TOKEN}" \
             -H "Content-Type: application/javascript" \
-            --data-binary @/tmp/worker.js
+            --data-binary @/tmp/worker.js || echo "000")
+
+          echo "[cf] PUT http=${HTTP_CODE_PUT}"
+          head -c 400 /tmp/worker_put_resp.txt || true
+
+          if [ "$HTTP_CODE_PUT" != "200" ]; then
+            echo "[cf] Failed to update worker script"
+            exit 1
+          fi
 
       - name: Run pusher (always-push + clear logs)
         shell: bash
@@ -608,6 +628,14 @@ jobs:
           function mergeStates(remote, local) {
             const merged = { ...remote };
 
+            // Preserve pusher-only meta fields that Worker doesn't know about
+            if (local.run_counter !== undefined) {
+              merged.run_counter = local.run_counter;
+            }
+            if (local.calib_last_version !== undefined) {
+              merged.calib_last_version = local.calib_last_version;
+            }
+
             // 1. Merge learned_trade_keys (O(n), recency-preserving)
             const remoteKeys = Array.isArray(remote.learned_trade_keys) ? remote.learned_trade_keys : [];
             const localKeys = Array.isArray(local.learned_trade_keys) ? local.learned_trade_keys : [];
@@ -1088,7 +1116,7 @@ jobs:
                 avg_error: avg_error.toFixed(3),
                 brier_raw: brier_raw?.toFixed(4) || "N/A",
                 brier_cal: brier_cal?.toFixed(4) || "N/A",
-                improvement: (brier_raw && brier_cal) ? ((brier_raw - brier_cal) / brier_raw * 100).toFixed(1) + "%" : "N/A",
+                improvement: (brier_raw && brier_cal) ? ((brier_raw - brier_cal) / brier_cal * 100).toFixed(1) + "%" : "N/A",
                 samples_since_reset,
                 status: is_healthy ? "healthy" : "degraded"
               };
