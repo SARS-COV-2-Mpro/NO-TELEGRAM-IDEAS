@@ -1716,11 +1716,58 @@ jobs:
                   return 1.0;
                 })();
 
-                // 4. Final score with capped total multiplier (prevent 2.9x swings)
                 const totalMult = qualityMult * fluctMult * verdictBonus;
                 const cappedMult = clamp(totalMult, 0.88, 1.35);  // Max 53% swing instead of 190%
 
-                const conf = Math.round(rawScore * cappedMult);
+                // --- Verdict-based confidence boost ---
+                // Reconstruct the verdict tiers similar to your logging:
+                //
+                // EXCELLENT:   many greens, no reds
+                // GOOD:        some greens, no reds
+                // ACCEPTABLE:  no reds, few/no greens
+                // MARGINAL:    exactly one red
+                // WEAK:        multiple reds
+                const isGreenADX  = (scoreADX   >= 30);
+                const isRedADX    = (scoreADX   < 20);
+
+                const isGreenATR  = (scoreATR   >= 30);
+                const isRedATR    = (scoreATR   < 10);
+
+                const isGreenVOL  = (scoreVolume >= 20);
+                const isRedVOL    = (scoreVolume === 5);
+
+                const isGreenQUAL = (scoreQuality >= 10);
+                const isRedQUAL   = (scoreQuality < 6);
+
+                const greenCount = [isGreenADX, isGreenATR, isGreenVOL, isGreenQUAL].filter(Boolean).length;
+                const redCount   = [isRedADX,   isRedATR,   isRedVOL,   isRedQUAL  ].filter(Boolean).length;
+
+                // Map verdict → numeric boost:
+                // EXCELLENT  → +12
+                // GOOD       → +10
+                // ACCEPTABLE → +6
+                // MARGINAL   → +0
+                // WEAK       → +0
+                let verdictBoost = 0;
+                if (greenCount >= 3 && redCount === 0) {
+                  // EXCELLENT
+                  verdictBoost = 12;
+                } else if (greenCount >= 2 && redCount === 0) {
+                  // GOOD
+                  verdictBoost = 10;
+                } else if (redCount === 0) {
+                  // ACCEPTABLE
+                  verdictBoost = 6;
+                } else if (redCount === 1) {
+                  // MARGINAL
+                  verdictBoost = 0;
+                } else {
+                  // WEAK (multiple weaknesses)
+                  verdictBoost = 0;
+                }
+
+                // Base confidence from rawScore and multipliers, plus verdict bonus
+                const conf = Math.round(rawScore * cappedMult + verdictBoost);
 
                 const slipEst=chosen.side==="long"?slipL:slipS;
                 const btcCorr=corr((()=>{const r=[];for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-120);})(), btcR5);
