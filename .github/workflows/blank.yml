@@ -1031,7 +1031,6 @@ jobs:
               // ✅ CORRECT: Only learn from TP/SL hits
               const tp_hit = exit === "tp" || c.realized?.tp_hit === true;
               const sl_hit = exit === "sl" || c.realized?.sl_hit === true;
-              
               // Skip TTL without marking learned (Worker may update later)
               if (!tp_hit && !sl_hit) {
                 stats.skipped_ttl++;
@@ -1391,23 +1390,17 @@ jobs:
             const { state, persist } = await loadState();
 
             // ============================================================
-            // 🔥 WIPE EVERYTHING EVERY 3 RUNS
+            // 🔥 WIPE TO {} EVERY 6 RUNS
             // ============================================================
             state.run_counter = (state.run_counter || 0) + 1;
-            log(`🔄 Run ${state.run_counter}/3`);
+            log(`🔄 Run ${state.run_counter}/6`);
 
-            if (state.run_counter >= 3) {
-              log("🧹 3RD RUN → FULL GIST WIPE");
-              Object.keys(state).forEach(k => delete state[k]);
-              Object.assign(state, {
-                v: "mexc-ultimate-6.4-audit-mtf",
-                run_counter: 0,
-                cooldown: {}, cooldown_side: {}, pending: [], equity: [], closed: [],
-                mr_lockout: {}, sym_stats: {}, sym_stats_real: {}, calibCoeffs: {},
-                lastReconcileTs: 0, calibration_holdout: [],
-                learned_trade_keys: [], calib_symbol_counts: {},
-                calib_last_version: CALIB_VERSION
-              });
+            const SHOULD_WIPE = (state.run_counter >= 6);
+
+            if (SHOULD_WIPE) {
+              log("🧹 6TH RUN → COMPLETE GIST WIPE TO {}");
+              // Mark for total wipe at save time
+              state.__WIPE_TO_EMPTY__ = true;
             }
             // ============================================================
 
@@ -1689,18 +1682,45 @@ jobs:
                   0.25
                 );
 
-                // Fluctuation multiplier (continuous scaling by realized volatility)
-                const fluctMult = clamp((fluctuation_90m_bps || 0) / 140, 0.85, 1.4);
+                // ============ FIXED MULTIPLIERS (BALANCED) ============
+                
+                // 1. Reduce fluctuation impact (was ±40%, now ±15%)
+                const fluctMult = clamp((fluctuation_90m_bps || 0) / 200, 0.92, 1.15);
 
-                // Quality multipliers (binary gates for directional/market conditions)
+                // 2. Soften penalties, strengthen bonuses
                 const qualityMult = (
-                  (tfAlign > 0.7 ? 1.15 : 1.0) *
-                  (!p.mrLocked ? 1.05 : 1.0) *
-                  ((chosen.side === "long" && p.noLongDown) ? 0.8 : 1.0) *
-                  ((chosen.side === "long" && !btcUp1h) ? 0.85 : 1.0)
+                  (tfAlign > 0.7 ? 1.20 : 1.0) *          // Boost alignment bonus 15%→20%
+                  (!p.mrLocked ? 1.08 : 1.0) *            // Boost MR bonus 5%→8%
+                  ((chosen.side === "long" && p.noLongDown) ? 0.92 : 1.0) *  // Soften RSI penalty 20%→8%
+                  ((chosen.side === "long" && !btcUp1h) ? 0.94 : 1.0)        // Soften BTC penalty 15%→6%
                 );
 
-                const conf = Math.round(rawScore * qualityMult * fluctMult);
+                // 3. ADD: Bonus for "GOOD" verdict (quality over hype)
+                const verdictBonus = (() => {
+                  const spreadOK = (p.spreadBps || 999) <= 12;
+                  const spreadFair = (p.spreadBps || 999) <= 18;
+                  const depthGood = (depth1pUSD || 0) > 150_000;
+                  const depthOK = (depth1pUSD || 0) > 80_000;
+                  const vol24h = (p.vol1h_est_usd || 0) * 24;
+                  
+                  // Count green checkmarks from your logging
+                  let greenCount = 0;
+                  if ((mtfAgg.adx || 0) > 22) greenCount++;
+                  if (p.atr_bps >= 120 && p.atr_bps <= 280) greenCount++;
+                  if (vol24h > 30_000_000) greenCount++;
+                  if ((spreadOK && depthGood) || (spreadFair && depthOK)) greenCount++;
+                  
+                  // EXCELLENT (3-4 green) → +12% | GOOD (2 green, 0 red) → +8% | else → +0%
+                  if (greenCount >= 3) return 1.12;
+                  if (greenCount >= 2) return 1.08;
+                  return 1.0;
+                })();
+
+                // 4. Final score with capped total multiplier (prevent 2.9x swings)
+                const totalMult = qualityMult * fluctMult * verdictBonus;
+                const cappedMult = clamp(totalMult, 0.88, 1.35);  // Max 53% swing instead of 190%
+
+                const conf = Math.round(rawScore * cappedMult);
 
                 const slipEst=chosen.side==="long"?slipL:slipS;
                 const btcCorr=corr((()=>{const r=[];for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-120);})(), btcR5);
@@ -2125,7 +2145,16 @@ jobs:
             // Persist state + audit artifacts
             const auditOut=buildAuditOutputs(state);
             log("DEBUG: Pre-save: pending length=", (state.pending || []).length);
-            await saveState(persist, state, auditOut, 2, true);
+
+            // Check if this run should wipe gist to {}
+            if (state.__WIPE_TO_EMPTY__) {
+              log("🗑️  WIPING GIST TO EMPTY {} (run 6 complete)");
+              await saveState(persist, {}, auditOut, 2, true);  // Save empty object
+              log("✅ Gist now contains: {}");
+            } else {
+              await saveState(persist, state, auditOut, 2, true);  // Normal save
+            }
+
             log("DEBUG: saveState call complete.");
 
             // Build meta and payload — push v1 ideas to the existing Worker
