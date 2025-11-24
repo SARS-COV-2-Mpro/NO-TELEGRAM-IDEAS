@@ -747,6 +747,9 @@ jobs:
             const gistUrl = `https://api.github.com/gists/${persist.id}`;
             const mkFiles = (s) => ({ "state.json": { content: JSON.stringify(s) } });
 
+            // Detect wipe mode: caller passed {} as state
+            const wipeToEmpty = state && Object.keys(state).length === 0;
+
             async function patch(files, etag) {
               const headers = {
                 Authorization: `Bearer ${persist.token}`,
@@ -814,9 +817,10 @@ jobs:
 
             if (blindFallback) {
               log("WARN: Falling back to blind PATCH (no If-Match).");
-              
-              // Pre-merge before blind patch to avoid clobbering Worker updates
-              try {
+
+              if (!wipeToEmpty) {
+                // Normal mode: pre-merge to avoid clobbering Worker updates
+                try {
                   const r2 = await fetchWithTimeout(gistUrl, {
                     headers: {
                       Authorization: `Bearer ${persist.token}`,
@@ -834,15 +838,20 @@ jobs:
                   } else {
                     log("WARN: Pre-blind-patch re-fetch failed status=", r2.status, ". Will save local state.");
                   }
-              } catch (e) {
+                } catch (e) {
                   log("ERROR: Exception during pre-blind-patch re-fetch:", e?.message || String(e));
+                }
+              } else {
+                // Wipe mode: force {} and skip merge entirely
+                toSave = {};
+                log("DEBUG: WipeToEmpty=true → skipping pre-merge, forcing {}");
               }
-              
+
               const r3 = await patch(mkFiles(toSave), null);
               if (r3.ok) {
                 const newEtag = r3.headers.get("etag");
                 persist.etag = newEtag || persist.etag;
-                log("SUCCESS: Blind Gist update ok. pending=", (toSave.pending||[]).length);
+                log("SUCCESS: Blind Gist update ok. pending=", (toSave.pending||[]).length || 0);
               } else {
                 const body = (await r3.text().catch(()=> ""))?.slice(0, 300) || "";
                 log("ERROR: Blind save failed status=", r3.status, "body=", body);
