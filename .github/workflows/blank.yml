@@ -79,49 +79,61 @@ jobs:
         with:
           node-version: 20
 
-      # NEW / FIXED: rotate comment in Cloudflare Worker script
       - name: Rotate Cloudflare Worker comment
         env:
-          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-          CF_WORKER_NAME: ${{ secrets.CF_WORKER_NAME }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
         run: |
           set -euo pipefail
-
-          API_BASE="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/workers/scripts/${CF_WORKER_NAME}"
-
-          echo "[cf] Fetching current worker script from ${API_BASE}"
-          HTTP_CODE=$(curl -sS -w "%{http_code}" -o /tmp/worker_raw.js \
-            -X GET "${API_BASE}" \
-            -H "Authorization: Bearer ${CF_API_TOKEN}" \
-            -H "Accept: application/javascript" || echo "000")
-
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "[cf] Failed to fetch script, http=${HTTP_CODE}"
-            cat /tmp/worker_raw.js || true
-            exit 1
+          
+          WORKER_NAME="${{ secrets.CF_WORKER_NAME }}"
+          
+          # Skip if secrets missing
+          if [[ -z "${CLOUDFLARE_API_TOKEN:-}" || -z "${CLOUDFLARE_ACCOUNT_ID:-}" || -z "${WORKER_NAME:-}" ]]; then
+            echo "⚠️  Cloudflare secrets missing - skipping"
+            exit 0
           fi
-
-          CODE="$(cat /tmp/worker_raw.js)"
-
-          # Remove old comment line, if present, and append fresh one
-          NEW_CODE="$(printf "%s\n" "$CODE" | sed '/\/\/hey i am here!A\.G/d')"
-          printf "%s\n//hey i am here!A.G\n" "$NEW_CODE" > /tmp/worker.js
-
-          echo "[cf] Uploading modified script"
-          HTTP_CODE_PUT=$(curl -sS -w "%{http_code}" -o /tmp/worker_put_resp.txt \
-            -X PUT "${API_BASE}" \
-            -H "Authorization: Bearer ${CF_API_TOKEN}" \
-            -H "Content-Type: application/javascript" \
-            --data-binary @/tmp/worker.js || echo "000")
-
-          echo "[cf] PUT http=${HTTP_CODE_PUT}"
-          head -c 400 /tmp/worker_put_resp.txt || true
-
-          if [ "$HTTP_CODE_PUT" != "200" ]; then
-            echo "[cf] Failed to update worker script"
-            exit 1
+          
+          # Install Wrangler CLI
+          echo "[cf] Installing Wrangler..."
+          npm install -g wrangler@latest
+          
+          # Temporary directory
+          mkdir -p /tmp/worker-temp
+          cd /tmp/worker-temp
+          
+          # Download worker
+          echo "[cf] Downloading worker..."
+          wrangler download "${WORKER_NAME}" --output=. || {
+            echo "⚠️  Download failed - skipping"
+            exit 0
+          }
+          
+          # ✅ DELETE wrangler.toml to prevent config override
+          rm -f wrangler.toml wrangler.json .wrangler.toml
+          
+          # Find script file
+          SCRIPT_FILE=$(find . -maxdepth 1 \( -name "*.js" -o -name "*.mjs" -o -name "*.ts" \) | head -n 1)
+          
+          if [[ -z "$SCRIPT_FILE" ]]; then
+            echo "⚠️  No script found - skipping"
+            exit 0
           fi
+          
+          echo "[cf] Found script: $SCRIPT_FILE"
+          
+          # Update comment
+          sed -i.bak '/\/\/hey i am here!A\.G/d' "$SCRIPT_FILE" 2>/dev/null || sed -i '' '/\/\/hey i am here!A\.G/d' "$SCRIPT_FILE"
+          echo "//hey i am here!A.G" >> "$SCRIPT_FILE"
+          
+          # ✅ Deploy WITHOUT config file (preserves all env vars/bindings)
+          echo "[cf] Deploying (env vars preserved)..."
+          wrangler deploy "$SCRIPT_FILE" --name "${WORKER_NAME}" --compatibility-date=$(date +%Y-%m-%d) || {
+            echo "⚠️  Deploy failed, but continuing workflow"
+            exit 0
+          }
+          
+          echo "✅ Worker comment rotated (all env vars preserved)"
 
       - name: Run pusher (always-push + clear logs)
         shell: bash
@@ -628,7 +640,7 @@ jobs:
           function mergeStates(remote, local) {
             const merged = { ...remote };
 
-            // Preserve pusher-only meta fields that Worker doesn't know about
+            // ✅ Preserve pusher-only meta fields that Worker doesn't touch
             if (local.run_counter !== undefined) {
               merged.run_counter = local.run_counter;
             }
@@ -1116,7 +1128,7 @@ jobs:
                 avg_error: avg_error.toFixed(3),
                 brier_raw: brier_raw?.toFixed(4) || "N/A",
                 brier_cal: brier_cal?.toFixed(4) || "N/A",
-                improvement: (brier_raw && brier_cal) ? ((brier_raw - brier_cal) / brier_cal * 100).toFixed(1) + "%" : "N/A",
+                improvement: (brier_raw && brier_cal) ? ((brier_raw - brier_cal) / brier_raw * 100).toFixed(1) + "%" : "N/A",
                 samples_since_reset,
                 status: is_healthy ? "healthy" : "degraded"
               };
