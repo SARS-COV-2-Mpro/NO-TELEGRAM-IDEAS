@@ -79,6 +79,30 @@ jobs:
         with:
           node-version: 20
 
+      - name: Rotate Cloudflare Worker comment
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_WORKER_NAME: ${{ secrets.CF_WORKER_NAME }}
+        run: |
+          # Fetch current worker code (script only, no env/bindings)
+          CODE=$(curl -sS -X GET \
+            "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/workers/scripts/${CF_WORKER_NAME}/content" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Accept: application/javascript")
+          
+          # Remove old comment, add new one
+          NEW_CODE=$(echo "$CODE" | sed '/\/\/hey i am here!A\.G/d')
+          echo "${NEW_CODE}" > /tmp/worker.js
+          echo "//hey i am here!A.G" >> /tmp/worker.js
+          
+          # Upload modified code (preserves all env vars/bindings)
+          curl -sS -X PUT \
+            "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/workers/scripts/${CF_WORKER_NAME}" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/javascript" \
+            --data-binary @/tmp/worker.js
+
       - name: Run pusher (always-push + clear logs)
         shell: bash
         run: |
