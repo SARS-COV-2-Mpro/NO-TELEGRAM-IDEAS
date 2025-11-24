@@ -1702,11 +1702,6 @@ jobs:
 
                 const conf = Math.round(rawScore * qualityMult * fluctMult);
 
-                // HARD GATE: Reject symbols with poor factor combinations
-                if (conf < 45) {
-                  continue;
-                }
-
                 const slipEst=chosen.side==="long"?slipL:slipS;
                 const btcCorr=corr((()=>{const r=[];for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-120);})(), btcR5);
                 const reasons=reasonBuilder({adx1h:ind1h?.adx||0,ofi30s,tfAlign,spread_bps:p.spreadBps,slip_bps_est:slipEst,mtf_rsi:mtfAgg.rsi});
@@ -1756,6 +1751,121 @@ jobs:
             }
 
             refined.sort((a,b)=>b.confidence-a.confidence);
+
+            // ═══════════════════════════════════════════════════════
+            // DETAILED TOP 10 SCORING BREAKDOWN
+            // ═══════════════════════════════════════════════════════
+            log(`\n${"═".repeat(60)}`);
+            log(`📊 TOP 10 CANDIDATES (Geometric Mean Ranking):`);
+            log(`${"═".repeat(60)}\n`);
+
+            const top10 = refined.slice(0, 10);
+            
+            for (let i = 0; i < top10.length; i++) {
+              const x = top10[i];
+              const rank = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"][i];
+              
+              // Recalculate factor scores for logging
+              const adx = x.mtf_agg?.adx || 0;
+              const scoreADX = adx > 22 ? 40 : (adx >= 18 ? 30 : (adx >= 14 ? 20 : 10));
+              
+              const atr_pct = x.atr_bps / 100;
+              const scoreATR = (atr_pct >= 1.2 && atr_pct <= 2.8) ? 30 : ((atr_pct >= 0.8 && atr_pct <= 3.5) ? 20 : ((atr_pct >= 0.4 && atr_pct <= 5.0) ? 10 : 5));
+              
+              const vol24h = (x.vol1h_est_usd || 0) * 24;
+              const scoreVolume = vol24h > 300_000_000 ? 20 : (vol24h > 100_000_000 ? 15 : (vol24h > 30_000_000 ? 10 : 5));
+              
+              const spreadOK = x.spread_bps <= 12;
+              const spreadFair = x.spread_bps <= 18;
+              const depthGood = x.depth1p_usd > 150_000;
+              const depthOK = x.depth1p_usd > 80_000;
+              const scoreQuality = (spreadOK && depthGood) ? 10 : ((spreadOK || (spreadFair && depthGood)) ? 8 : ((spreadFair && depthOK) ? 6 : 4));
+              
+              const rawScore = Math.pow(scoreADX * scoreATR * scoreVolume * scoreQuality, 0.25);
+              const mult = x.confidence / rawScore;
+              
+              log(`${rank} ${x.symbol} ${x.side.toUpperCase()}: conf=${x.confidence} (raw=${rawScore.toFixed(1)} × mult=${mult.toFixed(2)})`);
+              
+              // ADX Analysis
+              const adxIcon = scoreADX >= 30 ? "✅" : (scoreADX >= 20 ? "⚠️" : "❌");
+              const adxText = adx > 22 ? `Strong trend (${adx.toFixed(1)} > threshold 22)` : 
+                             (adx >= 18 ? `Moderate trend (${adx.toFixed(1)} near threshold)` : 
+                             (adx >= 14 ? `Weak trend (${adx.toFixed(1)} < threshold 22)` : 
+                             `Ranging market (${adx.toFixed(1)} far below 22)`));
+              log(`   ${adxIcon} ADX=${scoreADX}: ${adxText}`);
+              
+              // ATR Analysis
+              const atrIcon = scoreATR >= 30 ? "✅" : (scoreATR >= 20 ? "⚠️" : (scoreATR >= 10 ? "⚠️" : "❌"));
+              const atrText = (atr_pct >= 1.2 && atr_pct <= 2.8) ? `Perfect volatility (${atr_pct.toFixed(1)}% in sweet spot 1.2-2.8%)` :
+                             ((atr_pct >= 0.8 && atr_pct <= 3.5) ? `Acceptable volatility (${atr_pct.toFixed(1)}% near range)` :
+                             ((atr_pct >= 0.4 && atr_pct <= 5.0) ? `Marginal volatility (${atr_pct.toFixed(1)}%)` :
+                             (atr_pct < 0.4 ? `Too quiet (${atr_pct.toFixed(1)}% below 0.4%)` : `Too choppy (${atr_pct.toFixed(1)}% above 5%)`)));
+              log(`   ${atrIcon} ATR=${scoreATR}: ${atrText}`);
+              
+              // Volume Analysis
+              const volIcon = scoreVolume >= 20 ? "✅" : (scoreVolume >= 15 ? "⚠️" : (scoreVolume >= 10 ? "⚠️" : "❌"));
+              const volText = vol24h > 300_000_000 ? `Excellent liquidity ($${(vol24h/1e6).toFixed(0)}M > $300M)` :
+                             (vol24h > 100_000_000 ? `Good liquidity ($${(vol24h/1e6).toFixed(0)}M in $100-300M range)` :
+                             (vol24h > 30_000_000 ? `Moderate liquidity ($${(vol24h/1e6).toFixed(0)}M in $30-100M range)` :
+                             `Thin liquidity ($${(vol24h/1e6).toFixed(0)}M < $30M)`));
+              log(`   ${volIcon} VOL=${scoreVolume}: ${volText}`);
+              
+              // Quality Analysis
+              const qualIcon = scoreQuality >= 10 ? "✅" : (scoreQuality >= 8 ? "⚠️" : (scoreQuality >= 6 ? "⚠️" : "❌"));
+              const qualText = (spreadOK && depthGood) ? `Tight execution (${x.spread_bps}bps spread + $${(x.depth1p_usd/1e3).toFixed(0)}k depth1%)` :
+                              (spreadOK || (spreadFair && depthGood)) ? `Acceptable execution (${x.spread_bps}bps spread, decent depth)` :
+                              ((spreadFair && depthOK) ? `Marginal execution (${x.spread_bps}bps spread, $${(x.depth1p_usd/1e3).toFixed(0)}k depth)` :
+                              `Poor execution (${x.spread_bps}bps wide spread, $${(x.depth1p_usd/1e3).toFixed(0)}k thin depth)`);
+              log(`   ${qualIcon} QUAL=${scoreQuality}: ${qualText}`);
+              
+              // Final Verdict
+              const greenCount = [adxIcon, atrIcon, volIcon, qualIcon].filter(ic => ic === "✅").length;
+              const redCount = [adxIcon, atrIcon, volIcon, qualIcon].filter(ic => ic === "❌").length;
+              
+              let verdict = "";
+              if (greenCount >= 3) {
+                verdict = "→ EXCELLENT: Balanced excellence across all factors";
+              } else if (greenCount >= 2 && redCount === 0) {
+                verdict = "→ GOOD: Strong in key factors, no major weaknesses";
+              } else if (redCount === 0) {
+                verdict = "→ ACCEPTABLE: All factors acceptable, no standout strengths";
+              } else if (redCount === 1) {
+                const weakFactor = adxIcon === "❌" ? "weak trend" : (atrIcon === "❌" ? "poor volatility" : (volIcon === "❌" ? "thin liquidity" : "expensive execution"));
+                verdict = `→ MARGINAL: One weakness (${weakFactor}) limits quality`;
+              } else {
+                const weak = [];
+                if (adxIcon === "❌") weak.push("ranging");
+                if (atrIcon === "❌") weak.push("volatility");
+                if (volIcon === "❌") weak.push("thin liquidity");
+                if (qualIcon === "❌") weak.push("wide spread");
+                verdict = `→ WEAK: Imbalanced (${weak.join(" + ")})`;
+              }
+              
+              log(`   ${verdict}\n`);
+            }
+
+            // Summary Statistics
+            log(`${"═".repeat(60)}`);
+            log(`📈 SELECTION SUMMARY:`);
+            log(`${"═".repeat(60)}`);
+            log(`   Refined: ${refined.length} total candidates`);
+            log(`   Selected: Top ${TOP_N || 3} (will be flipped to ${(TOP_N || 3) * 2} ideas)`);
+            
+            const scores = refined.map(r => r.confidence);
+            log(`   Score Range: ${Math.max(...scores)} → ${Math.min(...scores)} (spread: ${Math.max(...scores) - Math.min(...scores)} points)`);
+            log(`   Avg Quality: ${Math.round(mean(scores))} | Median: ${scores[Math.floor(scores.length/2)]}`);
+            
+            const excellent = scores.filter(s => s > 70).length;
+            const good = scores.filter(s => s >= 50 && s <= 70).length;
+            const marginal = scores.filter(s => s >= 30 && s < 50).length;
+            const poor = scores.filter(s => s < 30).length;
+            
+            log(`\n   Quality Tiers:`);
+            if (excellent > 0) log(`     Excellent (>70):  ${excellent} symbols`);
+            if (good > 0) log(`     Good (50-70):     ${good} symbols`);
+            if (marginal > 0) log(`     Marginal (30-50): ${marginal} symbols`);
+            if (poor > 0) log(`     Poor (<30):       ${poor} symbols`);
+            log(`${"═".repeat(60)}\n`);
 
             const TARGET_TOP_N = Math.max(1, TOP_N || 3);
 
@@ -2019,7 +2129,11 @@ jobs:
             log("DEBUG: saveState call complete.");
 
             // Build meta and payload — push v1 ideas to the existing Worker
-            for (const p of picks) { log(`idea ${p.symbol_full} ${p.side} conf=${p.confidence} reasons=${(p.reasons_text||[]).join("; ")}`); }
+            log(`🎯 FINAL ${picks.length} IDEAS (${picks.length/2} hedge pairs):`);
+            for (const p of picks) { 
+              const icon = p.predicted?.flipped ? "🔄" : "⭐";
+              log(`   ${icon} ${p.symbol_full} ${p.side.toUpperCase()} conf=${p.confidence} ev=${p.ev_bps}bps rrr=${p.rrr}`); 
+            }
             const ideaLogs = picks.map(p=>({
               symbol:p.symbol_full,
               side:p.side,
