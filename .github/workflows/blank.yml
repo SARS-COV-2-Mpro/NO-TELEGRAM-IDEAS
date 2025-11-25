@@ -79,62 +79,6 @@ jobs:
         with:
           node-version: 20
 
-      - name: Rotate Cloudflare Worker comment
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-        run: |
-          set -euo pipefail
-          
-          WORKER_NAME="${{ secrets.CF_WORKER_NAME }}"
-          
-          # Skip if secrets missing
-          if [[ -z "${CLOUDFLARE_API_TOKEN:-}" || -z "${CLOUDFLARE_ACCOUNT_ID:-}" || -z "${WORKER_NAME:-}" ]]; then
-            echo "⚠️  Cloudflare secrets missing - skipping"
-            exit 0
-          fi
-          
-          # Install Wrangler CLI
-          echo "[cf] Installing Wrangler..."
-          npm install -g wrangler@latest
-          
-          # Temporary directory
-          mkdir -p /tmp/worker-temp
-          cd /tmp/worker-temp
-          
-          # Download worker
-          echo "[cf] Downloading worker..."
-          wrangler download "${WORKER_NAME}" --output=. || {
-            echo "⚠️  Download failed - skipping"
-            exit 0
-          }
-          
-          # ✅ DELETE wrangler.toml to prevent config override
-          rm -f wrangler.toml wrangler.json .wrangler.toml
-          
-          # Find script file
-          SCRIPT_FILE=$(find . -maxdepth 1 \( -name "*.js" -o -name "*.mjs" -o -name "*.ts" \) | head -n 1)
-          
-          if [[ -z "$SCRIPT_FILE" ]]; then
-            echo "⚠️  No script found - skipping"
-            exit 0
-          fi
-          
-          echo "[cf] Found script: $SCRIPT_FILE"
-          
-          # Update comment
-          sed -i.bak '/\/\/hey i am here!A\.G/d' "$SCRIPT_FILE" 2>/dev/null || sed -i '' '/\/\/hey i am here!A\.G/d' "$SCRIPT_FILE"
-          echo "//hey i am here!A.G" >> "$SCRIPT_FILE"
-          
-          # ✅ Deploy WITHOUT config file (preserves all env vars/bindings)
-          echo "[cf] Deploying (env vars preserved)..."
-          wrangler deploy "$SCRIPT_FILE" --name "${WORKER_NAME}" --compatibility-date=$(date +%Y-%m-%d) || {
-            echo "⚠️  Deploy failed, but continuing workflow"
-            exit 0
-          }
-          
-          echo "✅ Worker comment rotated (all env vars preserved)"
-
       - name: Run pusher (always-push + clear logs)
         shell: bash
         run: |
@@ -640,14 +584,6 @@ jobs:
           function mergeStates(remote, local) {
             const merged = { ...remote };
 
-            // ✅ Preserve pusher-only meta fields that Worker doesn't touch
-            if (local.run_counter !== undefined) {
-              merged.run_counter = local.run_counter;
-            }
-            if (local.calib_last_version !== undefined) {
-              merged.calib_last_version = local.calib_last_version;
-            }
-
             // 1. Merge learned_trade_keys (O(n), recency-preserving)
             const remoteKeys = Array.isArray(remote.learned_trade_keys) ? remote.learned_trade_keys : [];
             const localKeys = Array.isArray(local.learned_trade_keys) ? local.learned_trade_keys : [];
@@ -747,9 +683,6 @@ jobs:
             const gistUrl = `https://api.github.com/gists/${persist.id}`;
             const mkFiles = (s) => ({ "state.json": { content: JSON.stringify(s) } });
 
-            // Detect wipe mode: caller passed {} as state
-            const wipeToEmpty = state && Object.keys(state).length === 0;
-
             async function patch(files, etag) {
               const headers = {
                 Authorization: `Bearer ${persist.token}`,
@@ -817,10 +750,9 @@ jobs:
 
             if (blindFallback) {
               log("WARN: Falling back to blind PATCH (no If-Match).");
-
-              if (!wipeToEmpty) {
-                // Normal mode: pre-merge to avoid clobbering Worker updates
-                try {
+              
+              // Pre-merge before blind patch to avoid clobbering Worker updates
+              try {
                   const r2 = await fetchWithTimeout(gistUrl, {
                     headers: {
                       Authorization: `Bearer ${persist.token}`,
@@ -838,20 +770,15 @@ jobs:
                   } else {
                     log("WARN: Pre-blind-patch re-fetch failed status=", r2.status, ". Will save local state.");
                   }
-                } catch (e) {
+              } catch (e) {
                   log("ERROR: Exception during pre-blind-patch re-fetch:", e?.message || String(e));
-                }
-              } else {
-                // Wipe mode: force {} and skip merge entirely
-                toSave = {};
-                log("DEBUG: WipeToEmpty=true → skipping pre-merge, forcing {}");
               }
-
+              
               const r3 = await patch(mkFiles(toSave), null);
               if (r3.ok) {
                 const newEtag = r3.headers.get("etag");
                 persist.etag = newEtag || persist.etag;
-                log("SUCCESS: Blind Gist update ok. pending=", (toSave.pending||[]).length || 0);
+                log("SUCCESS: Blind Gist update ok. pending=", (toSave.pending||[]).length);
               } else {
                 const body = (await r3.text().catch(()=> ""))?.slice(0, 300) || "";
                 log("ERROR: Blind save failed status=", r3.status, "body=", body);
@@ -1040,6 +967,7 @@ jobs:
               // ✅ CORRECT: Only learn from TP/SL hits
               const tp_hit = exit === "tp" || c.realized?.tp_hit === true;
               const sl_hit = exit === "sl" || c.realized?.sl_hit === true;
+              
               // Skip TTL without marking learned (Worker may update later)
               if (!tp_hit && !sl_hit) {
                 stats.skipped_ttl++;
@@ -1398,21 +1326,6 @@ jobs:
           try{
             const { state, persist } = await loadState();
 
-            // ============================================================
-            // 🔥 WIPE TO {} EVERY 6 RUNS
-            // ============================================================
-            state.run_counter = (state.run_counter || 0) + 1;
-            log(`🔄 Run ${state.run_counter}/6`);
-
-            const SHOULD_WIPE = (state.run_counter >= 6);
-
-            if (SHOULD_WIPE) {
-              log("🧹 6TH RUN → COMPLETE GIST WIPE TO {}");
-              // Mark for total wipe at save time
-              state.__WIPE_TO_EMPTY__ = true;
-            }
-            // ============================================================
-
             // 📚 Learn from ALL closed trades FIRST
             learnFromGistRealFills(state);
 
@@ -1643,140 +1556,35 @@ jobs:
                 const chosen=candLong&&candShort?(candLong.exp_lcb_bps>=candShort.exp_lcb_bps?candLong:candShort):(candLong||candShort||null);
                 if(!chosen) continue;
 
-                // ============ GEOMETRIC MEAN SCORING (Hedge-Optimized for MEXC) ============
-                
-                // Factor 1: ADX (trend strength)
-                const scoreADX = (() => {
-                  const adx = mtfAgg.adx || 0;
-                  if (adx > 22) return 40;
-                  if (adx >= 18) return 30;
-                  if (adx >= 14) return 20;
-                  return 10;
-                })();
+                const microQ=(Math.max(0,1-(p.spreadBps||0)/20))*(1-Math.min(0.6,(chosen.cost_bps-COST_BPS)/20))*(1+clamp(obi,-0.2,0.2));
+                // Soft TF alignment (no hard gate)
+                const gTF = clamp(0.4 + 0.8*tfAlign, 0.2, 1.2);
+                const regimeQ=0.7+0.4*tfAlign;
 
-                // Factor 2: ATR % (volatility sweet spot)
-                const scoreATR = (() => {
-                  const atr_pct = p.atr_bps / 100;
-                  if (atr_pct >= 1.2 && atr_pct <= 2.8) return 30;
-                  if (atr_pct >= 0.8 && atr_pct <= 3.5) return 20;
-                  if (atr_pct >= 0.4 && atr_pct <= 5.0) return 10;
-                  return 5;
-                })();
+                const gSpread = clamp(1 - Math.max(0,(p.spreadBps - MAX_SPREAD_BPS))/MAX_SPREAD_BPS, 0.2, 1.1);
+                const gCost   = clamp(1 - Math.max(0,(chosen.cost_bps - COST_BPS))/20, 0.2, 1.1);
+                const gVol    = clamp((p.vol1h_est_usd||0)/Math.max(1, MIN_VOL_1H_USD), 0.2, 1.1);
+                const gDepth  = clamp(depth1pUSD/Math.max(1, DEPTH_1P_MIN_USD), 0.2, 1.1);
+                const gMR     = p.mrLocked ? 0.7 : 1.05;
+                const gDir    = (chosen.side==="long" && p.noLongDown) ? 0.8 : 1.0;
+                const gBTC    = (chosen.side==="long" && !btcUp1h) ? 0.85 : 1.0;
+                const gEV     = clamp(chosen.viab_mult||1, 0.3, 1.3);
 
-                // Factor 3: Volume (24h liquidity for hedge pairs)
-                const scoreVolume = (() => {
-                  const vol24h = (p.vol1h_est_usd || 0) * 24;
-                  if (vol24h > 300_000_000) return 20;
-                  if (vol24h > 100_000_000) return 15;
-                  if (vol24h > 30_000_000) return 10;
-                  return 5;
-                })();
+                const gateMult= clamp(gSpread * gCost * gVol * gDepth * gMR * gDir * gBTC * gTF * gEV, 0.2, 1.4);
 
-                // Factor 4: Execution Quality (spread + depth)
-                const scoreQuality = (() => {
-                  const spreadOK = (p.spreadBps || 999) <= 12;
-                  const spreadFair = (p.spreadBps || 999) <= 18;
-                  const depthGood = (depth1pUSD || 0) > 150_000;
-                  const depthOK = (depth1pUSD || 0) > 80_000;
-                  
-                  if (spreadOK && depthGood) return 10;
-                  if (spreadOK || (spreadFair && depthGood)) return 8;
-                  if (spreadFair && depthOK) return 6;
-                  return 4;
-                })();
+                // ✅ FLUCTUATION MULTIPLIER: higher 90m volatility = higher confidence
+                // Normalize around 140bps avg, clamp to 0.7x - 1.6x boost
+                const fluctMult = clamp((fluctuation_90m_bps || 0) / 140, 0.7, 1.6);
 
-                // GEOMETRIC MEAN (4th root) - harshly penalizes imbalanced symbols
-                const rawScore = Math.pow(
-                  scoreADX * scoreATR * scoreVolume * scoreQuality,
-                  0.25
-                );
-
-                // ============ FIXED MULTIPLIERS (BALANCED) ============
-                
-                // 1. Reduce fluctuation impact (was ±40%, now ±15%)
-                const fluctMult = clamp((fluctuation_90m_bps || 0) / 200, 0.92, 1.15);
-
-                // 2. Soften penalties, strengthen bonuses
-                const qualityMult = (
-                  (tfAlign > 0.7 ? 1.20 : 1.0) *          // Boost alignment bonus 15%→20%
-                  (!p.mrLocked ? 1.08 : 1.0) *            // Boost MR bonus 5%→8%
-                  ((chosen.side === "long" && p.noLongDown) ? 0.92 : 1.0) *  // Soften RSI penalty 20%→8%
-                  ((chosen.side === "long" && !btcUp1h) ? 0.94 : 1.0)        // Soften BTC penalty 15%→6%
-                );
-
-                // 3. ADD: Bonus for "GOOD" verdict (quality over hype)
-                const verdictBonus = (() => {
-                  const spreadOK = (p.spreadBps || 999) <= 12;
-                  const spreadFair = (p.spreadBps || 999) <= 18;
-                  const depthGood = (depth1pUSD || 0) > 150_000;
-                  const depthOK = (depth1pUSD || 0) > 80_000;
-                  const vol24h = (p.vol1h_est_usd || 0) * 24;
-                  
-                  // Count green checkmarks from your logging
-                  let greenCount = 0;
-                  if ((mtfAgg.adx || 0) > 22) greenCount++;
-                  if (p.atr_bps >= 120 && p.atr_bps <= 280) greenCount++;
-                  if (vol24h > 30_000_000) greenCount++;
-                  if ((spreadOK && depthGood) || (spreadFair && depthOK)) greenCount++;
-                  
-                  // EXCELLENT (3-4 green) → +12% | GOOD (2 green, 0 red) → +8% | else → +0%
-                  if (greenCount >= 3) return 1.12;
-                  if (greenCount >= 2) return 1.08;
-                  return 1.0;
-                })();
-
-                const totalMult = qualityMult * fluctMult * verdictBonus;
-                const cappedMult = clamp(totalMult, 0.88, 1.35);  // Max 53% swing instead of 190%
-
-                // --- Verdict-based confidence boost ---
-                // Reconstruct the verdict tiers similar to your logging:
-                //
-                // EXCELLENT:   many greens, no reds
-                // GOOD:        some greens, no reds
-                // ACCEPTABLE:  no reds, few/no greens
-                // MARGINAL:    exactly one red
-                // WEAK:        multiple reds
-                const isGreenADX  = (scoreADX   >= 30);
-                const isRedADX    = (scoreADX   < 20);
-
-                const isGreenATR  = (scoreATR   >= 30);
-                const isRedATR    = (scoreATR   < 10);
-
-                const isGreenVOL  = (scoreVolume >= 20);
-                const isRedVOL    = (scoreVolume === 5);
-
-                const isGreenQUAL = (scoreQuality >= 10);
-                const isRedQUAL   = (scoreQuality < 6);
-
-                const greenCount = [isGreenADX, isGreenATR, isGreenVOL, isGreenQUAL].filter(Boolean).length;
-                const redCount   = [isRedADX,   isRedATR,   isRedVOL,   isRedQUAL  ].filter(Boolean).length;
-
-                // Map verdict → numeric boost:
-                // EXCELLENT  → +12
-                // GOOD       → +10
-                // ACCEPTABLE → +6
-                // MARGINAL   → +0
-                // WEAK       → +0
-                let verdictBoost = 0;
-                if (greenCount >= 3 && redCount === 0) {
-                  // EXCELLENT
-                  verdictBoost = 12;
-                } else if (greenCount >= 2 && redCount === 0) {
-                  // GOOD
-                  verdictBoost = 10;
-                } else if (redCount === 0) {
-                  // ACCEPTABLE
-                  verdictBoost = 6;
-                } else if (redCount === 1) {
-                  // MARGINAL
-                  verdictBoost = 0;
-                } else {
-                  // WEAK (multiple weaknesses)
-                  verdictBoost = 0;
-                }
-
-                // Base confidence from rawScore and multipliers, plus verdict bonus
-                const conf = Math.round(rawScore * cappedMult + verdictBoost);
+                const conf = confidenceScore({
+                  p_cal: chosen.p_lcb,
+                  ev_bps: chosen.ev_bps,
+                  atr_bps: p.atr_bps,
+                  micro: microQ,
+                  regime: regimeQ,
+                  reliability: 1,
+                  riskAdj: 1
+                }) * gateMult * fluctMult;
 
                 const slipEst=chosen.side==="long"?slipL:slipS;
                 const btcCorr=corr((()=>{const r=[];for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-120);})(), btcR5);
@@ -1785,7 +1593,7 @@ jobs:
                 refined.push({
                   symbol:c.symbol, base:c.base, quote:c.quote, qv:c.qv,
                   side:chosen.side,
-                  fluctuation_90m_bps,
+                  fluctuation_90m_bps,  // ✅ ADD THIS
                   p_lcb:+chosen.p_lcb.toFixed(3), p_raw:+chosen.p_raw.toFixed(3),
                   exp_bps:chosen.ev_bps, exp_lcb_bps:chosen.exp_lcb_bps,
                   tp_bps:chosen.tp_bps, sl_bps:chosen.sl_bps,
@@ -1807,7 +1615,7 @@ jobs:
                   btc_corr: +(+btcCorr||0).toFixed(3),
                   trend5m: p.trend5m
                 });
-              }catch(e){ log("heavy refine warn", e?.message||e); }
+              }catch(e){ log("heavy refine warn",e?.message||e); }
             }
 
             // Uniqueness adjustment
@@ -1827,121 +1635,6 @@ jobs:
             }
 
             refined.sort((a,b)=>b.confidence-a.confidence);
-
-            // ═══════════════════════════════════════════════════════
-            // DETAILED TOP 10 SCORING BREAKDOWN
-            // ═══════════════════════════════════════════════════════
-            log(`\n${"═".repeat(60)}`);
-            log(`📊 TOP 10 CANDIDATES (Geometric Mean Ranking):`);
-            log(`${"═".repeat(60)}\n`);
-
-            const top10 = refined.slice(0, 10);
-            
-            for (let i = 0; i < top10.length; i++) {
-              const x = top10[i];
-              const rank = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"][i];
-              
-              // Recalculate factor scores for logging
-              const adx = x.mtf_agg?.adx || 0;
-              const scoreADX = adx > 22 ? 40 : (adx >= 18 ? 30 : (adx >= 14 ? 20 : 10));
-              
-              const atr_pct = x.atr_bps / 100;
-              const scoreATR = (atr_pct >= 1.2 && atr_pct <= 2.8) ? 30 : ((atr_pct >= 0.8 && atr_pct <= 3.5) ? 20 : ((atr_pct >= 0.4 && atr_pct <= 5.0) ? 10 : 5));
-              
-              const vol24h = (x.vol1h_est_usd || 0) * 24;
-              const scoreVolume = vol24h > 300_000_000 ? 20 : (vol24h > 100_000_000 ? 15 : (vol24h > 30_000_000 ? 10 : 5));
-              
-              const spreadOK = x.spread_bps <= 12;
-              const spreadFair = x.spread_bps <= 18;
-              const depthGood = x.depth1p_usd > 150_000;
-              const depthOK = x.depth1p_usd > 80_000;
-              const scoreQuality = (spreadOK && depthGood) ? 10 : ((spreadOK || (spreadFair && depthGood)) ? 8 : ((spreadFair && depthOK) ? 6 : 4));
-              
-              const rawScore = Math.pow(scoreADX * scoreATR * scoreVolume * scoreQuality, 0.25);
-              const mult = x.confidence / rawScore;
-              
-              log(`${rank} ${x.symbol} ${x.side.toUpperCase()}: conf=${x.confidence} (raw=${rawScore.toFixed(1)} × mult=${mult.toFixed(2)})`);
-              
-              // ADX Analysis
-              const adxIcon = scoreADX >= 30 ? "✅" : (scoreADX >= 20 ? "⚠️" : "❌");
-              const adxText = adx > 22 ? `Strong trend (${adx.toFixed(1)} > threshold 22)` : 
-                             (adx >= 18 ? `Moderate trend (${adx.toFixed(1)} near threshold)` : 
-                             (adx >= 14 ? `Weak trend (${adx.toFixed(1)} < threshold 22)` : 
-                             `Ranging market (${adx.toFixed(1)} far below 22)`));
-              log(`   ${adxIcon} ADX=${scoreADX}: ${adxText}`);
-              
-              // ATR Analysis
-              const atrIcon = scoreATR >= 30 ? "✅" : (scoreATR >= 20 ? "⚠️" : (scoreATR >= 10 ? "⚠️" : "❌"));
-              const atrText = (atr_pct >= 1.2 && atr_pct <= 2.8) ? `Perfect volatility (${atr_pct.toFixed(1)}% in sweet spot 1.2-2.8%)` :
-                             ((atr_pct >= 0.8 && atr_pct <= 3.5) ? `Acceptable volatility (${atr_pct.toFixed(1)}% near range)` :
-                             ((atr_pct >= 0.4 && atr_pct <= 5.0) ? `Marginal volatility (${atr_pct.toFixed(1)}%)` :
-                             (atr_pct < 0.4 ? `Too quiet (${atr_pct.toFixed(1)}% below 0.4%)` : `Too choppy (${atr_pct.toFixed(1)}% above 5%)`)));
-              log(`   ${atrIcon} ATR=${scoreATR}: ${atrText}`);
-              
-              // Volume Analysis
-              const volIcon = scoreVolume >= 20 ? "✅" : (scoreVolume >= 15 ? "⚠️" : (scoreVolume >= 10 ? "⚠️" : "❌"));
-              const volText = vol24h > 300_000_000 ? `Excellent liquidity ($${(vol24h/1e6).toFixed(0)}M > $300M)` :
-                             (vol24h > 100_000_000 ? `Good liquidity ($${(vol24h/1e6).toFixed(0)}M in $100-300M range)` :
-                             (vol24h > 30_000_000 ? `Moderate liquidity ($${(vol24h/1e6).toFixed(0)}M in $30-100M range)` :
-                             `Thin liquidity ($${(vol24h/1e6).toFixed(0)}M < $30M)`));
-              log(`   ${volIcon} VOL=${scoreVolume}: ${volText}`);
-              
-              // Quality Analysis
-              const qualIcon = scoreQuality >= 10 ? "✅" : (scoreQuality >= 8 ? "⚠️" : (scoreQuality >= 6 ? "⚠️" : "❌"));
-              const qualText = (spreadOK && depthGood) ? `Tight execution (${x.spread_bps}bps spread + $${(x.depth1p_usd/1e3).toFixed(0)}k depth1%)` :
-                              (spreadOK || (spreadFair && depthGood)) ? `Acceptable execution (${x.spread_bps}bps spread, decent depth)` :
-                              ((spreadFair && depthOK) ? `Marginal execution (${x.spread_bps}bps spread, $${(x.depth1p_usd/1e3).toFixed(0)}k depth)` :
-                              `Poor execution (${x.spread_bps}bps wide spread, $${(x.depth1p_usd/1e3).toFixed(0)}k thin depth)`);
-              log(`   ${qualIcon} QUAL=${scoreQuality}: ${qualText}`);
-              
-              // Final Verdict
-              const greenCount = [adxIcon, atrIcon, volIcon, qualIcon].filter(ic => ic === "✅").length;
-              const redCount = [adxIcon, atrIcon, volIcon, qualIcon].filter(ic => ic === "❌").length;
-              
-              let verdict = "";
-              if (greenCount >= 3) {
-                verdict = "→ EXCELLENT: Balanced excellence across all factors";
-              } else if (greenCount >= 2 && redCount === 0) {
-                verdict = "→ GOOD: Strong in key factors, no major weaknesses";
-              } else if (redCount === 0) {
-                verdict = "→ ACCEPTABLE: All factors acceptable, no standout strengths";
-              } else if (redCount === 1) {
-                const weakFactor = adxIcon === "❌" ? "weak trend" : (atrIcon === "❌" ? "poor volatility" : (volIcon === "❌" ? "thin liquidity" : "expensive execution"));
-                verdict = `→ MARGINAL: One weakness (${weakFactor}) limits quality`;
-              } else {
-                const weak = [];
-                if (adxIcon === "❌") weak.push("ranging");
-                if (atrIcon === "❌") weak.push("volatility");
-                if (volIcon === "❌") weak.push("thin liquidity");
-                if (qualIcon === "❌") weak.push("wide spread");
-                verdict = `→ WEAK: Imbalanced (${weak.join(" + ")})`;
-              }
-              
-              log(`   ${verdict}\n`);
-            }
-
-            // Summary Statistics
-            log(`${"═".repeat(60)}`);
-            log(`📈 SELECTION SUMMARY:`);
-            log(`${"═".repeat(60)}`);
-            log(`   Refined: ${refined.length} total candidates`);
-            log(`   Selected: Top ${TOP_N || 3} (will be flipped to ${(TOP_N || 3) * 2} ideas)`);
-            
-            const scores = refined.map(r => r.confidence);
-            log(`   Score Range: ${Math.max(...scores)} → ${Math.min(...scores)} (spread: ${Math.max(...scores) - Math.min(...scores)} points)`);
-            log(`   Avg Quality: ${Math.round(mean(scores))} | Median: ${scores[Math.floor(scores.length/2)]}`);
-            
-            const excellent = scores.filter(s => s > 70).length;
-            const good = scores.filter(s => s >= 50 && s <= 70).length;
-            const marginal = scores.filter(s => s >= 30 && s < 50).length;
-            const poor = scores.filter(s => s < 30).length;
-            
-            log(`\n   Quality Tiers:`);
-            if (excellent > 0) log(`     Excellent (>70):  ${excellent} symbols`);
-            if (good > 0) log(`     Good (50-70):     ${good} symbols`);
-            if (marginal > 0) log(`     Marginal (30-50): ${marginal} symbols`);
-            if (poor > 0) log(`     Poor (<30):       ${poor} symbols`);
-            log(`${"═".repeat(60)}\n`);
 
             const TARGET_TOP_N = Math.max(1, TOP_N || 3);
 
@@ -2201,24 +1894,11 @@ jobs:
             // Persist state + audit artifacts
             const auditOut=buildAuditOutputs(state);
             log("DEBUG: Pre-save: pending length=", (state.pending || []).length);
-
-            // Check if this run should wipe gist to {}
-            if (state.__WIPE_TO_EMPTY__) {
-              log("🗑️  WIPING GIST TO EMPTY {} (run 6 complete)");
-              await saveState(persist, {}, auditOut, 2, true);  // Save empty object
-              log("✅ Gist now contains: {}");
-            } else {
-              await saveState(persist, state, auditOut, 2, true);  // Normal save
-            }
-
+            await saveState(persist, state, auditOut, 2, true);
             log("DEBUG: saveState call complete.");
 
             // Build meta and payload — push v1 ideas to the existing Worker
-            log(`🎯 FINAL ${picks.length} IDEAS (${picks.length/2} hedge pairs):`);
-            for (const p of picks) { 
-              const icon = p.predicted?.flipped ? "🔄" : "⭐";
-              log(`   ${icon} ${p.symbol_full} ${p.side.toUpperCase()} conf=${p.confidence} ev=${p.ev_bps}bps rrr=${p.rrr}`); 
-            }
+            for (const p of picks) { log(`idea ${p.symbol_full} ${p.side} conf=${p.confidence} reasons=${(p.reasons_text||[]).join("; ")}`); }
             const ideaLogs = picks.map(p=>({
               symbol:p.symbol_full,
               side:p.side,
