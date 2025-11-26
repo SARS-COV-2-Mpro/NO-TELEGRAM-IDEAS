@@ -687,7 +687,7 @@ jobs:
             const gistUrl = `https://api.github.com/gists/${persist.id}`;
             const mkFiles = (s) => ({ "state.json": { content: JSON.stringify(s) } });
 
-            // Detect wipe mode: caller passed {} as state
+            // Detect wipe mode: caller passed {run_counter: 0}
             const wipeToEmpty = state && Object.keys(state).length === 1 && state.run_counter === 0;
 
             async function patch(files, etag) {
@@ -729,6 +729,10 @@ jobs:
               }
 
               if (r.status === 412) {
+                if (wipeToEmpty) {
+                  log("DEBUG: 412 during wipe - skipping merge");
+                  break;  // Fall through to blindFallback
+                }
                 // Conflict: re-fetch + merge + retry
                 const r2 = await fetchWithTimeout(gistUrl, {
                   headers: {
@@ -1346,8 +1350,11 @@ jobs:
             const SHOULD_WIPE = (state.run_counter >= 6);
 
             if (SHOULD_WIPE) {
-              log("🧹 6TH RUN → COMPLETE GIST WIPE TO {run_counter: 0}");
-              state.__WIPE_TO_EMPTY__ = true;
+              log("🗑️  RUN 6: IMMEDIATE WIPE");
+              await saveState(persist, { run_counter: 0 }, {}, 2, true);
+              const payload = { ts: new Date().toISOString(), mode: "normal", source: "external_pusher", meta: { origin: "github_actions", reason: "wipe_cycle" }, top_n: 0, ideas: [] };
+              await fetchWithTimeout(PUSH_URL, { method: "POST", headers: { "Content-Type": "application/json", "Authorization": "Bearer " + PUSH_TOKEN }, body: JSON.stringify(payload) }, 15000);
+              return; // EXIT - skip all processing
             }
 
             // 📚 Learn from ALL closed trades FIRST
@@ -1363,8 +1370,7 @@ jobs:
             const preserved = {
               v: state.v || "mexc-ultimate-6.4-audit-mtf",
               run_counter: state.run_counter || 0,
-              __WIPE_TO_EMPTY__: state.__WIPE_TO_EMPTY__,
-
+              
               // Pusher owns (keep):
               cooldown: state.cooldown || {},
               cooldown_side: state.cooldown_side || {},
@@ -1917,18 +1923,11 @@ jobs:
               log("DEBUG: Appended", picks.length, "plans. New pending length=", (state.pending || []).length, "example ID:", state.pending.slice(-1)[0]?.client_order_id || "none");
             }catch(e){ log("state update warn",e?.message||e); }
 
-            // Persist state + audit artifacts
-            const auditOut=buildAuditOutputs(state);
+            // Persist state + audit artifacts (only for non-wipe runs)
+            const auditOut = buildAuditOutputs(state);
             log("DEBUG: Pre-save: pending length=", (state.pending || []).length);
-
-            if (state.__WIPE_TO_EMPTY__) {
-              log("🗑️  WIPING GIST (run 6 complete)");
-              await saveState(persist, { run_counter: 0 }, auditOut, 2, true);
-              log("✅ Gist wiped, counter reset to 0");
-            } else {
-              await saveState(persist, state, auditOut, 2, true);
-              log("DEBUG: saveState call complete.");
-            }
+            await saveState(persist, state, auditOut, 2, true);
+            log("DEBUG: saveState call complete.");
 
             // Build meta and payload — push v1 ideas to the existing Worker
             for (const p of picks) { log(`idea ${p.symbol_full} ${p.side} conf=${p.confidence} reasons=${(p.reasons_text||[]).join("; ")}`); }
