@@ -175,7 +175,7 @@ jobs:
             let openAll = null;
             try { openAll = await fetchOpenOrders(); } catch (e) { log("openOrders err", e?.message || e); }
 
-            // If we can’t confirm open orders, skip cleanup (don’t risk deleting live orders)
+            // If we can't confirm open orders, skip cleanup (don't risk deleting live orders)
             if (!Array.isArray(openAll)) {
               log("cleanup: openOrders unavailable; skipping this cycle");
               return { dropped: 0, dropCIDs: [], scanned: state.pending?.length || 0, droppable: 0, orphans: 0 };
@@ -517,7 +517,7 @@ jobs:
             if(!MEXC_API_KEY||!MEXC_SECRET_KEY) return res;
             try{
               const openAll=await fetchOpenOrders();
-              if (!Array.isArray(openAll)) return res; // don’t mark zombies on unavailable data
+              if (!Array.isArray(openAll)) return res; // don't mark zombies on unavailable data
 
               const byClient=new Map();
               for(const o of openAll){ const cid=(o.clientOrderId||o.clientOrderID||"").trim(); if(cid) byClient.set(cid,o); }
@@ -570,6 +570,7 @@ jobs:
               if(!s.lastReconcileTs)s.lastReconcileTs=0;
               if (!Array.isArray(s.learned_trade_keys)) s.learned_trade_keys = [];
               if (!s.calib_symbol_counts) s.calib_symbol_counts = {};
+              if (s.run_counter == null) s.run_counter = 0;
 
               // Version check - reset calibration if outdated
               if (s.calib_last_version !== CALIB_VERSION) {
@@ -584,6 +585,8 @@ jobs:
           
           function mergeStates(remote, local) {
             const merged = { ...remote };
+
+            merged.run_counter = Math.max(local.run_counter || 0, remote.run_counter || 0);
 
             // 1. Merge learned_trade_keys (O(n), recency-preserving)
             const remoteKeys = Array.isArray(remote.learned_trade_keys) ? remote.learned_trade_keys : [];
@@ -685,7 +688,7 @@ jobs:
             const mkFiles = (s) => ({ "state.json": { content: JSON.stringify(s) } });
 
             // Detect wipe mode: caller passed {} as state
-            const wipeToEmpty = state && Object.keys(state).length === 0;
+            const wipeToEmpty = state && Object.keys(state).length === 1 && state.run_counter === 0;
 
             async function patch(files, etag) {
               const headers = {
@@ -779,9 +782,9 @@ jobs:
                     log("ERROR: Exception during pre-blind-patch re-fetch:", e?.message || String(e));
                 }
               } else {
-                // Wipe mode: force {} and skip merge entirely
-                toSave = {};
-                log("DEBUG: WipeToEmpty=true → skipping pre-merge, forcing {}");
+                // Wipe mode: force {run_counter:0} and skip merge entirely
+                toSave = { run_counter: 0 };
+                log("DEBUG: WipeToEmpty=true → skipping pre-merge, forcing {run_counter:0}");
               }
               
               const r3 = await patch(mkFiles(toSave), null);
@@ -1343,7 +1346,7 @@ jobs:
             const SHOULD_WIPE = (state.run_counter >= 6);
 
             if (SHOULD_WIPE) {
-              log("🧹 6TH RUN → COMPLETE GIST WIPE TO {}");
+              log("🧹 6TH RUN → COMPLETE GIST WIPE TO {run_counter: 0}");
               state.__WIPE_TO_EMPTY__ = true;
             }
 
@@ -1919,9 +1922,9 @@ jobs:
             log("DEBUG: Pre-save: pending length=", (state.pending || []).length);
 
             if (state.__WIPE_TO_EMPTY__) {
-              log("🗑️  WIPING GIST TO EMPTY {} (run 6 complete)");
-              await saveState(persist, {}, auditOut, 2, true);
-              log("✅ Gist now contains: {}");
+              log("🗑️  WIPING GIST (run 6 complete)");
+              await saveState(persist, { run_counter: 0 }, auditOut, 2, true);
+              log("✅ Gist wiped, counter reset to 0");
             } else {
               await saveState(persist, state, auditOut, 2, true);
               log("DEBUG: saveState call complete.");
