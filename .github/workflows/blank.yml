@@ -296,16 +296,6 @@ jobs:
           const todOK=(S_H==null||E_H==null)?true:(S_H<=E_H?(nowH>=S_H&&nowH<=E_H):(nowH>=S_H||nowH<=E_H));
           const STABLES=new Set(["USDT","USDC","USD","USDE","USDD","BUSD","FDUSD","TUSD","DRKUSD","DAI","USDP","PAX","USTC"]);
 
-          // ✅ ALLOWED SYMBOLS WHITELIST
-          const ALLOWED_SYMBOLS = new Set([
-            "BTCUSDT","ETHUSDT","SOLUSDT","PEPEUSDT","DOGEUSDT","XRPUSDT","1000SATSUSDT","BNBUSDT","SUIUSDT",
-            "BONKUSDT","SHIBUSDT","FLOKIUSDT","TONUSDT","ADAUSDT","AVAXUSDT","TRXUSDT","LINKUSDT","WIFUSDT",
-            "BCHUSDT","NEARUSDT","ONDOUSDT","DOTUSDT","LTCUSDT","NOTUSDT","FETUSDT","ARBUSDT","OPUSDT",
-            "INJUSDT","MATICUSDT","HBARUSDT","FILUSDT","JUPUSDT","FTMUSDT","STXUSDT","ORDIUSDT",
-            "SEIUSDT","UNIUSDT","APTUSDT","RUNEUSDT","ENAUSDT","GALAUSDT","WLDUSDT","TIAUSDT",
-            "MEMEUSDT","ICPUSDT","ATOMUSDT"
-          ]);
-
           // ✅ PRIORITY SYMBOLS: BTC/ETH/SOL + extended list
           const PRIORITY_BASES = new Set([
             "BTC","ETH","SOL",
@@ -1446,7 +1436,7 @@ jobs:
             // Universe build
             const QUOTES=["USDT","USDC","USD"];
             const split=(sym)=>{ for(const q of QUOTES) if(sym.endsWith(q)) return { base:sym.slice(0,-q.length), quote:q }; return null; };
-            const all=[]; for(const t of ALL24||[]){ const sym=t.symbol||t.s; if(!sym) continue; if(!ALLOWED_SYMBOLS.has(sym)) continue; const sq=split(sym); if(!sq) continue; if(STABLES.has(sq.base)) continue; const qv=+(t.quoteVolume||t.q||0); if(!isFinite(qv)||qv<=0) continue; all.push({ symbol:sym, base:sq.base, quote:sq.quote, qv }); }
+            const all=[]; for(const t of ALL24||[]){ const sym=t.symbol||t.s; if(!sym) continue; const sq=split(sym); if(!sq) continue; if(STABLES.has(sq.base)) continue; const qv=+(t.quoteVolume||t.q||0); if(!isFinite(qv)||qv<=0) continue; all.push({ symbol:sym, base:sq.base, quote:sq.quote, qv }); }
             all.sort((a,b)=>b.qv-a.qv);
             let dynMinQV=Math.max(MIN_QV_ENV||0,DYN_QV_MIN), filt=all.filter(x=>x.qv>=dynMinQV);
             while(filt.length<UNIV_TARGET_MIN && dynMinQV>1_000_000){ dynMinQV=Math.max(1_000_000, dynMinQV-DYN_QV_STEP); filt=all.filter(x=>x.qv>=dynMinQV); }
