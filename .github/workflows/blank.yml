@@ -1,4 +1,3 @@
-0
 name: Ideas Pusher (MEXC Ultimate 7.7.7)
 
 on:
@@ -471,7 +470,6 @@ jobs:
             return Array.isArray(r) ? r : null; // null => unavailable
           }
           async function fetchK(sym,interval,limit,startTime,endTime){ const u=api("/api/v3/klines",{symbol:sym,interval,limit,startTime,endTime}); const r=await getJSON(u,10000,2); return Array.isArray(r)?r:null; }
-          async function fetchDepth(symbol){ return await getJSON(api("/api/v3/depth",{symbol,limit:DEPTH_LIMIT}), 10000, 2); }
           async function fetchAll24hr(){
             let all=await getJSON(api("/api/v3/ticker/24hr"),10000,2); if(Array.isArray(all)&&all.length) return all;
             const exi=await getJSON(api("/api/v3/exchangeInfo"),10000,2); const syms=(exi?.symbols||[]).filter(s=>s.status==="TRADING").map(s=>s.symbol).slice(0,300);
@@ -1351,11 +1349,29 @@ jobs:
             const SHOULD_WIPE = (state.run_counter >= 6);
 
             if (SHOULD_WIPE) {
-              log("🗑️  RUN 6: IMMEDIATE WIPE");
+              log("🗑️  RUN 6: WIPE GIST AND RESTART FRESH");
               await saveState(persist, { run_counter: 0 }, {}, 2, true);
-              const payload = { ts: new Date().toISOString(), mode: "normal", source: "external_pusher", meta: { origin: "github_actions", reason: "wipe_cycle" }, top_n: 0, ideas: [] };
-              await fetchWithTimeout(PUSH_URL, { method: "POST", headers: { "Content-Type": "application/json", "Authorization": "Bearer " + PUSH_TOKEN }, body: JSON.stringify(payload) }, 15000);
-              return; // EXIT - skip all processing
+              
+              // Reset local state to fresh initial values
+              state.v = "mexc-ultimate-6.4-audit-mtf";
+              state.run_counter = 1;
+              state.cooldown = {};
+              state.cooldown_side = {};
+              state.pending = [];
+              state.equity = [];
+              state.closed = [];
+              state.mr_lockout = {};
+              state.sym_stats = {};
+              state.sym_stats_real = {};
+              state.calibCoeffs = {};
+              state.lastReconcileTs = 0;
+              state.calibration_holdout = [];
+              state.learned_trade_keys = [];
+              state.calib_symbol_counts = {};
+              state.calib_last_version = CALIB_VERSION;
+              
+              log("♻️  State reset to fresh. Continuing with idea generation...");
+              // NO return - let code continue below
             }
 
             // 📚 Learn from ALL closed trades FIRST
