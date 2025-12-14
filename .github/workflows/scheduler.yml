@@ -1,0 +1,36 @@
+0
+name: ⏰ Scheduler (Every 30 min)
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}  # Manual trigger for testing
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: Trigger Main Workflow
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const now = new Date().toISOString();
+            console.log(`⏰ Scheduler triggered at ${now}`);
+            
+            await github.rest.repos.createDispatchEvent({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              event_type: 'run_B'
+            });
+            
+            console.log('✅ Sent run_B dispatch to trigger main workflow');
+
+      - name: Done
+        run: echo "🚀 Main workflow triggered successfully"
