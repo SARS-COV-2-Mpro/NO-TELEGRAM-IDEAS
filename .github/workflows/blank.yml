@@ -1734,258 +1734,101 @@ jobs:
             // ========== RANK BY HEDGE CONFIDENCE ==========
             // Sort by hedge confidence (highest first)
             allMetrics.sort((a, b) => b.hedge_confidence - a.hedge_confidence);
-            
-            // Log top 10 for debugging
+
+            // ========== SIMPLE SELECTION: JUST TAKE TOP N FROM TOP 10 ==========
+            const TOP_10_COUNT = 10;
+            const topCandidates = allMetrics.slice(0, TOP_10_COUNT);
+
             log("🏆 Top 10 by hedge confidence (includes spread):");
-            for (let i = 0; i < Math.min(10, allMetrics.length); i++) {
-              const m = allMetrics[i];
+            for (let i = 0; i < topCandidates.length; i++) {
+              const m = topCandidates[i];
               log(`   ${i+1}. ${m.symbol} conf=${m.hedge_confidence} vol1h=${m.vol_1h_pct.toFixed(2)}% fund=${(m.funding_rate*100).toFixed(4)}% oi_delta=${m.oi_delta_pct.toFixed(1)}% vol=$${Math.round(m.volume_1h_usd/1e6)}M spread=${m.spread_bps}bps`);
             }
 
-            // ========== SELECT TOP CANDIDATES FOR DETAILED ANALYSIS ==========
-            const TOP_10_COUNT = 10;
-            const topCandidates = allMetrics.slice(0, TOP_10_COUNT);
-            log(`🎯 Selecting ideas ONLY from Top ${TOP_10_COUNT}`);
-            
-            // BTC regime detection (using Binance data)
+            // BTC regime for side selection
             const btcMetrics = allMetrics.find(m => m.symbol === "BTCUSDT");
             const btcUp1h = btcMetrics ? (btcMetrics.price_change_1h > 0) : true;
-            
-            // ========== DETAILED REFINEMENT WITH BINANCE DATA ==========
-            const refined = [];
-            
+
+            // Simply take TOP_N from Top 10 (no re-ranking)
+            const TARGET_TOP_N = Math.max(1, TOP_N || 3);
+            let selected = [];
+
             for (const cand of topCandidates) {
-              try {
-                // Spread already available from cand.spread_bps
-                const spreadBps = cand.spread_bps;
-                const mid = cand.mark_price;
+              if (selected.length >= TARGET_TOP_N) break;
+              
+              // Diversity: don't pick same base twice
+              if (selected.some(s => s.base === cand.base)) continue;
+              
+              // Determine side based on funding (short positive funding, long negative)
+              const side = cand.funding_rate_raw > 0 ? "short" : "long";
+              
+              // Simple TP/SL based on volatility
+              const atr_bps = Math.round(cand.vol_1h_pct * 100);
+              const tp_bps = Math.max(30, Math.round(atr_bps * 0.9));
+              const sl_bps = Math.min(80, Math.max(20, Math.round(atr_bps * 0.5)));
+              
+              // Estimate cost
+              const cost_bps = COST_BPS + Math.round(cand.spread_bps / 2);
+              
+              // Simple EV (must be positive)
+              const p_win = 0.50 + 0.15 * Math.tanh(cand.vol_1h_pct / 3);
+              const ev_bps = Math.round(p_win * tp_bps - (1 - p_win) * sl_bps - cost_bps);
+              
+              if (ev_bps < 0) {
+                log(`   ⏭️  Skip ${cand.symbol}: negative EV (${ev_bps}bps)`);
+                continue;
+              }
+              
+              selected.push({
+                symbol: cand.symbol,
+                base: cand.base,
+                quote: cand.quote,
+                side,
                 
-                // Still fetch depth for OBI/slip if needed
-                const depth = await fetchBinanceFuturesDepth(cand.symbol);
+                mark_price: cand.mark_price,
+                spread_bps: cand.spread_bps,
                 
-                // Calculate OBI and slip estimation using Binance depth
-                const obi = computeOBI(depth, OBI_TOPN);
+                tp_bps,
+                sl_bps,
+                cost_bps,
+                rrr: +(tp_bps / sl_bps).toFixed(2),
                 
-                const sideSlipL = slipFromDepth(depth, mid, "long", NOTIONAL);
-                const sideSlipS = slipFromDepth(depth, mid, "short", NOTIONAL);
-                const slipL = sideSlipL?.slip_bps ?? Math.round(spreadBps / 2);
-                const slipS = sideSlipS?.slip_bps ?? Math.round(spreadBps / 2);
+                p_win: +p_win.toFixed(3),
+                p_lcb: +p_win.toFixed(3),
+                p_raw: +p_win.toFixed(3),
+                ev_bps,
+                exp_lcb_bps: ev_bps,
                 
-                const costLong = COST_BPS + slipL;
-                const costShort = COST_BPS + slipS;
+                regime: "hedge",
+                style: "hedge",
                 
-                // Depth quality
-                const d1 = depthWithinPctUSD(depth, mid, 0.01);
-                const depth1pUSD = (d1.asksUSD || 0) + (d1.bidsUSD || 0);
+                // Golden metrics (preserved)
+                vol_1h_pct: cand.vol_1h_pct,
+                funding_rate: cand.funding_rate,
+                funding_rate_raw: cand.funding_rate_raw,
+                oi_delta_pct: cand.oi_delta_pct,
+                volume_1h_usd: cand.volume_1h_usd,
+                basis_bps: cand.basis_bps,
+                current_oi_usd: cand.current_oi_usd,
                 
-                // Determine regime based on volatility and funding
-                const regime = (cand.vol_1h_pct >= 1.5 && Math.abs(cand.funding_rate) >= 0.0003) ? "trend" : "meanrevert";
+                confidence: cand.hedge_confidence,
+                hedge_confidence: cand.hedge_confidence,
                 
-                // Get calibrated probabilities
-                const coeffL = getCoeffs(state, "long", regime);
-                const coeffS = getCoeffs(state, "short", regime);
-                const nL = Math.max(1, Math.min(500, coeffL?.n || 0));
-                const nS = Math.max(1, Math.min(500, coeffS?.n || 0));
+                hold_sec: 3600,
                 
-                // Base probability from golden metrics
-                const pBase = 0.45 + 0.35 * Math.tanh(cand.vol_1h_pct / 3);
-                
-                // Direction bias from funding rate
-                const fundingBias = -Math.sign(cand.funding_rate_raw) * Math.min(0.15, Math.abs(cand.funding_rate_raw) * 100);
-                
-                const pLong0 = clamp(pBase + fundingBias, 0.30, 0.85);
-                const pShort0 = clamp(pBase - fundingBias, 0.30, 0.85);
-                
-                const pLong = calibrateP(state, "long", regime, pLong0);
-                const pShort = calibrateP(state, "short", regime, pShort0);
-                const pLong_lcb = wilsonLCB(pLong, nL, WILSON_Z);
-                const pShort_lcb = wilsonLCB(pShort, nS, WILSON_Z);
-                
-                // ATR estimation from 1h volatility
-                const atr_bps = Math.round(cand.vol_1h_pct * 100);
-                
-                // TP/SL based on volatility
-                const MAX_SL_BPS = 80;
-                let candLong = null, candShort = null;
-                
-                if (DIRECTION !== "short") {
-                  let tp = Math.round(atr_bps * LONG_BOUNCE_TP_ATR);
-                  let sl = Math.round(atr_bps * LONG_BOUNCE_SL_ATR);
-                  sl = Math.min(sl, MAX_SL_BPS);
-                  tp = Math.max(tp, Math.round(sl * 1.5));
-                  
-                  const evLCB = Math.round(pLong_lcb * tp - (1 - pLong_lcb) * sl - costLong);
-                  const edgeL = tp / Math.max(1, LONG_EDGE_MULT_MIN * costLong);
-                  const evScoreL = evLCB / Math.max(8, EXP_LCB_MIN_BPS_BASE);
-                  const viabMultL = clamp(0.5 * clamp(edgeL, 0.3, 1.4) + 0.5 * clamp(evScoreL, 0.3, 1.4), 0.3, 1.3);
-                  
-                  candLong = {
-                    side: "long",
-                    p_lcb: pLong_lcb,
-                    p_raw: pLong0,
-                    ev_bps: evLCB,
-                    exp_lcb_bps: evLCB,
-                    tp_bps: tp,
-                    sl_bps: sl,
-                    cost_bps: costLong,
-                    style: "hedge",
-                    regime,
-                    viab_mult: viabMultL
-                  };
-                }
-                
-                if (DIRECTION !== "long") {
-                  let tp = Math.round(atr_bps * 1.0);
-                  let sl = Math.round(atr_bps * 0.5);
-                  sl = Math.min(sl, MAX_SL_BPS);
-                  tp = Math.max(tp, Math.round(sl * 1.5));
-                  
-                  const evLCB = Math.round(pShort_lcb * tp - (1 - pShort_lcb) * sl - costShort);
-                  const edgeS = tp / Math.max(1, 4 * costShort);
-                  const evScoreS = evLCB / Math.max(8, EXP_LCB_MIN_BPS_BASE);
-                  const viabMultS = clamp(0.5 * clamp(edgeS, 0.3, 1.4) + 0.5 * clamp(evScoreS, 0.3, 1.4), 0.3, 1.3);
-                  
-                  candShort = {
-                    side: "short",
-                    p_lcb: pShort_lcb,
-                    p_raw: pShort0,
-                    ev_bps: evLCB,
-                    exp_lcb_bps: evLCB,
-                    tp_bps: tp,
-                    sl_bps: sl,
-                    cost_bps: costShort,
-                    style: "hedge",
-                    regime,
-                    viab_mult: viabMultS
-                  };
-                }
-                
-                // Choose better side
-                const chosen = candLong && candShort
-                  ? (candLong.exp_lcb_bps >= candShort.exp_lcb_bps ? candLong : candShort)
-                  : (candLong || candShort || null);
-                
-                if (!chosen) continue;
-                
-                // ========== FINAL CONFIDENCE CALCULATION ==========
-                // Base from golden 4 metrics (already 0-100)
-                const baseConf = cand.hedge_confidence;
-                
-                // Execution quality multipliers
-                const spreadMult = clamp(1 - Math.max(0, (spreadBps - 5)) / 30, 0.5, 1.1);
-                const depthMult = clamp(depth1pUSD / Math.max(1, DEPTH_1P_MIN_USD), 0.3, 1.2);
-                const slipMult = clamp(1 - Math.max(0, (chosen.cost_bps - COST_BPS)) / 25, 0.5, 1.1);
-                const oiMult = clamp(cand.current_oi_usd / 50_000_000, 0.4, 1.3);
-                
-                // EV multiplier
-                const evMult = clamp(chosen.viab_mult || 1, 0.3, 1.3);
-                
-                // Direction bias for BTC regime
-                const btcMult = (chosen.side === "long" && !btcUp1h) ? 0.85 : 1.0;
-                
-                // Funding alignment bonus
-                const fundingAlignBonus = (
-                  (chosen.side === "short" && cand.funding_rate_raw > 0) ||
-                  (chosen.side === "long" && cand.funding_rate_raw < 0)
-                ) ? 1.1 : 1.0;
-                
-                // Final confidence
-                const finalConf = Math.round(
-                  baseConf * spreadMult * depthMult * slipMult * oiMult * evMult * btcMult * fundingAlignBonus
-                );
-                
-                // Build reasons
-                const reasons = reasonBuilder({
+                reasons: reasonBuilder({
                   vol_1h_pct: cand.vol_1h_pct,
                   funding_rate: cand.funding_rate,
                   oi_delta_pct: cand.oi_delta_pct,
                   volume_1h_usd: cand.volume_1h_usd,
                   basis_bps: cand.basis_bps
-                });
+                }),
                 
-                refined.push({
-                  symbol: cand.symbol,
-                  base: cand.base,
-                  quote: cand.quote,
-                  
-                  side: chosen.side,
-                  p_lcb: +chosen.p_lcb.toFixed(3),
-                  p_raw: +chosen.p_raw.toFixed(3),
-                  exp_bps: chosen.ev_bps,
-                  exp_lcb_bps: chosen.exp_lcb_bps,
-                  tp_bps: chosen.tp_bps,
-                  sl_bps: chosen.sl_bps,
-                  rrr: +(chosen.tp_bps / Math.max(1, chosen.sl_bps)).toFixed(2),
-                  spread_bps: spreadBps,
-                  cost_bps: chosen.cost_bps,
-                  atr_bps,
-                  regime: chosen.regime,
-                  style: chosen.style,
-                  
-                  // Golden metrics
-                  vol_1h_pct: cand.vol_1h_pct,
-                  funding_rate: cand.funding_rate,
-                  funding_rate_raw: cand.funding_rate_raw,
-                  oi_delta_pct: cand.oi_delta_pct,
-                  volume_1h_usd: cand.volume_1h_usd,
-                  basis_bps: cand.basis_bps,
-                  current_oi_usd: cand.current_oi_usd,
-                  
-                  // Prices
-                  mark_price: cand.mark_price,
-                  spot_price: cand.spot_price,
-                  
-                  // Execution quality
-                  depth1p_usd: depth1pUSD,
-                  obi,
-                  slip_est: chosen.side === "long" ? slipL : slipS,
-                  
-                  // TTL (max 2 hours for hedge trades)
-                  hold_sec: clamp(3600, TTL_MIN, TTL_MAX), // Default 1 hour
-                  
-                  confidence: clamp(finalConf, 0, 100),
-                  hedge_confidence: cand.hedge_confidence,
-                  reasons,
-                  
-                  ret5: [] // Simplified
-                });
-                
-              } catch (e) {
-                log(`Refine error for ${cand.symbol}:`, e?.message || e);
-              }
+                ret5: []
+              });
             }
-            
-            log(`🔍 Refined ${refined.length} candidates with execution quality analysis`);
 
-            // ========== FINAL SELECTION ==========
-            refined.sort((a, b) => b.confidence - a.confidence);
-            
-            const TARGET_TOP_N = Math.max(1, TOP_N || 3);
-            
-            const selected = [];
-            for (const cand of refined) {
-              if (selected.length >= TARGET_TOP_N) break;
-              
-              // Simple diversity: don't pick same base twice
-              const alreadyHaveBase = selected.some(s => s.base === cand.base);
-              if (!alreadyHaveBase) {
-                selected.push(cand);
-              }
-            }
-            
-            // Fill remaining slots if needed
-            if (selected.length < TARGET_TOP_N) {
-              const haveSyms = new Set(selected.map(s => s.symbol));
-              for (const c of refined) {
-                if (selected.length >= TARGET_TOP_N) break;
-                if (!haveSyms.has(c.symbol)) {
-                  selected.push(c);
-                  haveSyms.add(c.symbol);
-                }
-              }
-            }
-            
-            log(`✅ Selected ${selected.length} ideas for pushing`);
+            log(`✅ Selected ${selected.length} ideas (TOP ${TARGET_TOP_N} from Top 10)`);
 
             // ========== GENERATE FLIPPED IDEAS ==========
             const flipped = selected.map(orig => ({
@@ -2056,7 +1899,7 @@ jobs:
                 sl_bps: x.sl_bps,
                 rrr: x.rrr,
                 exp_lcb_bps: x.exp_lcb_bps,
-                ev_bps: x.exp_bps,
+                ev_bps: x.ev_bps,
                 cost_bps: x.cost_bps,
 
                 p_win: x.p_lcb,
@@ -2277,7 +2120,6 @@ jobs:
               counts: {
                 binance_universe: binanceSymbols.length,
                 metrics_fetched: allMetrics.length,
-                refined: refined.length,
                 selected: picks.length
               },
               dd_gate: { pnl24_bps, peak_dd_bps, throttle },
