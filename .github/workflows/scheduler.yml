@@ -1,4 +1,4 @@
-0
+0 */2 * * *
 name: ⏰ Scheduler (Every 30 min)
 
 on:
