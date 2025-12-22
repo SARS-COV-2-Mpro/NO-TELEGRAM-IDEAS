@@ -1,9 +1,8 @@
-0
 name: Ideas Pusher (MEXC Ultimate 7.7.7)
 
 on:
   schedule:
-    - cron: "*/40 * * * *"
+    - cron: "*/30 * * * *"
   repository_dispatch:
     types: [run_B]
   workflow_dispatch: {}
@@ -314,12 +313,15 @@ jobs:
           const IDEAL_FUNDING_RATE = 0.0004;  // |funding| >= 0.04%
           const IDEAL_OI_DELTA_PCT = 10.0;    // |ΔOI 1-2h| >= 10%
           const IDEAL_VOLUME_1H_USD = 60_000_000; // 1h volume >= $60M
+          const IDEAL_SPREAD_BPS = 3;      // Ideal spread <= 3 bps
 
           // Confidence weights for hedge trading (sum = 1.0)
-          const WEIGHT_VOL_1H = 0.40;      // 1h volatility - HIGHEST priority
-          const WEIGHT_FUNDING = 0.25;     // Funding rate
-          const WEIGHT_OI_DELTA = 0.20;    // Open Interest change
-          const WEIGHT_VOLUME = 0.15;      // 1h volume
+          const WEIGHT_VOL_1H = 0.35;      // Reduced from 0.40
+          const WEIGHT_FUNDING = 0.20;     // Reduced from 0.25
+          const WEIGHT_OI_DELTA = 0.15;    // Reduced from 0.20
+          const WEIGHT_VOLUME = 0.15;      // Same
+          const WEIGHT_SPREAD = 0.15;      // Weight for spread
+
 
           const CONFIG_HASH=(()=>{ try{
             const knobs={
@@ -328,8 +330,8 @@ jobs:
               LONG_DOWN_RSI_CUTOFF, LONG_MR_DIVERGENCE_REQ, LONG_EDGE_MULT_MIN,
               LONG_BOUNCE_SL_ATR, LONG_BOUNCE_TP_ATR, LONG_SIMILARITY_RHO, TOP_N, MAX_SPREAD_BPS,
               EXP_LCB_MIN_BPS_BASE, COST_BPS, NOTIONAL, DEPTH_LIMIT, OBI_TOPN, MIN_TF_ALIGN, TF_WEIGHTS,
-              IDEAL_VOL_1H_PCT, IDEAL_FUNDING_RATE, IDEAL_OI_DELTA_PCT, IDEAL_VOLUME_1H_USD,
-              WEIGHT_VOL_1H, WEIGHT_FUNDING, WEIGHT_OI_DELTA, WEIGHT_VOLUME
+              IDEAL_VOL_1H_PCT, IDEAL_FUNDING_RATE, IDEAL_OI_DELTA_PCT, IDEAL_VOLUME_1H_USD, IDEAL_SPREAD_BPS,
+              WEIGHT_VOL_1H, WEIGHT_FUNDING, WEIGHT_OI_DELTA, WEIGHT_VOLUME, WEIGHT_SPREAD
             };
             return hashObj(knobs);
           }catch{ return "cfg-unknown"; } })();
@@ -753,6 +755,53 @@ jobs:
               basis_bps: Math.round(basis * 10000)
             };
           }
+          
+          async function fetchGoldenMetricsWithSpread(symbol) {
+            try {
+              // Fetch all data in parallel
+              const [kline, funding, oiHist, spot, ticker] = await Promise.all([
+                fetchBinance1hKline(symbol),
+                fetchBinanceFundingRate(symbol),
+                fetchBinanceOIHist(symbol),
+                fetchBinanceSpotPrice(symbol),
+                fetchBinanceFuturesTicker(symbol)  // NEW: fetch spread data here
+              ]);
+              
+              if (!kline) return null;
+              
+              const basisInfo = calculateBasis(funding?.markPrice, spot?.spotPrice);
+              
+              // Calculate spread
+              let spread_bps = 999; // Default high (bad)
+              let mid = funding?.markPrice || kline.currClose || 0;
+              if (ticker?.bid && ticker?.ask && ticker.bid > 0) {
+                mid = (ticker.bid + ticker.ask) / 2;
+                spread_bps = Math.round(((ticker.ask - ticker.bid) / mid) * 10000);
+              }
+              
+              return {
+                symbol,
+                vol_1h_pct: kline.vol1hPct || 0,
+                price_change_1h: kline.priceChange1h || 0,
+                funding_rate: Math.abs(funding?.lastFundingRate || 0),
+                funding_rate_raw: funding?.lastFundingRate || 0,
+                oi_delta_pct: Math.max(oiHist?.oiDelta1hPct || 0, oiHist?.oiDelta2hPct || 0),
+                oi_delta_1h_pct: oiHist?.oiDelta1hPct || 0,
+                oi_delta_2h_pct: oiHist?.oiDelta2hPct || 0,
+                current_oi_usd: oiHist?.currentOI_USD || 0,
+                volume_1h_usd: kline.volume1hUSD || 0,
+                mark_price: mid,
+                spot_price: spot?.spotPrice || 0,
+                basis_bps: basisInfo.basis_bps,
+                spread_bps,  // NEW: spread included
+                bid: ticker?.bid || 0,
+                ask: ticker?.ask || 0,
+                ts: Date.now()
+              };
+            } catch (e) {
+              return null;
+            }
+          }
 
           // Fetch all 4 golden metrics for a symbol
           async function fetchGoldenMetrics(symbol) {
@@ -799,11 +848,18 @@ jobs:
             const oiNorm = Math.tanh((metrics.oi_delta_pct || 0) / IDEAL_OI_DELTA_PCT);
             const volUsdNorm = Math.tanh((metrics.volume_1h_usd || 0) / IDEAL_VOLUME_1H_USD);
             
+            // NEW: Spread score (lower spread = higher score)
+            // spread_bps of 3 or less = 1.0, spread of 15+ = ~0
+            const spreadScore = metrics.spread_bps != null 
+              ? Math.max(0, 1 - (metrics.spread_bps - IDEAL_SPREAD_BPS) / 12)
+              : 0.5;
+            
             const rawScore = 
               WEIGHT_VOL_1H * volNorm +
               WEIGHT_FUNDING * fundingNorm +
               WEIGHT_OI_DELTA * oiNorm +
-              WEIGHT_VOLUME * volUsdNorm;
+              WEIGHT_VOLUME * volUsdNorm +
+              WEIGHT_SPREAD * spreadScore;  // NEW
             
             const confidence = Math.round(rawScore * 100);
             
@@ -1629,19 +1685,25 @@ jobs:
             const BATCH_DELAY = 300;
             const allMetrics = [];
             
-            for (let i = 0; i < binanceSymbols.length; i += BATCH_SIZE) {
-              const batch = binanceSymbols.slice(i, i + BATCH_SIZE);
+            // FIRST: Filter out cooldown symbols completely
+            const eligibleSymbols = binanceSymbols.filter(sym => {
+              const lastTs = state.cooldown?.[sym.base] || 0;
+              if (lastTs && (Date.now() - lastTs) < COOLDOWN_MS) {
+                return false; // Skip cooldown symbols
+              }
+              return true;
+            });
+            
+            log(`📋 Eligible symbols after cooldown filter: ${eligibleSymbols.length}/${binanceSymbols.length}`);
+
+            // NOW loop over eligibleSymbols instead of binanceSymbols
+            for (let i = 0; i < eligibleSymbols.length; i += BATCH_SIZE) {
+              const batch = eligibleSymbols.slice(i, i + BATCH_SIZE);
               
               const batchResults = await Promise.all(
                 batch.map(async (sym) => {
                   try {
-                    // Check cooldown first
-                    const lastTs = state.cooldown?.[sym.base] || 0;
-                    if (lastTs && (Date.now() - lastTs) < COOLDOWN_MS) {
-                      return null; // Skip cooldown symbols
-                    }
-                    
-                    const metrics = await fetchGoldenMetrics(sym.symbol);
+                    const metrics = await fetchGoldenMetricsWithSpread(sym.symbol);
                     if (!metrics) return null;
                     
                     return {
@@ -1662,27 +1724,28 @@ jobs:
               }
               
               // Rate limit pause between batches
-              if (i + BATCH_SIZE < binanceSymbols.length) {
+              if (i + BATCH_SIZE < eligibleSymbols.length) {
                 await sleep(BATCH_DELAY);
               }
             }
             
-            log(`📈 Fetched metrics for ${allMetrics.length}/${binanceSymbols.length} symbols`);
+            log(`📈 Fetched metrics for ${allMetrics.length}/${eligibleSymbols.length} symbols`);
 
             // ========== RANK BY HEDGE CONFIDENCE ==========
             // Sort by hedge confidence (highest first)
             allMetrics.sort((a, b) => b.hedge_confidence - a.hedge_confidence);
             
             // Log top 10 for debugging
-            log("🏆 Top 10 by hedge confidence:");
+            log("🏆 Top 10 by hedge confidence (includes spread):");
             for (let i = 0; i < Math.min(10, allMetrics.length); i++) {
               const m = allMetrics[i];
-              log(`   ${i+1}. ${m.symbol} conf=${m.hedge_confidence} vol1h=${m.vol_1h_pct.toFixed(2)}% fund=${(m.funding_rate*100).toFixed(4)}% oi_delta=${m.oi_delta_pct.toFixed(1)}% vol=$${Math.round(m.volume_1h_usd/1e6)}M`);
+              log(`   ${i+1}. ${m.symbol} conf=${m.hedge_confidence} vol1h=${m.vol_1h_pct.toFixed(2)}% fund=${(m.funding_rate*100).toFixed(4)}% oi_delta=${m.oi_delta_pct.toFixed(1)}% vol=$${Math.round(m.volume_1h_usd/1e6)}M spread=${m.spread_bps}bps`);
             }
 
             // ========== SELECT TOP CANDIDATES FOR DETAILED ANALYSIS ==========
-            const MAX_DETAILED = 30;
-            const topCandidates = allMetrics.slice(0, MAX_DETAILED);
+            const TOP_10_COUNT = 10;
+            const topCandidates = allMetrics.slice(0, TOP_10_COUNT);
+            log(`🎯 Selecting ideas ONLY from Top ${TOP_10_COUNT}`);
             
             // BTC regime detection (using Binance data)
             const btcMetrics = allMetrics.find(m => m.symbol === "BTCUSDT");
@@ -1693,19 +1756,12 @@ jobs:
             
             for (const cand of topCandidates) {
               try {
-                // Fetch BINANCE execution quality data (depth, spread)
-                const ticker = await fetchBinanceFuturesTicker(cand.symbol);
+                // Spread already available from cand.spread_bps
+                const spreadBps = cand.spread_bps;
+                const mid = cand.mark_price;
+                
+                // Still fetch depth for OBI/slip if needed
                 const depth = await fetchBinanceFuturesDepth(cand.symbol);
-                
-                let spreadBps = 5; // Default
-                let mid = cand.mark_price;
-                
-                if (ticker?.bid && ticker?.ask) {
-                  const bid = ticker.bid;
-                  const ask = ticker.ask;
-                  mid = (bid + ask) / 2;
-                  spreadBps = Math.round(((ask - bid) / mid) * 10000);
-                }
                 
                 // Calculate OBI and slip estimation using Binance depth
                 const obi = computeOBI(depth, OBI_TOPN);
