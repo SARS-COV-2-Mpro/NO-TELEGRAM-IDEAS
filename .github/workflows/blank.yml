@@ -233,7 +233,7 @@ jobs:
           const setCached=(map,key,v)=>map.set(key,{ v, ts: Date.now() });
 
           // ---------- Config / ENV ----------
-          const TARGET_EXCHANGE = "binance_futures";  // â† CHANGED for Binance
+          const TARGET_EXCHANGE = "binance_futures";  // ← CHANGED for Binance
           const MARKET_TYPE     = "futures";
           const MARGIN_MODE     = "isolated";
           const LEVERAGE        = 1;
@@ -281,7 +281,7 @@ jobs:
           const EXP_LCB_MIN_BPS_BASE=Number(process.env.EXP_LCB_MIN_BPS||"12");
           const EMA_FAST=21, EMA_SLOW=50, ADX_P=14, ATR_P=14, K1M=240, K5M=300, K15M=300, K1H=300, K4H=300;
           const VWAP_5M_WIN=36, COST_BPS=Number(process.env.FEES_BPS||"10"), NOTIONAL=Number(process.env.NOTIONAL_USD||"300");
-          const DEPTH_LIMIT=Number(process.env.BINANCE_DEPTH_LIMIT||"20");  // â† CHANGED
+          const DEPTH_LIMIT=Number(process.env.BINANCE_DEPTH_LIMIT||"20");  // ← CHANGED
           const OBI_TOPN=Number(process.env.OBI_TOPN||"12");
           const COOLDOWN_MS=3*60*60*1000, FLIP_GUARD_MS=30*60*1000;
           const DD_24H_LIMIT_BPS=-150, DD_PEAK_LIMIT_BPS=-300;
@@ -311,7 +311,7 @@ jobs:
           // Golden 4 metrics ideal thresholds (for confidence scoring, NOT gates)
           const IDEAL_VOL_1H_PCT = 2.0;       // |1h price change| >= 2%
           const IDEAL_FUNDING_RATE = 0.0004;  // |funding| >= 0.04%
-          const IDEAL_OI_DELTA_PCT = 10.0;    // |Î”OI 1-2h| >= 10%
+          const IDEAL_OI_DELTA_PCT = 10.0;    // |ΔOI 1-2h| >= 10%
           const IDEAL_VOLUME_1H_USD = 60_000_000; // 1h volume >= $60M
 
           // Confidence weights for hedge trading (sum = 1.0)
@@ -341,19 +341,19 @@ jobs:
           try{ const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`,"User-Agent":UA }},5000); let t=""; try{ t=await r.text(); }catch{} log("health status", r?.status||"ERR", (t||"").slice(0,160)); }catch(e){ log("health error", e?.message||e); }
 
           // Pre-warm Render proxy to handle cold starts
-          log("ðŸ”¥ Pre-warming Render proxy...");
+          log("🔥 Pre-warming Render proxy...");
           try { 
             const warmResp = await fetchWithTimeout(`${BINANCE_FAPI}/fapi/v1/time`, {}, 45000); 
             let warmText = "";
             try { warmText = await warmResp.text(); } catch {}
-            log("âœ… Pre-warm status:", warmResp?.status || "timeout", warmText.slice(0, 100));
+            log("✅ Pre-warm status:", warmResp?.status || "timeout", warmText.slice(0, 100));
           } catch (e) { 
-            log("âš ï¸  Pre-warm timeout (may indicate cold start):", e?.message || e); 
+            log("⚠️  Pre-warm timeout (may indicate cold start):", e?.message || e); 
           }
           await sleep(2000); // Give Render time to fully wake up
 
           // ========== FAKE FLUSH START ==========
-          log("ðŸš€ FAKE FLUSH: Sending 2 fake ideas immediately...");
+          log("🚀 FAKE FLUSH: Sending 2 fake ideas immediately...");
           try {
             const fakeIdeas = [
               {
@@ -442,7 +442,7 @@ jobs:
               ideas: fakeIdeas
             };
 
-            log("ðŸ“¤ Pushing FAKE ideas to", PUSH_URL);
+            log("📤 Pushing FAKE ideas to", PUSH_URL);
             const fakeResp = await fetchWithTimeout(PUSH_URL, {
               method: "POST",
               headers: {
@@ -454,12 +454,12 @@ jobs:
 
             let fakeText = "";
             try { fakeText = await fakeResp.text(); } catch {}
-            log("âœ… FAKE FLUSH push status:", fakeResp?.status || "ERR", (fakeText || "").slice(0, 200));
-            log("ðŸŽ¯ FAKE ideas sent: nabodgarekhashayar (long), khashayarnabodgar (short)");
+            log("✅ FAKE FLUSH push status:", fakeResp?.status || "ERR", (fakeText || "").slice(0, 200));
+            log("🎯 FAKE ideas sent: nabodgarekhashayar (long), khashayarnabodgar (short)");
           } catch (e) {
-            log("âš ï¸ FAKE FLUSH failed:", e?.message || e);
+            log("⚠️ FAKE FLUSH failed:", e?.message || e);
           }
-          log("ðŸ FAKE FLUSH complete. Starting REAL processing...");
+          log("🏁 FAKE FLUSH complete. Starting REAL processing...");
           // ========== FAKE FLUSH END ==========
 
           // ---------- MEXC Adapter (REMOVED - NOT NEEDED FOR BINANCE) ----------
@@ -495,12 +495,12 @@ jobs:
             for (let attempt = 0; attempt < 3; attempt++) {
               try {
                 const timeout = 60000; // 60s to handle slow GitHub runners
-                log(`ðŸ“¡ Fetching Binance exchangeInfo (attempt ${attempt + 1}/3, timeout ${timeout/1000}s) from: ${url}`);
+                log(`📡 Fetching Binance exchangeInfo (attempt ${attempt + 1}/3, timeout ${timeout/1000}s) from: ${url}`);
                 
                 const response = await fetchWithTimeout(url, {}, timeout);
                 
                 if (!response.ok) {
-                  log(`âš ï¸  Binance exchangeInfo HTTP ${response.status}`);
+                  log(`⚠️  Binance exchangeInfo HTTP ${response.status}`);
                   if (attempt < 2) { 
                     await sleep(2000 + attempt * 1000); 
                     continue; 
@@ -510,7 +510,7 @@ jobs:
                 
                 const data = await response.json();
                 if (!data?.symbols) {
-                  log("âš ï¸  Binance exchangeInfo has no symbols array");
+                  log("⚠️  Binance exchangeInfo has no symbols array");
                   return [];
                 }
                 
@@ -529,20 +529,20 @@ jobs:
                   }));
                 
                 setCached(cache.binance, cacheKey, symbols);
-                log(`âœ… Binance Futures: ${symbols.length} USDT perpetuals found`);
+                log(`✅ Binance Futures: ${symbols.length} USDT perpetuals found`);
                 return symbols;
                 
               } catch (e) {
-                log(`âŒ Attempt ${attempt + 1}/3 failed:`, e?.message || e);
+                log(`❌ Attempt ${attempt + 1}/3 failed:`, e?.message || e);
                 if (attempt < 2) {
                   const backoff = 3000 + attempt * 2000; // 3s, 5s
-                  log(`â³ Retrying in ${backoff/1000}s...`);
+                  log(`⏳ Retrying in ${backoff/1000}s...`);
                   await sleep(backoff);
                 }
               }
             }
             
-            log("ðŸ’¥ All 3 attempts exhausted for Binance exchangeInfo");
+            log("💥 All 3 attempts exhausted for Binance exchangeInfo");
             return [];
           }
 
@@ -636,7 +636,7 @@ jobs:
             }
           }
 
-          // Fetch OI history for Î”OI calculation
+          // Fetch OI history for ΔOI calculation
           async function fetchBinanceOIHist(symbol) {
             const cacheKey = `binance_oi_hist_${symbol}`;
             const cached = getCached(cache.binance, cacheKey, TTL.binance);
@@ -824,10 +824,10 @@ jobs:
           }
 
           // ---------- State (Gist) + Calibration + Audit ----------
-          // âš ï¸ THIS SECTION IS 100% UNCHANGED FROM ORIGINAL
+          // ⚠️ THIS SECTION IS 100% UNCHANGED FROM ORIGINAL
           async function loadState(){
             const token=process.env.GIST_TOKEN, id=process.env.GIST_ID;
-            const init={ v:"binance-hedge-7.0",  // â† CHANGED version string
+            const init={ v:"binance-hedge-7.0",  // ← CHANGED version string
               run_counter: 0,
               cooldown:{}, cooldown_side:{}, pending:[], equity:[], closed:[],
               mr_lockout:{}, sym_stats:{}, sym_stats_real:{}, calibCoeffs:{}, lastReconcileTs:0,
@@ -863,7 +863,7 @@ jobs:
               if (s.run_counter == null) s.run_counter = 0;
 
               if (s.calib_last_version !== CALIB_VERSION) {
-                log(`ðŸ”„ Calibration version change: ${s.calib_last_version} â†’ ${CALIB_VERSION}`);
+                log(`🔄 Calibration version change: ${s.calib_last_version} → ${CALIB_VERSION}`);
                 s.calibCoeffs = {};
                 s.calib_last_version = CALIB_VERSION;
               }
@@ -962,7 +962,7 @@ jobs:
           }
 
           async function saveState(persist, state, auditOut, retries=2, blindFallback=true) {
-            if (!persist) { log("WARN: No persistâ€”skipping Gist save."); return; }
+            if (!persist) { log("WARN: No persist—skipping Gist save."); return; }
 
             const gistUrl = `https://api.github.com/gists/${persist.id}`;
             const mkFiles = (s) => ({ "state.json": { content: JSON.stringify(s) } });
@@ -1063,7 +1063,7 @@ jobs:
                 }
               } else {
                 toSave = { run_counter: 0 };
-                log("DEBUG: WipeToEmpty=true â†’ skipping pre-merge, forcing {run_counter:0}");
+                log("DEBUG: WipeToEmpty=true → skipping pre-merge, forcing {run_counter:0}");
               }
               
               const r3 = await patch(mkFiles(toSave), null);
@@ -1107,7 +1107,7 @@ jobs:
               }
             }
             
-            log(`ðŸ§¹ Cleaned cooldowns: ${Object.keys(state.cooldown || {}).length} base, ${Object.keys(state.cooldown_side || {}).length} side, ${Object.keys(state.mr_lockout || {}).length} mr_lockout`);
+            log(`🧹 Cleaned cooldowns: ${Object.keys(state.cooldown || {}).length} base, ${Object.keys(state.cooldown_side || {}).length} side, ${Object.keys(state.mr_lockout || {}).length} mr_lockout`);
           }
 
           function cleanExpiredClosedTrades(state) {
@@ -1121,7 +1121,7 @@ jobs:
             const before = state.closed.length;
             
             if (before <= MAX_CLOSED_TRADES) {
-              log(`ðŸ“¦ Closed trades: ${before}/${MAX_CLOSED_TRADES} (no cleanup needed)`);
+              log(`📦 Closed trades: ${before}/${MAX_CLOSED_TRADES} (no cleanup needed)`);
               return;
             }
             
@@ -1134,7 +1134,7 @@ jobs:
             state.closed = state.closed.slice(0, MAX_CLOSED_TRADES);
             
             const removed = before - state.closed.length;
-            log(`ðŸ—‘ï¸  Kept ${MAX_CLOSED_TRADES} most recent closed trades, removed ${removed} old ones`);
+            log(`🗑️  Kept ${MAX_CLOSED_TRADES} most recent closed trades, removed ${removed} old ones`);
           }
 
           const getCoeffs = (state, side, regime) => {
@@ -1148,7 +1148,7 @@ jobs:
             const existing = state.calibCoeffs[key];
             
             if (existing.version !== CALIB_VERSION) {
-              log(`ðŸ“¦ Resetting ${key} (version ${existing.version} â†’ ${CALIB_VERSION})`);
+              log(`📦 Resetting ${key} (version ${existing.version} → ${CALIB_VERSION})`);
               const def = {
                 version: CALIB_VERSION,
                 a: 0,
@@ -1186,11 +1186,11 @@ jobs:
             );
             
             if (learnable.length === 0) {
-              log("ðŸ“š No new fills to learn from this cycle.");
+              log("📚 No new fills to learn from this cycle.");
               return;
             }
 
-            log(`ðŸ“š Learning from ${learnable.length} real fills...`);
+            log(`📚 Learning from ${learnable.length} real fills...`);
             
             const pRawValues = learnable.map(c => c.p_raw).filter(p => p != null);
             const pMean = mean(pRawValues);
@@ -1207,7 +1207,7 @@ jobs:
               }
 
               if (useOutlierFilter && Math.abs((c.p_raw - pMean) / pStd) > OUTLIER_ZSCORE) {
-                log(`âš ï¸  Outlier p_raw=${c.p_raw.toFixed(4)} z=${((c.p_raw - pMean) / pStd).toFixed(2)}`);
+                log(`⚠️  Outlier p_raw=${c.p_raw.toFixed(4)} z=${((c.p_raw - pMean) / pStd).toFixed(2)}`);
                 stats.skipped_outlier++;
                 continue;
               }
@@ -1237,7 +1237,7 @@ jobs:
               const futureSymCount = currentSymCount + 1;
               
               if (futureTotal > 20 && futureSymCount / futureTotal > MAX_SYMBOL_CONTRIBUTION) {
-                log(`âš ï¸  ${sym} would be ${(futureSymCount / futureTotal * 100).toFixed(1)}% of ${side}_${reg} (limit ${(MAX_SYMBOL_CONTRIBUTION * 100).toFixed(0)}%)`);
+                log(`⚠️  ${sym} would be ${(futureSymCount / futureTotal * 100).toFixed(1)}% of ${side}_${reg} (limit ${(MAX_SYMBOL_CONTRIBUTION * 100).toFixed(0)}%)`);
                 stats.skipped_poison++;
                 continue;
               }
@@ -1253,7 +1253,7 @@ jobs:
               
               const pnl = c.pnl_bps || 0;
               if ((tp_hit && pnl < -10) || (sl_hit && pnl > 10)) {
-                log(`âš ï¸  Anomaly: ${sym} ${side} exit=${exit} pnl=${pnl}bps - skipping`);
+                log(`⚠️  Anomaly: ${sym} ${side} exit=${exit} pnl=${pnl}bps - skipping`);
                 stats.skipped_invalid++;
                 continue;
               }
@@ -1267,9 +1267,9 @@ jobs:
                 c.learned = true;
                 c.learned_at_ts = Date.now();
                 stats.learned++;
-                log(`  âœ“ ${sym} ${side} ${exit.toUpperCase()} pnl=${pnl}bps p=${c.p_raw.toFixed(3)} reg=${reg}`);
+                log(`  ✓ ${sym} ${side} ${exit.toUpperCase()} pnl=${pnl}bps p=${c.p_raw.toFixed(3)} reg=${reg}`);
               } catch(e) {
-                log(`  âœ— Learn error: ${e?.message || e}`);
+                log(`  ✗ Learn error: ${e?.message || e}`);
                 stats.skipped_invalid++;
               }
             }
@@ -1283,7 +1283,7 @@ jobs:
             
             state.learned_trade_keys = Array.from(learnedSet).slice(-2000);
             
-            log(`âœ… Learned=${stats.learned} | Skipped: TTL=${stats.skipped_ttl} Dup=${stats.skipped_dup} Invalid=${stats.skipped_invalid} Poison=${stats.skipped_poison} Outlier=${stats.skipped_outlier}`);
+            log(`✅ Learned=${stats.learned} | Skipped: TTL=${stats.skipped_ttl} Dup=${stats.skipped_dup} Invalid=${stats.skipped_invalid} Poison=${stats.skipped_poison} Outlier=${stats.skipped_outlier}`);
           }
           
           function validateCalibration(state) {
@@ -1342,7 +1342,7 @@ jobs:
             }
             
             if (Object.keys(report).length > 0) {
-              log("ðŸ“Š Calibration Health:");
+              log("📊 Calibration Health:");
               for (const [k, v] of Object.entries(report)) {
                 log(`   ${k}: ${v.status} | n=${v.n} wr=${v.win_rate} brier=${v.brier_cal} (${v.improvement} better) a=${v.a} b=${v.b}`);
               }
@@ -1357,7 +1357,7 @@ jobs:
             const coeff = getCoeffs(state, side, regime);
             
             if (!coeff) {
-              log(`â­ï¸  Skip learning [${side}_${regime}]: no existing calibration`);
+              log(`⏭️  Skip learning [${side}_${regime}]: no existing calibration`);
               return;
             }
             
@@ -1403,7 +1403,7 @@ jobs:
             const hit_b = (b_next < -COEFF_BOUND_B || b_next > COEFF_BOUND_B);
 
             if (b_next < 0.05) {
-              log(`âš ï¸  Negative slope [${side}_${regime}]: b=${b_next.toFixed(3)} â†’ reset to 1.0`);
+              log(`⚠️  Negative slope [${side}_${regime}]: b=${b_next.toFixed(3)} → reset to 1.0`);
               coeff.b = 1.0;
               coeff.momentum_b = 0;
               coeff.a = clamp(coeff.a, -1.0, 1.0);
@@ -1433,7 +1433,7 @@ jobs:
             );
             
             if (should_reset) {
-              log(`ðŸ”„ RESET [${side}_${regime}] n=${coeff.n} weighted_err=${weighted_error.toFixed(3)} > ${CALIBRATION_RESET_THRESHOLD}`);
+              log(`🔄 RESET [${side}_${regime}] n=${coeff.n} weighted_err=${weighted_error.toFixed(3)} > ${CALIBRATION_RESET_THRESHOLD}`);
               coeff.a = 0;
               coeff.b = 1;
               coeff.momentum_a = 0;
@@ -1448,9 +1448,9 @@ jobs:
             coeff.last_updated = Date.now();
 
             const mag = Math.sqrt(grad_a * grad_a + grad_b * grad_b);
-            log(`ðŸ“š [${side}_${regime}] n=${coeff.n} (${coeff.n_tp}tp/${coeff.n_sl}sl) lr=${lr.toFixed(5)} |âˆ‡|=${mag.toFixed(4)}`);
-            log(`   p_raw=${pRaw.toFixed(4)} â†’ pÌ‚=${pHat.toFixed(4)} vs y=${outcome} (err=${error.toFixed(4)})`);
-            log(`   a: ${before_a.toFixed(4)}â†’${coeff.a.toFixed(4)} | b: ${before_b.toFixed(4)}â†’${coeff.b.toFixed(4)}${(hit_a || hit_b) ? ' [CLIP]' : ''}`);
+            log(`📚 [${side}_${regime}] n=${coeff.n} (${coeff.n_tp}tp/${coeff.n_sl}sl) lr=${lr.toFixed(5)} |∇|=${mag.toFixed(4)}`);
+            log(`   p_raw=${pRaw.toFixed(4)} → p̂=${pHat.toFixed(4)} vs y=${outcome} (err=${error.toFixed(4)})`);
+            log(`   a: ${before_a.toFixed(4)}→${coeff.a.toFixed(4)} | b: ${before_b.toFixed(4)}→${coeff.b.toFixed(4)}${(hit_a || hit_b) ? ' [CLIP]' : ''}`);
             log(`   Quality: weighted_err=${weighted_error.toFixed(3)} window=${coeff.recent_errors.length}`);
 
             state.calibCoeffs[`${side}_${regime}`] = coeff;
@@ -1536,12 +1536,12 @@ jobs:
 
             // Increment run counter and check for wipe
             state.run_counter = (state.run_counter || 0) + 1;
-            log(`ðŸ”„ Run ${state.run_counter}/6`);
+            log(`🔄 Run ${state.run_counter}/6`);
 
             const SHOULD_WIPE = (state.run_counter >= 6);
 
             if (SHOULD_WIPE) {
-              log("ðŸ—‘ï¸  RUN 6: WIPE GIST AND RESTART FRESH");
+              log("🗑️  RUN 6: WIPE GIST AND RESTART FRESH");
               await saveState(persist, { run_counter: 0 }, {}, 2, true);
               
               state.v = "binance-hedge-7.0";
@@ -1561,16 +1561,16 @@ jobs:
               state.calib_symbol_counts = {};
               state.calib_last_version = CALIB_VERSION;
               
-              log("â™»ï¸  State reset to fresh. Continuing with idea generation...");
+              log("♻️  State reset to fresh. Continuing with idea generation...");
             }
 
-            // ðŸ“š Learn from ALL closed trades FIRST
+            // 📚 Learn from ALL closed trades FIRST
             learnFromGistRealFills(state);
 
-            // ðŸ§¹ Clean expired cooldowns
+            // 🧹 Clean expired cooldowns
             cleanExpiredCooldowns(state);
 
-            // ðŸ—‘ï¸  Keep only last 10 closed trades AFTER learning
+            // 🗑️  Keep only last 10 closed trades AFTER learning
             cleanExpiredClosedTrades(state);
 
             // Preserve cleaned state
@@ -1598,23 +1598,23 @@ jobs:
             };
 
             Object.assign(state, preserved);
-            log(`â™»ï¸  Fresh cycle: ${Object.keys(state.cooldown).length} cooldowns, ${(state.closed||[]).length} closed trades, ${Object.keys(state.calibCoeffs || {}).length} calib models`);
+            log(`♻️  Fresh cycle: ${Object.keys(state.cooldown).length} cooldowns, ${(state.closed||[]).length} closed trades, ${Object.keys(state.calibCoeffs || {}).length} calib models`);
             
             const calibHealth = validateCalibration(state);
             
             if(!todOK) reason="tod_gate";
 
             // ========== DYNAMIC UNIVERSE FROM BINANCE FUTURES (NO VALIDATION NEEDED) ==========
-            log("ðŸ“¡ Fetching Binance Futures universe...");
+            log("📡 Fetching Binance Futures universe...");
             const binanceSymbols = await fetchBinanceFuturesSymbols();
             
             if (!binanceSymbols || binanceSymbols.length === 0) {
-              log("âŒ No Binance Futures symbols found - cannot proceed");
+              log("❌ No Binance Futures symbols found - cannot proceed");
               reason = "no_binance_symbols";
               throw new Error("No Binance Futures symbols available");
             }
             
-            log(`âœ… Binance Futures universe: ${binanceSymbols.length} USDT perpetuals`);
+            log(`✅ Binance Futures universe: ${binanceSymbols.length} USDT perpetuals`);
 
             // DD/throttle
             const equityStats=(eq)=>{ const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of eq||[]){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd) }; };
@@ -1622,7 +1622,7 @@ jobs:
             const throttle=(pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
 
             // ========== FETCH GOLDEN METRICS FOR ALL BINANCE SYMBOLS ==========
-            log("ðŸ“Š Fetching golden metrics for all symbols...");
+            log("📊 Fetching golden metrics for all symbols...");
             
             const BATCH_SIZE = 15;
             const BATCH_DELAY = 300;
@@ -1666,14 +1666,14 @@ jobs:
               }
             }
             
-            log(`ðŸ“ˆ Fetched metrics for ${allMetrics.length}/${binanceSymbols.length} symbols`);
+            log(`📈 Fetched metrics for ${allMetrics.length}/${binanceSymbols.length} symbols`);
 
             // ========== RANK BY HEDGE CONFIDENCE ==========
             // Sort by hedge confidence (highest first)
             allMetrics.sort((a, b) => b.hedge_confidence - a.hedge_confidence);
             
             // Log top 10 for debugging
-            log("ðŸ† Top 10 by hedge confidence:");
+            log("🏆 Top 10 by hedge confidence:");
             for (let i = 0; i < Math.min(10, allMetrics.length); i++) {
               const m = allMetrics[i];
               log(`   ${i+1}. ${m.symbol} conf=${m.hedge_confidence} vol1h=${m.vol_1h_pct.toFixed(2)}% fund=${(m.funding_rate*100).toFixed(4)}% oi_delta=${m.oi_delta_pct.toFixed(1)}% vol=$${Math.round(m.volume_1h_usd/1e6)}M`);
@@ -1898,7 +1898,7 @@ jobs:
               }
             }
             
-            log(`ðŸ” Refined ${refined.length} candidates with execution quality analysis`);
+            log(`🔍 Refined ${refined.length} candidates with execution quality analysis`);
 
             // ========== FINAL SELECTION ==========
             refined.sort((a, b) => b.confidence - a.confidence);
@@ -1928,7 +1928,7 @@ jobs:
               }
             }
             
-            log(`âœ… Selected ${selected.length} ideas for pushing`);
+            log(`✅ Selected ${selected.length} ideas for pushing`);
 
             // ========== GENERATE FLIPPED IDEAS ==========
             const flipped = selected.map(orig => ({
@@ -1962,7 +1962,7 @@ jobs:
               }
 
               const idea_id = uuidv4();
-              const client_order_id = mkClientOrderId("bnh");  // â† CHANGED prefix for Binance Hedge
+              const client_order_id = mkClientOrderId("bnh");  // ← CHANGED prefix for Binance Hedge
 
               const ttl = clamp(Math.round((x.hold_sec || 3600) + i * 12), TTL_MIN, TTL_MAX);
               const size_bps = (Number(process.env.FORCE_SIZE_BPS || "0") > 0)
@@ -2210,8 +2210,8 @@ jobs:
             const meta = {
               origin: "github_actions",
               reason,
-              exchange: "binance_futures",  // â† CHANGED
-              execution_exchange: "binance_futures",  // â† CHANGED
+              exchange: "binance_futures",  // ← CHANGED
+              execution_exchange: "binance_futures",  // ← CHANGED
               strategy: STRATEGY_NAME,
               model_version: MODEL_VERSION,
               schema_version: SCHEMA_VERSION,
@@ -2311,7 +2311,7 @@ jobs:
                 origin: "github_actions",
                 reason,
                 error: (e?.message || String(e)).slice(0, 220),
-                exchange: "binance_futures"  // â† CHANGED
+                exchange: "binance_futures"  // ← CHANGED
               },
               top_n: 0,
               ideas: []
@@ -2338,7 +2338,7 @@ jobs:
           # Shell-level fallback (in case node crashed before posting)
           set -e
           if [[ $EXIT_CODE -ne 0 ]]; then
-            echo "[gha] pusher exited with code $EXIT_CODE â€” sending minimal payload so tail shows a [push] line"
+            echo "[gha] pusher exited with code $EXIT_CODE — sending minimal payload so tail shows a [push] line"
 
             # Sanitize and derive URLs
             raw_push_url="$(printf '%s' "${WORKER_PUSH_URL}" | tr -d '\r\n')"
