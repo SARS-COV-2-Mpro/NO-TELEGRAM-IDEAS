@@ -217,7 +217,7 @@ jobs:
           const microprice=(bid,ask,qb,qa)=>{ const d=(qb||1)+(qa||1); return (ask*qb + bid*qa)/d; };
           const ofiProxy=(d0,d1)=>{ const lev=(side,d)=>d?.[side]?.slice(0,3).map(x=>+x[1]||0)||[]; const sum=a=>a.reduce((x,y)=>x+y,0); if(!d0||!d1) return 0; return (sum(lev("bids",d1))-sum(lev("bids",d0))) - (sum(lev("asks",d1))-sum(lev("asks",d0))); };
           const bookSlope=(depth, mid)=>{ const toPts=(levels)=>{ let cum=0; const pts=[]; for(const [ps,qs] of (levels||[])){ const p=+ps,q=+qs; if(!(p>0&&q>0)) continue; cum+=p*q; const x=Math.log(Math.abs(p-mid)/mid + 1e-6), y=Math.log(cum+1); pts.push([x,y]); if(pts.length>=10) break; } return pts; }; if(!depth?.asks?.length||!depth?.bids?.length||!(mid>0)) return { slope:0, r2:0 }; const pts=toPts(depth.asks).concat(toPts(depth.bids)); if(pts.length<6) return { slope:0, r2:0 }; const xs=pts.map(p=>p[0]), ys=pts.map(p=>p[1]), mx=mean(xs), my=mean(ys); let num=0,den=0,vy=0; for(let i=0;i<xs.length;i++){ const dx=xs[i]-mx, dy=ys[i]-my; num+=dx*dy; den+=dx*dx; vy+=dy*dy; } return { slope: den>1e-9? num/den : 0, r2: den>1e-9 && vy>1e-9? (num*num)/(den*vy):0 }; };
-          const reasonBuilder=(ctx)=>{ const out=[]; if((ctx.vol_1h_pct||0)>=1.5) out.push({ factor:"Vol_1h_pct", value:+(ctx.vol_1h_pct||0).toFixed(2), contribution:+Math.min(20,(ctx.vol_1h_pct)*5).toFixed(1) }); if((ctx.funding_rate||0)>=0.0003) out.push({ factor:"Funding", value:+(ctx.funding_rate*100||0).toFixed(3), contribution:+Math.min(15, ctx.funding_rate*10000).toFixed(1) }); if((ctx.oi_delta_pct||0)>=5) out.push({ factor:"OI_delta_pct", value:+(ctx.oi_delta_pct||0).toFixed(1), contribution:+Math.min(12,(ctx.oi_delta_pct)*0.8).toFixed(1) }); if((ctx.volume_1h_usd||0)>=30000000) out.push({ factor:"Volume_1h", value:Math.round((ctx.volume_1h_usd||0)/1000000)+"M", contribution:+Math.min(10, (ctx.volume_1h_usd||0)/10000000).toFixed(1) }); if((ctx.basis_bps||0)>5) out.push({ factor:"Basis_bps", value:+(ctx.basis_bps||0).toFixed(1), contribution:+Math.min(8, ctx.basis_bps*0.5).toFixed(1) }); return out.sort((a,b)=>Math.abs(b.contribution)-Math.abs(a.contribution)).slice(0,5); };
+          const reasonBuilder=(ctx)=>{ const out=[]; if((ctx.vol_1h_pct||0)>=1.5) out.push({ factor:"Vol_1h_pct", value:+(ctx.vol_1h_pct||0).toFixed(2), contribution:+Math.min(20,(ctx.vol_1h_pct)*5).toFixed(1) }); if((ctx.funding_rate||0)>=0.0003) out.push({ factor:"Funding", value:+(ctx.funding_rate*100||0).toFixed(3), contribution:+Math.min(15, ctx.funding_rate*10000).toFixed(1) }); if((ctx.oi_delta_pct||0)>=5) out.push({ factor:"OI_delta_pct", value:+(ctx.oi_delta_pct||0).toFixed(1), contribution:+Math.min(12,(ctx.oi_delta_pct)*0.8).toFixed(1) }); if((ctx.volume_1h_usd||0)>=30000000) out.push({ factor:"Volume_1h", value:Math.round((ctx.volume_1h_usd||0)/1000000)+"M", contribution:+Math.min(10, (ctx.volume_1h_usd||0)/10000000).toFixed(1) }); if((ctx.basis_bps||0)>5) out.push({ factor:"Basis_bps", value:+(ctx.basis_bps||0).toFixed(1), contribution:+Math.min(8, ctx.basis_bps*0.5).toFixed(1) }); if((ctx.clean_candle_pct||0)>=0.6) out.push({ factor:"CleanCandles", value:+((ctx.clean_candle_pct||0)*100).toFixed(0)+"%", contribution:+Math.min(10, (ctx.clean_candle_pct-0.5)*20).toFixed(1) }); return out.sort((a,b)=>Math.abs(b.contribution)-Math.abs(a.contribution)).slice(0,5); };
           const cholesky=(A)=>{ const n=A.length; const L=Array.from({length:n},()=>Array(n).fill(0)); for(let i=0;i<n;i++){ for(let j=0;j<=i;j++){ let s=0; for(let k=0;k<j;k++) s+=L[i][k]*L[j][k]; const v=A[i][j]-s; if(i===j){ if(v<=1e-12) return null; L[i][j]=Math.sqrt(Math.max(v,1e-12)); } else L[i][j]=v/(L[j][j]||1e-12); } } return L; };
           const choleskySafe=(S)=>{ const L=cholesky(S); if(L) return L; const n=S.length; const Sc=S.map((r,i)=> r.map((v,j)=> v + (i===j?1e-6:0))); return cholesky(Sc); };
           const sampleMultiT=(muVec,Sigma,df=6,M=1000)=>{ const n=muVec.length; const L=choleskySafe(Sigma); if(!L) return []; const out=[]; for(let m=0;m<M;m++){ const z=Array(n).fill(0).map(()=>randn()); const y=Array(n).fill(0); for(let i=0;i<n;i++){ let s=0; for(let k=0;k<i;k++) s+=L[i][k]*z[k]; y[i]=s; } let chi=0; for(let i=0;i<df;i++){ const zc=randn(); chi+=zc*zc; } const scale=Math.sqrt(df/Math.max(1e-9,chi)); out.push(y.map((yi,i)=> (muVec[i]||0) + yi*scale)); } return out; };
@@ -226,8 +226,8 @@ jobs:
           // ---------- HTTP + Concurrency ----------
           async function fetchWithTimeout(url,opts={},ms=12000){ const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms); try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts?.headers||{})}});} finally{ clearTimeout(t);} }
           async function getJSON(url,ms=12000,tries=2){ for(let a=0;a<tries;a++){ try{ const r=await fetchWithTimeout(url,{},ms); if(r?.ok){ return await r.json(); } }catch{} await sleep(jitter(220)); } return null; }
-          const cache={ k:new Map(), depth:new Map(), bt:new Map(), conv:new Map(), binance:new Map() };
-          const TTL={ k: 60_000, depth: 8_000, bt: 5_000, conv: 60_000, binance: 30_000 };
+          const cache={ k:new Map(), depth:new Map(), bt:new Map(), conv:new Map(), binance:new Map(), bybit:new Map() };
+          const TTL={ k: 60_000, depth: 8_000, bt: 5_000, conv: 60_000, binance: 30_000, bybit: 30_000 };
 
           const getCached=(map,key,ttl)=>{ const e=map.get(key); return e && (Date.now()-e.ts<ttl)? e.v : null; };
           const setCached=(map,key,v)=>map.set(key,{ v, ts: Date.now() });
@@ -247,6 +247,7 @@ jobs:
           // Binance Futures endpoints (public, no API key needed)
           const BINANCE_FAPI = "https://railway-1-zf3a.onrender.com/testnet";
           const BINANCE_SPOT = "https://railway-1-zf3a.onrender.com/testnet";
+          const BYBIT_PROXY = "https://bybit-bjpg.onrender.com/mainnet";
           
           const MIN_TF_ALIGN=(Number(process.env.MIN_TF_ALIGN||"0.60"));
           let TF_WEIGHTS={}; try{ TF_WEIGHTS=JSON.parse(process.env.TF_WEIGHTS||"{}"); }catch{ TF_WEIGHTS={}; }
@@ -340,16 +341,29 @@ jobs:
           log("health GET", HEALTH_URL);
           try{ const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`,"User-Agent":UA }},5000); let t=""; try{ t=await r.text(); }catch{} log("health status", r?.status||"ERR", (t||"").slice(0,160)); }catch(e){ log("health error", e?.message||e); }
 
-          // Pre-warm Render proxy to handle cold starts
-          log("🔥 Pre-warming Render proxy...");
+          // Pre-warm Render proxies to handle cold starts
+          log("🔥 Pre-warming Render proxies...");
+
+          // Pre-warm Binance proxy
           try { 
             const warmResp = await fetchWithTimeout(`${BINANCE_FAPI}/fapi/v1/time`, {}, 45000); 
             let warmText = "";
             try { warmText = await warmResp.text(); } catch {}
-            log("✅ Pre-warm status:", warmResp?.status || "timeout", warmText.slice(0, 100));
+            log("✅ Binance pre-warm status:", warmResp?.status || "timeout", warmText.slice(0, 100));
           } catch (e) { 
-            log("⚠️  Pre-warm timeout (may indicate cold start):", e?.message || e); 
+            log("⚠️  Binance pre-warm timeout (may indicate cold start):", e?.message || e); 
           }
+
+          // Pre-warm Bybit proxy
+          try { 
+            const warmRespBybit = await fetchWithTimeout(`${BYBIT_PROXY}/v5/market/time`, {}, 30000); 
+            let warmTextBybit = "";
+            try { warmTextBybit = await warmRespBybit.text(); } catch {}
+            log("✅ Bybit pre-warm status:", warmRespBybit?.status || "timeout", warmTextBybit.slice(0, 100));
+          } catch (e) { 
+            log("⚠️  Bybit pre-warm timeout (may indicate cold start):", e?.message || e); 
+          }
+
           await sleep(2000); // Give Render time to fully wake up
 
           // ========== FAKE FLUSH START ==========
@@ -740,6 +754,135 @@ jobs:
               return result;
             } catch (e) {
               return null;
+            }
+          }
+
+          // ---------- Bybit Shadow Analysis Functions ----------
+
+          // Fetch 100 x 1m candles from Bybit
+          async function fetchBybit1mKlines(symbol) {
+            const cacheKey = `bybit_1m_${symbol}`;
+            const cached = getCached(cache.bybit, cacheKey, TTL.bybit);
+            if (cached) return cached;
+            
+            try {
+              const url = `${BYBIT_PROXY}/v5/market/kline?category=linear&symbol=${symbol}&interval=1&limit=100`;
+              const response = await fetchWithTimeout(url, {}, 15000);
+              
+              if (!response.ok) {
+                return null;
+              }
+              
+              const data = await response.json();
+              
+              // Bybit returns: retCode, retMsg, result.list
+              // Each candle: [startTime, openPrice, highPrice, lowPrice, closePrice, volume, turnover]
+              if (data?.retCode !== 0 || !Array.isArray(data?.result?.list)) {
+                return null;
+              }
+              
+              const candles = data.result.list.map(c => ({
+                ts: +c[0],
+                open: +c[1],
+                high: +c[2],
+                low: +c[3],
+                close: +c[4],
+                volume: +c[5],
+                turnover: +c[6]
+              }));
+              
+              setCached(cache.bybit, cacheKey, candles);
+              return candles;
+              
+            } catch (e) {
+              return null;
+            }
+          }
+
+          // Calculate shadow ratio for a single candle
+          function calcCandleShadowRatio(candle) {
+            const { open, high, low, close } = candle;
+            
+            const range = high - low;
+            if (range <= 0) return null; // Skip zero-range candles
+            
+            const body = Math.abs(close - open);
+            const upperShadow = high - Math.max(open, close);
+            const lowerShadow = Math.min(open, close) - low;
+            const totalShadow = upperShadow + lowerShadow;
+            
+            // Shadow ratio: 0 = no shadows (perfect), 1 = all shadows (no body)
+            const shadowRatio = totalShadow / range;
+            
+            return {
+              shadowRatio: clamp(shadowRatio, 0, 1),
+              upperRatio: upperShadow / range,
+              lowerRatio: lowerShadow / range,
+              bodyRatio: body / range
+            };
+          }
+
+          // Analyze 100 candles and return aggregate shadow metrics
+          function analyzeShadows(candles) {
+            if (!Array.isArray(candles) || candles.length === 0) {
+              return { avgShadowRatio: 0.5, medianShadowRatio: 0.5, cleanCandlePct: 0.5, shadowMult: 1.0 };
+            }
+            
+            const ratios = [];
+            
+            for (const candle of candles) {
+              const result = calcCandleShadowRatio(candle);
+              if (result !== null) {
+                ratios.push(result.shadowRatio);
+              }
+            }
+            
+            if (ratios.length === 0) {
+              return { avgShadowRatio: 0.5, medianShadowRatio: 0.5, cleanCandlePct: 0.5, shadowMult: 1.0 };
+            }
+            
+            // Calculate average
+            const avgShadowRatio = ratios.reduce((a, b) => a + b, 0) / ratios.length;
+            
+            // Calculate median
+            const sorted = [...ratios].sort((a, b) => a - b);
+            const mid = Math.floor(sorted.length / 2);
+            const medianShadowRatio = sorted.length % 2 === 0 
+              ? (sorted[mid - 1] + sorted[mid]) / 2 
+              : sorted[mid];
+            
+            // Calculate percentage of "clean" candles (shadow ratio < 0.4)
+            const cleanCount = ratios.filter(r => r < 0.4).length;
+            const cleanCandlePct = cleanCount / ratios.length;
+            
+            // Calculate multiplier
+            // avgShadowRatio = 0.0 → mult = 1.20 (cleanest, best)
+            // avgShadowRatio = 0.3 → mult = 1.08
+            // avgShadowRatio = 0.5 → mult = 1.00 (neutral)
+            // avgShadowRatio = 0.7 → mult = 0.92
+            // avgShadowRatio = 1.0 → mult = 0.80 (worst)
+            const shadowMult = clamp(1.2 - (avgShadowRatio * 0.4), 0.80, 1.20);
+            
+            return {
+              avgShadowRatio: +avgShadowRatio.toFixed(4),
+              medianShadowRatio: +medianShadowRatio.toFixed(4),
+              cleanCandlePct: +cleanCandlePct.toFixed(4),
+              shadowMult: +shadowMult.toFixed(4),
+              candlesAnalyzed: ratios.length
+            };
+          }
+
+          // Fetch and analyze shadows for a symbol
+          async function getSymbolShadowAnalysis(symbol) {
+            try {
+              const candles = await fetchBybit1mKlines(symbol);
+              if (!candles) {
+                return { avgShadowRatio: 0.5, medianShadowRatio: 0.5, cleanCandlePct: 0.5, shadowMult: 1.0, source: "fallback" };
+              }
+              const analysis = analyzeShadows(candles);
+              return { ...analysis, source: "bybit" };
+            } catch (e) {
+              return { avgShadowRatio: 0.5, medianShadowRatio: 0.5, cleanCandlePct: 0.5, shadowMult: 1.0, source: "error" };
             }
           }
 
@@ -1690,8 +1833,15 @@ jobs:
             // ========== DETAILED REFINEMENT WITH BINANCE DATA ==========
             const refined = [];
             
+            let candIndex = 0;
             for (const cand of topCandidates) {
               try {
+                // Small delay every 5 candidates to avoid rate limits on Bybit
+                if (candIndex > 0 && candIndex % 5 === 0) {
+                  await sleep(200);
+                }
+                candIndex++;
+                
                 // Fetch BINANCE execution quality data (depth, spread)
                 const ticker = await fetchBinanceFuturesTicker(cand.symbol);
                 const depth = await fetchBinanceFuturesDepth(cand.symbol);
@@ -1832,9 +1982,13 @@ jobs:
                   (chosen.side === "long" && cand.funding_rate_raw < 0)
                 ) ? 1.1 : 1.0;
                 
+                // Shadow analysis from Bybit 1m candles
+                const shadowAnalysis = await getSymbolShadowAnalysis(cand.symbol);
+                const shadowMult = shadowAnalysis.shadowMult;
+
                 // Final confidence
                 const finalConf = Math.round(
-                  baseConf * spreadMult * depthMult * slipMult * oiMult * evMult * btcMult * fundingAlignBonus
+                  baseConf * spreadMult * depthMult * slipMult * oiMult * evMult * btcMult * fundingAlignBonus * shadowMult
                 );
                 
                 // Build reasons
@@ -1843,7 +1997,8 @@ jobs:
                   funding_rate: cand.funding_rate,
                   oi_delta_pct: cand.oi_delta_pct,
                   volume_1h_usd: cand.volume_1h_usd,
-                  basis_bps: cand.basis_bps
+                  basis_bps: cand.basis_bps,
+                  clean_candle_pct: shadowAnalysis.cleanCandlePct
                 });
                 
                 refined.push({
@@ -1883,6 +2038,10 @@ jobs:
                   obi,
                   slip_est: chosen.side === "long" ? slipL : slipS,
                   
+                  // Shadow analysis
+                  shadow_analysis: shadowAnalysis,
+                  shadow_mult: shadowMult,
+
                   // TTL (max 2 hours for hedge trades)
                   hold_sec: clamp(3600, TTL_MIN, TTL_MAX), // Default 1 hour
                   
@@ -1898,7 +2057,13 @@ jobs:
               }
             }
             
-            log(`🔍 Refined ${refined.length} candidates with execution quality analysis`);
+            log(`🔍 Refined ${refined.length} candidates with execution quality + shadow analysis`);
+
+            // Log shadow stats for top 5
+            const shadowStats = refined.slice(0, 5).map(r => 
+              `${r.symbol}: shadow=${(r.shadow_analysis?.avgShadowRatio || 0.5).toFixed(2)} mult=${(r.shadow_mult || 1).toFixed(2)} clean=${((r.shadow_analysis?.cleanCandlePct || 0.5) * 100).toFixed(0)}%`
+            );
+            log(`📊 Shadow analysis (top 5): ${shadowStats.join(" | ")}`);
 
             // ========== FINAL SELECTION ==========
             refined.sort((a, b) => b.confidence - a.confidence);
@@ -2024,7 +2189,13 @@ jobs:
                   oi_delta_pct: x.oi_delta_pct,
                   volume_1h_usd: x.volume_1h_usd,
                   basis_bps: x.basis_bps,
-                  hedge_confidence: x.hedge_confidence
+                  hedge_confidence: x.hedge_confidence,
+                  
+                  // Shadow analysis from Bybit
+                  shadow_avg_ratio: x.shadow_analysis?.avgShadowRatio,
+                  shadow_clean_pct: x.shadow_analysis?.cleanCandlePct,
+                  shadow_mult: x.shadow_mult,
+                  shadow_source: x.shadow_analysis?.source
                 },
 
                 confidence: x.confidence,
@@ -2201,6 +2372,9 @@ jobs:
               funding_rate: +(p.predicted?.funding_rate || 0).toFixed(5),
               oi_delta_pct: +(p.predicted?.oi_delta_pct || 0).toFixed(1),
               volume_1h_usd: Math.round((p.predicted?.volume_1h_usd || 0) / 1e6) + "M",
+              shadow_avg: +(p.predicted?.shadow_avg_ratio || 0.5).toFixed(2),
+              shadow_clean_pct: +((p.predicted?.shadow_clean_pct || 0.5) * 100).toFixed(0),
+              shadow_mult: +(p.predicted?.shadow_mult || 1).toFixed(2),
               reasons: p.reasons_text,
               p_cal: +p.p_lcb.toFixed(3),
               ev_bps: p.ev_bps,
