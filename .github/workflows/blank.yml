@@ -247,7 +247,7 @@ jobs:
           // Binance Futures endpoints (public, no API key needed)
           const BINANCE_FAPI = "https://testnet.binancefuture.com";
           const BINANCE_SPOT = "https://testnet.binancefuture.com";
-          const BYBIT_PROXY = "https://api.bybit-tr.com";
+          const BYBIT_PROXY = "https://api-demo.bybit.com/";
           
           const MIN_TF_ALIGN=(Number(process.env.MIN_TF_ALIGN||"0.60"));
           let TF_WEIGHTS={}; try{ TF_WEIGHTS=JSON.parse(process.env.TF_WEIGHTS||"{}"); }catch{ TF_WEIGHTS={}; }
