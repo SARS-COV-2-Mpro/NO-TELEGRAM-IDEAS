@@ -2,7 +2,7 @@ name: Ideas Pusher (MEXC Ultimate 7.7.7)
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/40 * * * *"
   repository_dispatch:
     types: [run_B]
   workflow_dispatch: {}
@@ -754,54 +754,6 @@ jobs:
               return result;
             } catch (e) {
               return null;
-            }
-          }
-
-          // ---------- Bybit Linear Symbols (for cross-exchange filter) ----------
-          
-          async function fetchBybitLinearSymbols() {
-            const cacheKey = "bybit_linear_symbols";
-            const cached = getCached(cache.bybit, cacheKey, 300_000); // 5 min cache
-            if (cached) return cached;
-            
-            try {
-              const url = `${BYBIT_PROXY}/v5/market/instruments-info?category=linear`;
-              log(`📡 Fetching Bybit linear symbols from: ${url}`);
-              
-              // Long timeout for cold start
-              const response = await fetchWithTimeout(url, {}, 60000);
-              
-              if (!response.ok) {
-                log(`⚠️ Bybit instruments HTTP ${response.status}`);
-                return [];
-              }
-              
-              const data = await response.json();
-              
-              if (data?.retCode !== 0 || !Array.isArray(data?.result?.list)) {
-                log("⚠️ Bybit instruments invalid response:", data?.retMsg || "no list");
-                return [];
-              }
-              
-              const symbols = data.result.list
-                .filter(s => 
-                  s.quoteCoin === "USDT" &&
-                  s.status === "Trading" &&
-                  s.contractType === "LinearPerpetual"
-                )
-                .map(s => ({
-                  symbol: s.symbol,        // e.g., "BTCUSDT"
-                  base: s.baseCoin,        // e.g., "BTC"
-                  quote: s.quoteCoin       // "USDT"
-                }));
-              
-              setCached(cache.bybit, cacheKey, symbols);
-              log(`✅ Bybit Linear: ${symbols.length} USDT perpetuals found`);
-              return symbols;
-              
-            } catch (e) {
-              log("❌ Bybit instruments fetch error:", e?.message || e);
-              return [];
             }
           }
 
@@ -1795,7 +1747,7 @@ jobs:
             
             if(!todOK) reason="tod_gate";
 
-            // ========== DYNAMIC UNIVERSE: BINANCE + BYBIT CROSS-EXCHANGE FILTER ==========
+            // ========== DYNAMIC UNIVERSE FROM BINANCE FUTURES (NO VALIDATION NEEDED) ==========
             log("📡 Fetching Binance Futures universe...");
             const binanceSymbols = await fetchBinanceFuturesSymbols();
             
@@ -1806,56 +1758,21 @@ jobs:
             }
             
             log(`✅ Binance Futures universe: ${binanceSymbols.length} USDT perpetuals`);
-            
-            // Fetch Bybit symbols for cross-exchange availability filter
-            log("📡 Fetching Bybit universe for cross-exchange filter...");
-            const bybitSymbols = await fetchBybitLinearSymbols();
-            
-            let workingUniverse = binanceSymbols;
-            let crossExchangeCount = 0;
-            
-            if (bybitSymbols && bybitSymbols.length > 0) {
-              // Create Bybit symbol set for O(1) lookup
-              const bybitSymbolSet = new Set(bybitSymbols.map(s => s.symbol));
-              
-              // Filter Binance symbols to only those ALSO available on Bybit
-              const crossExchangeSymbols = binanceSymbols.filter(s => bybitSymbolSet.has(s.symbol));
-              crossExchangeCount = crossExchangeSymbols.length;
-              
-              log(`🔗 Cross-exchange filter: ${crossExchangeSymbols.length}/${binanceSymbols.length} available on BOTH Binance & Bybit`);
-              
-              // Log examples of what got filtered out
-              const filteredOut = binanceSymbols.filter(s => !bybitSymbolSet.has(s.symbol)).slice(0, 10);
-              if (filteredOut.length > 0) {
-                log(`   ❌ Binance-only (excluded): ${filteredOut.map(s => s.symbol).join(", ")}${binanceSymbols.length - crossExchangeSymbols.length > 10 ? "..." : ""}`);
-              }
-              
-              // Use cross-exchange symbols
-              if (crossExchangeSymbols.length > 0) {
-                workingUniverse = crossExchangeSymbols;
-              } else {
-                log("⚠️ No cross-exchange symbols found - falling back to Binance-only (degraded mode)");
-              }
-            } else {
-              log("⚠️ Bybit fetch failed - proceeding with Binance-only universe (degraded mode)");
-            }
-            
-            log(`📊 Working universe: ${workingUniverse.length} symbols for golden 4 analysis`);
 
             // DD/throttle
             const equityStats=(eq)=>{ const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of eq||[]){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd) }; };
             const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
             const throttle=(pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
 
-            // ========== FETCH GOLDEN METRICS FOR CROSS-EXCHANGE SYMBOLS ==========
-            log(`📊 Fetching golden 4 metrics for ${workingUniverse.length} cross-exchange symbols...`);
+            // ========== FETCH GOLDEN METRICS FOR ALL BINANCE SYMBOLS ==========
+            log("📊 Fetching golden metrics for all symbols...");
             
             const BATCH_SIZE = 15;
             const BATCH_DELAY = 300;
             const allMetrics = [];
             
-            for (let i = 0; i < workingUniverse.length; i += BATCH_SIZE) {
-              const batch = workingUniverse.slice(i, i + BATCH_SIZE);
+            for (let i = 0; i < binanceSymbols.length; i += BATCH_SIZE) {
+              const batch = binanceSymbols.slice(i, i + BATCH_SIZE);
               
               const batchResults = await Promise.all(
                 batch.map(async (sym) => {
@@ -1887,12 +1804,12 @@ jobs:
               }
               
               // Rate limit pause between batches
-              if (i + BATCH_SIZE < workingUniverse.length) {
+              if (i + BATCH_SIZE < binanceSymbols.length) {
                 await sleep(BATCH_DELAY);
               }
             }
             
-            log(`📈 Fetched metrics for ${allMetrics.length}/${workingUniverse.length} symbols`);
+            log(`📈 Fetched metrics for ${allMetrics.length}/${binanceSymbols.length} symbols`);
 
             // ========== RANK BY HEDGE CONFIDENCE ==========
             // Sort by hedge confidence (highest first)
@@ -2266,9 +2183,6 @@ jobs:
                   confidence_score: x.confidence,
                   flipped: x.flipped || false,
                   
-                  // Cross-exchange confirmation
-                  bybit_available: true,
-                  
                   // Hedge-specific metadata
                   vol_1h_pct: x.vol_1h_pct,
                   funding_rate: x.funding_rate,
@@ -2479,9 +2393,6 @@ jobs:
               config_hash: CONFIG_HASH,
               counts: {
                 binance_universe: binanceSymbols.length,
-                bybit_universe: bybitSymbols?.length || 0,
-                cross_exchange: crossExchangeCount,
-                working_universe: workingUniverse.length,
                 metrics_fetched: allMetrics.length,
                 refined: refined.length,
                 selected: picks.length
