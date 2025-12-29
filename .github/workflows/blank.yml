@@ -1,7 +1,7 @@
 name: Ideas Pusher (MEXC Ultimate 7.7.7)
 
 on:
-  schedule:
+
   
   repository_dispatch:
     types: [run_B]
