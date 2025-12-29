@@ -3,11 +3,11 @@ name: ⏰ Scheduler (Every 30 min)
 on:
   schedule:
     - cron: "*/30 * * * *"
-  workflow_dispatch: {}  # Manual trigger for testing
+  workflow_dispatch: {}
 
 permissions:
   actions: write
-  contents: read
+  contents: write
 
 jobs:
   trigger:
