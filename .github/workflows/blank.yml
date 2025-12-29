@@ -245,8 +245,8 @@ jobs:
           const MEXC_BASES=[process.env.MEXC_BASE,"https://api.mexc.com","https://www.mexc.com"].filter(Boolean);
           
           // Binance Futures endpoints (public, no API key needed)
-          const BINANCE_FAPI = "https://testnet.binancefuture.com";
-          const BINANCE_SPOT = "https://testnet.binancefuture.com";
+          const BINANCE_FAPI = "https://lonely-manya-mazetofutures-c11b521d.koyeb.app/mainnet";
+          const BINANCE_SPOT = "https://lonely-manya-mazetofutures-c11b521d.koyeb.app/mainnet";
           const BYBIT_PROXY = "https://lonely-manya-mazetofutures-c11b521d.koyeb.app/mainnet";
           
           const MIN_TF_ALIGN=(Number(process.env.MIN_TF_ALIGN||"0.60"));
