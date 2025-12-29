@@ -2,7 +2,7 @@ name: Ideas Pusher (MEXC Ultimate 7.7.7)
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/40 * * * *"
   repository_dispatch:
     types: [run_B]
   workflow_dispatch: {}
@@ -217,7 +217,7 @@ jobs:
           const microprice=(bid,ask,qb,qa)=>{ const d=(qb||1)+(qa||1); return (ask*qb + bid*qa)/d; };
           const ofiProxy=(d0,d1)=>{ const lev=(side,d)=>d?.[side]?.slice(0,3).map(x=>+x[1]||0)||[]; const sum=a=>a.reduce((x,y)=>x+y,0); if(!d0||!d1) return 0; return (sum(lev("bids",d1))-sum(lev("bids",d0))) - (sum(lev("asks",d1))-sum(lev("asks",d0))); };
           const bookSlope=(depth, mid)=>{ const toPts=(levels)=>{ let cum=0; const pts=[]; for(const [ps,qs] of (levels||[])){ const p=+ps,q=+qs; if(!(p>0&&q>0)) continue; cum+=p*q; const x=Math.log(Math.abs(p-mid)/mid + 1e-6), y=Math.log(cum+1); pts.push([x,y]); if(pts.length>=10) break; } return pts; }; if(!depth?.asks?.length||!depth?.bids?.length||!(mid>0)) return { slope:0, r2:0 }; const pts=toPts(depth.asks).concat(toPts(depth.bids)); if(pts.length<6) return { slope:0, r2:0 }; const xs=pts.map(p=>p[0]), ys=pts.map(p=>p[1]), mx=mean(xs), my=mean(ys); let num=0,den=0,vy=0; for(let i=0;i<xs.length;i++){ const dx=xs[i]-mx, dy=ys[i]-my; num+=dx*dy; den+=dx*dx; vy+=dy*dy; } return { slope: den>1e-9? num/den : 0, r2: den>1e-9 && vy>1e-9? (num*num)/(den*vy):0 }; };
-          const reasonBuilder=(ctx)=>{ const out=[]; if((ctx.vol_1h_pct||0)>=1.5) out.push({ factor:"Vol_1h_pct", value:+(ctx.vol_1h_pct||0).toFixed(2), contribution:+Math.min(20,(ctx.vol_1h_pct)*5).toFixed(1) }); if((ctx.funding_rate||0)>=0.0003) out.push({ factor:"Funding", value:+(ctx.funding_rate*100||0).toFixed(3), contribution:+Math.min(15, ctx.funding_rate*10000).toFixed(1) }); if((ctx.oi_delta_pct||0)>=5) out.push({ factor:"OI_delta_pct", value:+(ctx.oi_delta_pct||0).toFixed(1), contribution:+Math.min(12,(ctx.oi_delta_pct)*0.8).toFixed(1) }); if((ctx.volume_1h_usd||0)>=30000000) out.push({ factor:"Volume_1h", value:Math.round((ctx.volume_1h_usd||0)/1000000)+"M", contribution:+Math.min(10, (ctx.volume_1h_usd||0)/10000000).toFixed(1) }); if((ctx.basis_bps||0)>5) out.push({ factor:"Basis_bps", value:+(ctx.basis_bps||0).toFixed(1), contribution:+Math.min(8, ctx.basis_bps*0.5).toFixed(1) }); return out.sort((a,b)=>Math.abs(b.contribution)-Math.abs(a.contribution)).slice(0,5); };
+          const reasonBuilder=(ctx)=>{ const out=[]; if((ctx.vol_1h_pct||0)>=1.5) out.push({ factor:"Vol_1h_pct", value:+(ctx.vol_1h_pct||0).toFixed(2), contribution:+Math.min(20,(ctx.vol_1h_pct)*5).toFixed(1) }); if((ctx.funding_rate||0)>=0.0003) out.push({ factor:"Funding", value:+(ctx.funding_rate*100||0).toFixed(3), contribution:+Math.min(15, ctx.funding_rate*10000).toFixed(1) }); if((ctx.oi_delta_pct||0)>=5) out.push({ factor:"OI_delta_pct", value:+(ctx.oi_delta_pct||0).toFixed(1), contribution:+Math.min(12,(ctx.oi_delta_pct)*0.8).toFixed(1) }); if((ctx.volume_1h_usd||0)>=30000000) out.push({ factor:"Volume_1h", value:Math.round((ctx.volume_1h_usd||0)/1000000)+"M", contribution:+Math.min(10, (ctx.volume_1h_usd||0)/10000000).toFixed(1) }); if((ctx.basis_bps||0)>5) out.push({ factor:"Basis_bps", value:+(ctx.basis_bps||0).toFixed(1), contribution:+Math.min(8, ctx.basis_bps*0.5).toFixed(1) }); if((ctx.clean_candle_pct||0)>=0.6) out.push({ factor:"CleanCandles", value:+((ctx.clean_candle_pct||0)*100).toFixed(0)+"%", contribution:+Math.min(10, (ctx.clean_candle_pct-0.5)*20).toFixed(1) }); return out.sort((a,b)=>Math.abs(b.contribution)-Math.abs(a.contribution)).slice(0,5); };
           const cholesky=(A)=>{ const n=A.length; const L=Array.from({length:n},()=>Array(n).fill(0)); for(let i=0;i<n;i++){ for(let j=0;j<=i;j++){ let s=0; for(let k=0;k<j;k++) s+=L[i][k]*L[j][k]; const v=A[i][j]-s; if(i===j){ if(v<=1e-12) return null; L[i][j]=Math.sqrt(Math.max(v,1e-12)); } else L[i][j]=v/(L[j][j]||1e-12); } } return L; };
           const choleskySafe=(S)=>{ const L=cholesky(S); if(L) return L; const n=S.length; const Sc=S.map((r,i)=> r.map((v,j)=> v + (i===j?1e-6:0))); return cholesky(Sc); };
           const sampleMultiT=(muVec,Sigma,df=6,M=1000)=>{ const n=muVec.length; const L=choleskySafe(Sigma); if(!L) return []; const out=[]; for(let m=0;m<M;m++){ const z=Array(n).fill(0).map(()=>randn()); const y=Array(n).fill(0); for(let i=0;i<n;i++){ let s=0; for(let k=0;k<i;k++) s+=L[i][k]*z[k]; y[i]=s; } let chi=0; for(let i=0;i<df;i++){ const zc=randn(); chi+=zc*zc; } const scale=Math.sqrt(df/Math.max(1e-9,chi)); out.push(y.map((yi,i)=> (muVec[i]||0) + yi*scale)); } return out; };
@@ -226,8 +226,8 @@ jobs:
           // ---------- HTTP + Concurrency ----------
           async function fetchWithTimeout(url,opts={},ms=12000){ const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms); try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts?.headers||{})}});} finally{ clearTimeout(t);} }
           async function getJSON(url,ms=12000,tries=2){ for(let a=0;a<tries;a++){ try{ const r=await fetchWithTimeout(url,{},ms); if(r?.ok){ return await r.json(); } }catch{} await sleep(jitter(220)); } return null; }
-          const cache={ k:new Map(), depth:new Map(), bt:new Map(), conv:new Map(), binance:new Map() };
-          const TTL={ k: 60_000, depth: 8_000, bt: 5_000, conv: 60_000, binance: 30_000 };
+          const cache={ k:new Map(), depth:new Map(), bt:new Map(), conv:new Map(), binance:new Map(), bybit:new Map() };
+          const TTL={ k: 60_000, depth: 8_000, bt: 5_000, conv: 60_000, binance: 30_000, bybit: 30_000 };
 
           const getCached=(map,key,ttl)=>{ const e=map.get(key); return e && (Date.now()-e.ts<ttl)? e.v : null; };
           const setCached=(map,key,v)=>map.set(key,{ v, ts: Date.now() });
@@ -247,6 +247,7 @@ jobs:
           // Binance Futures endpoints (public, no API key needed)
           const BINANCE_FAPI = "https://testnet.binancefuture.com";
           const BINANCE_SPOT = "https://testnet.binancefuture.com";
+          const BYBIT_PROXY = "https://lonely-manya-mazetofutures-c11b521d.koyeb.app/mainnet";
           
           const MIN_TF_ALIGN=(Number(process.env.MIN_TF_ALIGN||"0.60"));
           let TF_WEIGHTS={}; try{ TF_WEIGHTS=JSON.parse(process.env.TF_WEIGHTS||"{}"); }catch{ TF_WEIGHTS={}; }
@@ -313,15 +314,12 @@ jobs:
           const IDEAL_FUNDING_RATE = 0.0004;  // |funding| >= 0.04%
           const IDEAL_OI_DELTA_PCT = 10.0;    // |ΔOI 1-2h| >= 10%
           const IDEAL_VOLUME_1H_USD = 60_000_000; // 1h volume >= $60M
-          const IDEAL_SPREAD_BPS = 3;      // Ideal spread <= 3 bps
 
           // Confidence weights for hedge trading (sum = 1.0)
-          const WEIGHT_VOL_1H = 0.35;      // Reduced from 0.40
-          const WEIGHT_FUNDING = 0.20;     // Reduced from 0.25
-          const WEIGHT_OI_DELTA = 0.15;    // Reduced from 0.20
-          const WEIGHT_VOLUME = 0.15;      // Same
-          const WEIGHT_SPREAD = 0.15;      // Weight for spread
-
+          const WEIGHT_VOL_1H = 0.40;      // 1h volatility - HIGHEST priority
+          const WEIGHT_FUNDING = 0.25;     // Funding rate
+          const WEIGHT_OI_DELTA = 0.20;    // Open Interest change
+          const WEIGHT_VOLUME = 0.15;      // 1h volume
 
           const CONFIG_HASH=(()=>{ try{
             const knobs={
@@ -330,8 +328,8 @@ jobs:
               LONG_DOWN_RSI_CUTOFF, LONG_MR_DIVERGENCE_REQ, LONG_EDGE_MULT_MIN,
               LONG_BOUNCE_SL_ATR, LONG_BOUNCE_TP_ATR, LONG_SIMILARITY_RHO, TOP_N, MAX_SPREAD_BPS,
               EXP_LCB_MIN_BPS_BASE, COST_BPS, NOTIONAL, DEPTH_LIMIT, OBI_TOPN, MIN_TF_ALIGN, TF_WEIGHTS,
-              IDEAL_VOL_1H_PCT, IDEAL_FUNDING_RATE, IDEAL_OI_DELTA_PCT, IDEAL_VOLUME_1H_USD, IDEAL_SPREAD_BPS,
-              WEIGHT_VOL_1H, WEIGHT_FUNDING, WEIGHT_OI_DELTA, WEIGHT_VOLUME, WEIGHT_SPREAD
+              IDEAL_VOL_1H_PCT, IDEAL_FUNDING_RATE, IDEAL_OI_DELTA_PCT, IDEAL_VOLUME_1H_USD,
+              WEIGHT_VOL_1H, WEIGHT_FUNDING, WEIGHT_OI_DELTA, WEIGHT_VOLUME
             };
             return hashObj(knobs);
           }catch{ return "cfg-unknown"; } })();
@@ -343,16 +341,29 @@ jobs:
           log("health GET", HEALTH_URL);
           try{ const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`,"User-Agent":UA }},5000); let t=""; try{ t=await r.text(); }catch{} log("health status", r?.status||"ERR", (t||"").slice(0,160)); }catch(e){ log("health error", e?.message||e); }
 
-          // Pre-warm Render proxy to handle cold starts
-          log("🔥 Pre-warming Render proxy...");
+          // Pre-warm Render proxies to handle cold starts
+          log("🔥 Pre-warming Render proxies...");
+
+          // Pre-warm Binance proxy
           try { 
             const warmResp = await fetchWithTimeout(`${BINANCE_FAPI}/fapi/v1/time`, {}, 45000); 
             let warmText = "";
             try { warmText = await warmResp.text(); } catch {}
-            log("✅ Pre-warm status:", warmResp?.status || "timeout", warmText.slice(0, 100));
+            log("✅ Binance pre-warm status:", warmResp?.status || "timeout", warmText.slice(0, 100));
           } catch (e) { 
-            log("⚠️  Pre-warm timeout (may indicate cold start):", e?.message || e); 
+            log("⚠️  Binance pre-warm timeout (may indicate cold start):", e?.message || e); 
           }
+
+          // Pre-warm Bybit proxy
+          try { 
+            const warmRespBybit = await fetchWithTimeout(`${BYBIT_PROXY}/v5/market/time`, {}, 30000); 
+            let warmTextBybit = "";
+            try { warmTextBybit = await warmRespBybit.text(); } catch {}
+            log("✅ Bybit pre-warm status:", warmRespBybit?.status || "timeout", warmTextBybit.slice(0, 100));
+          } catch (e) { 
+            log("⚠️  Bybit pre-warm timeout (may indicate cold start):", e?.message || e); 
+          }
+
           await sleep(2000); // Give Render time to fully wake up
 
           // ========== FAKE FLUSH START ==========
@@ -746,6 +757,135 @@ jobs:
             }
           }
 
+          // ---------- Bybit Shadow Analysis Functions ----------
+
+          // Fetch 100 x 1m candles from Bybit
+          async function fetchBybit1mKlines(symbol) {
+            const cacheKey = `bybit_1m_${symbol}`;
+            const cached = getCached(cache.bybit, cacheKey, TTL.bybit);
+            if (cached) return cached;
+            
+            try {
+              const url = `${BYBIT_PROXY}/v5/market/kline?category=linear&symbol=${symbol}&interval=1&limit=100`;
+              const response = await fetchWithTimeout(url, {}, 15000);
+              
+              if (!response.ok) {
+                return null;
+              }
+              
+              const data = await response.json();
+              
+              // Bybit returns: retCode, retMsg, result.list
+              // Each candle: [startTime, openPrice, highPrice, lowPrice, closePrice, volume, turnover]
+              if (data?.retCode !== 0 || !Array.isArray(data?.result?.list)) {
+                return null;
+              }
+              
+              const candles = data.result.list.map(c => ({
+                ts: +c[0],
+                open: +c[1],
+                high: +c[2],
+                low: +c[3],
+                close: +c[4],
+                volume: +c[5],
+                turnover: +c[6]
+              }));
+              
+              setCached(cache.bybit, cacheKey, candles);
+              return candles;
+              
+            } catch (e) {
+              return null;
+            }
+          }
+
+          // Calculate shadow ratio for a single candle
+          function calcCandleShadowRatio(candle) {
+            const { open, high, low, close } = candle;
+            
+            const range = high - low;
+            if (range <= 0) return null; // Skip zero-range candles
+            
+            const body = Math.abs(close - open);
+            const upperShadow = high - Math.max(open, close);
+            const lowerShadow = Math.min(open, close) - low;
+            const totalShadow = upperShadow + lowerShadow;
+            
+            // Shadow ratio: 0 = no shadows (perfect), 1 = all shadows (no body)
+            const shadowRatio = totalShadow / range;
+            
+            return {
+              shadowRatio: clamp(shadowRatio, 0, 1),
+              upperRatio: upperShadow / range,
+              lowerRatio: lowerShadow / range,
+              bodyRatio: body / range
+            };
+          }
+
+          // Analyze 100 candles and return aggregate shadow metrics
+          function analyzeShadows(candles) {
+            if (!Array.isArray(candles) || candles.length === 0) {
+              return { avgShadowRatio: 0.5, medianShadowRatio: 0.5, cleanCandlePct: 0.5, shadowMult: 1.0 };
+            }
+            
+            const ratios = [];
+            
+            for (const candle of candles) {
+              const result = calcCandleShadowRatio(candle);
+              if (result !== null) {
+                ratios.push(result.shadowRatio);
+              }
+            }
+            
+            if (ratios.length === 0) {
+              return { avgShadowRatio: 0.5, medianShadowRatio: 0.5, cleanCandlePct: 0.5, shadowMult: 1.0 };
+            }
+            
+            // Calculate average
+            const avgShadowRatio = ratios.reduce((a, b) => a + b, 0) / ratios.length;
+            
+            // Calculate median
+            const sorted = [...ratios].sort((a, b) => a - b);
+            const mid = Math.floor(sorted.length / 2);
+            const medianShadowRatio = sorted.length % 2 === 0 
+              ? (sorted[mid - 1] + sorted[mid]) / 2 
+              : sorted[mid];
+            
+            // Calculate percentage of "clean" candles (shadow ratio < 0.4)
+            const cleanCount = ratios.filter(r => r < 0.4).length;
+            const cleanCandlePct = cleanCount / ratios.length;
+            
+            // Calculate multiplier
+            // avgShadowRatio = 0.0 → mult = 1.20 (cleanest, best)
+            // avgShadowRatio = 0.3 → mult = 1.08
+            // avgShadowRatio = 0.5 → mult = 1.00 (neutral)
+            // avgShadowRatio = 0.7 → mult = 0.92
+            // avgShadowRatio = 1.0 → mult = 0.80 (worst)
+            const shadowMult = clamp(1.2 - (avgShadowRatio * 0.4), 0.80, 1.20);
+            
+            return {
+              avgShadowRatio: +avgShadowRatio.toFixed(4),
+              medianShadowRatio: +medianShadowRatio.toFixed(4),
+              cleanCandlePct: +cleanCandlePct.toFixed(4),
+              shadowMult: +shadowMult.toFixed(4),
+              candlesAnalyzed: ratios.length
+            };
+          }
+
+          // Fetch and analyze shadows for a symbol
+          async function getSymbolShadowAnalysis(symbol) {
+            try {
+              const candles = await fetchBybit1mKlines(symbol);
+              if (!candles) {
+                return { avgShadowRatio: 0.5, medianShadowRatio: 0.5, cleanCandlePct: 0.5, shadowMult: 1.0, source: "fallback" };
+              }
+              const analysis = analyzeShadows(candles);
+              return { ...analysis, source: "bybit" };
+            } catch (e) {
+              return { avgShadowRatio: 0.5, medianShadowRatio: 0.5, cleanCandlePct: 0.5, shadowMult: 1.0, source: "error" };
+            }
+          }
+
           // Calculate basis (futures premium over spot)
           function calculateBasis(futuresPrice, spotPrice) {
             if (!futuresPrice || !spotPrice || spotPrice <= 0) return { basis: 0, basis_bps: 0 };
@@ -754,53 +894,6 @@ jobs:
               basis,
               basis_bps: Math.round(basis * 10000)
             };
-          }
-          
-          async function fetchGoldenMetricsWithSpread(symbol) {
-            try {
-              // Fetch all data in parallel
-              const [kline, funding, oiHist, spot, ticker] = await Promise.all([
-                fetchBinance1hKline(symbol),
-                fetchBinanceFundingRate(symbol),
-                fetchBinanceOIHist(symbol),
-                fetchBinanceSpotPrice(symbol),
-                fetchBinanceFuturesTicker(symbol)  // NEW: fetch spread data here
-              ]);
-              
-              if (!kline) return null;
-              
-              const basisInfo = calculateBasis(funding?.markPrice, spot?.spotPrice);
-              
-              // Calculate spread
-              let spread_bps = 999; // Default high (bad)
-              let mid = funding?.markPrice || kline.currClose || 0;
-              if (ticker?.bid && ticker?.ask && ticker.bid > 0) {
-                mid = (ticker.bid + ticker.ask) / 2;
-                spread_bps = Math.round(((ticker.ask - ticker.bid) / mid) * 10000);
-              }
-              
-              return {
-                symbol,
-                vol_1h_pct: kline.vol1hPct || 0,
-                price_change_1h: kline.priceChange1h || 0,
-                funding_rate: Math.abs(funding?.lastFundingRate || 0),
-                funding_rate_raw: funding?.lastFundingRate || 0,
-                oi_delta_pct: Math.max(oiHist?.oiDelta1hPct || 0, oiHist?.oiDelta2hPct || 0),
-                oi_delta_1h_pct: oiHist?.oiDelta1hPct || 0,
-                oi_delta_2h_pct: oiHist?.oiDelta2hPct || 0,
-                current_oi_usd: oiHist?.currentOI_USD || 0,
-                volume_1h_usd: kline.volume1hUSD || 0,
-                mark_price: mid,
-                spot_price: spot?.spotPrice || 0,
-                basis_bps: basisInfo.basis_bps,
-                spread_bps,  // NEW: spread included
-                bid: ticker?.bid || 0,
-                ask: ticker?.ask || 0,
-                ts: Date.now()
-              };
-            } catch (e) {
-              return null;
-            }
           }
 
           // Fetch all 4 golden metrics for a symbol
@@ -848,18 +941,11 @@ jobs:
             const oiNorm = Math.tanh((metrics.oi_delta_pct || 0) / IDEAL_OI_DELTA_PCT);
             const volUsdNorm = Math.tanh((metrics.volume_1h_usd || 0) / IDEAL_VOLUME_1H_USD);
             
-            // NEW: Spread score (lower spread = higher score)
-            // spread_bps of 3 or less = 1.0, spread of 15+ = ~0
-            const spreadScore = metrics.spread_bps != null 
-              ? Math.max(0, 1 - (metrics.spread_bps - IDEAL_SPREAD_BPS) / 12)
-              : 0.5;
-            
             const rawScore = 
               WEIGHT_VOL_1H * volNorm +
               WEIGHT_FUNDING * fundingNorm +
               WEIGHT_OI_DELTA * oiNorm +
-              WEIGHT_VOLUME * volUsdNorm +
-              WEIGHT_SPREAD * spreadScore;  // NEW
+              WEIGHT_VOLUME * volUsdNorm;
             
             const confidence = Math.round(rawScore * 100);
             
@@ -1685,25 +1771,19 @@ jobs:
             const BATCH_DELAY = 300;
             const allMetrics = [];
             
-            // FIRST: Filter out cooldown symbols completely
-            const eligibleSymbols = binanceSymbols.filter(sym => {
-              const lastTs = state.cooldown?.[sym.base] || 0;
-              if (lastTs && (Date.now() - lastTs) < COOLDOWN_MS) {
-                return false; // Skip cooldown symbols
-              }
-              return true;
-            });
-            
-            log(`📋 Eligible symbols after cooldown filter: ${eligibleSymbols.length}/${binanceSymbols.length}`);
-
-            // NOW loop over eligibleSymbols instead of binanceSymbols
-            for (let i = 0; i < eligibleSymbols.length; i += BATCH_SIZE) {
-              const batch = eligibleSymbols.slice(i, i + BATCH_SIZE);
+            for (let i = 0; i < binanceSymbols.length; i += BATCH_SIZE) {
+              const batch = binanceSymbols.slice(i, i + BATCH_SIZE);
               
               const batchResults = await Promise.all(
                 batch.map(async (sym) => {
                   try {
-                    const metrics = await fetchGoldenMetricsWithSpread(sym.symbol);
+                    // Check cooldown first
+                    const lastTs = state.cooldown?.[sym.base] || 0;
+                    if (lastTs && (Date.now() - lastTs) < COOLDOWN_MS) {
+                      return null; // Skip cooldown symbols
+                    }
+                    
+                    const metrics = await fetchGoldenMetrics(sym.symbol);
                     if (!metrics) return null;
                     
                     return {
@@ -1724,111 +1804,296 @@ jobs:
               }
               
               // Rate limit pause between batches
-              if (i + BATCH_SIZE < eligibleSymbols.length) {
+              if (i + BATCH_SIZE < binanceSymbols.length) {
                 await sleep(BATCH_DELAY);
               }
             }
             
-            log(`📈 Fetched metrics for ${allMetrics.length}/${eligibleSymbols.length} symbols`);
+            log(`📈 Fetched metrics for ${allMetrics.length}/${binanceSymbols.length} symbols`);
 
             // ========== RANK BY HEDGE CONFIDENCE ==========
             // Sort by hedge confidence (highest first)
             allMetrics.sort((a, b) => b.hedge_confidence - a.hedge_confidence);
-
-            // ========== SIMPLE SELECTION: JUST TAKE TOP N FROM TOP 10 ==========
-            const TOP_10_COUNT = 10;
-            const topCandidates = allMetrics.slice(0, TOP_10_COUNT);
-
-            log("🏆 Top 10 by hedge confidence (includes spread):");
-            for (let i = 0; i < topCandidates.length; i++) {
-              const m = topCandidates[i];
-              log(`   ${i+1}. ${m.symbol} conf=${m.hedge_confidence} vol1h=${m.vol_1h_pct.toFixed(2)}% fund=${(m.funding_rate*100).toFixed(4)}% oi_delta=${m.oi_delta_pct.toFixed(1)}% vol=$${Math.round(m.volume_1h_usd/1e6)}M spread=${m.spread_bps}bps`);
+            
+            // Log top 10 for debugging
+            log("🏆 Top 10 by hedge confidence:");
+            for (let i = 0; i < Math.min(10, allMetrics.length); i++) {
+              const m = allMetrics[i];
+              log(`   ${i+1}. ${m.symbol} conf=${m.hedge_confidence} vol1h=${m.vol_1h_pct.toFixed(2)}% fund=${(m.funding_rate*100).toFixed(4)}% oi_delta=${m.oi_delta_pct.toFixed(1)}% vol=$${Math.round(m.volume_1h_usd/1e6)}M`);
             }
 
-            // BTC regime for side selection
+            // ========== SELECT TOP CANDIDATES FOR DETAILED ANALYSIS ==========
+            const MAX_DETAILED = 30;
+            const topCandidates = allMetrics.slice(0, MAX_DETAILED);
+            
+            // BTC regime detection (using Binance data)
             const btcMetrics = allMetrics.find(m => m.symbol === "BTCUSDT");
             const btcUp1h = btcMetrics ? (btcMetrics.price_change_1h > 0) : true;
-
-            // Simply take TOP_N from Top 10 (no re-ranking)
-            const TARGET_TOP_N = Math.max(1, TOP_N || 3);
-            let selected = [];
-
+            
+            // ========== DETAILED REFINEMENT WITH BINANCE DATA ==========
+            const refined = [];
+            
+            let candIndex = 0;
             for (const cand of topCandidates) {
-              if (selected.length >= TARGET_TOP_N) break;
-              
-              // Diversity: don't pick same base twice
-              if (selected.some(s => s.base === cand.base)) continue;
-              
-              // Determine side based on funding (short positive funding, long negative)
-              const side = cand.funding_rate_raw > 0 ? "short" : "long";
-              
-              // Simple TP/SL based on volatility
-              const atr_bps = Math.round(cand.vol_1h_pct * 100);
-              const tp_bps = Math.max(30, Math.round(atr_bps * 0.9));
-              const sl_bps = Math.min(80, Math.max(20, Math.round(atr_bps * 0.5)));
-              
-              // Estimate cost
-              const cost_bps = COST_BPS + Math.round(cand.spread_bps / 2);
-              
-              // Simple EV (must be positive)
-              const p_win = 0.50 + 0.15 * Math.tanh(cand.vol_1h_pct / 3);
-              const ev_bps = Math.round(p_win * tp_bps - (1 - p_win) * sl_bps - cost_bps);
-              
-              if (ev_bps < 0) {
-                log(`   ⏭️  Skip ${cand.symbol}: negative EV (${ev_bps}bps)`);
-                continue;
-              }
-              
-              selected.push({
-                symbol: cand.symbol,
-                base: cand.base,
-                quote: cand.quote,
-                side,
+              try {
+                // Small delay every 5 candidates to avoid rate limits on Bybit
+                if (candIndex > 0 && candIndex % 5 === 0) {
+                  await sleep(200);
+                }
+                candIndex++;
                 
-                mark_price: cand.mark_price,
-                spread_bps: cand.spread_bps,
+                // Fetch BINANCE execution quality data (depth, spread)
+                const ticker = await fetchBinanceFuturesTicker(cand.symbol);
+                const depth = await fetchBinanceFuturesDepth(cand.symbol);
                 
-                tp_bps,
-                sl_bps,
-                cost_bps,
-                rrr: +(tp_bps / sl_bps).toFixed(2),
+                let spreadBps = 5; // Default
+                let mid = cand.mark_price;
                 
-                p_win: +p_win.toFixed(3),
-                p_lcb: +p_win.toFixed(3),
-                p_raw: +p_win.toFixed(3),
-                ev_bps,
-                exp_lcb_bps: ev_bps,
+                if (ticker?.bid && ticker?.ask) {
+                  const bid = ticker.bid;
+                  const ask = ticker.ask;
+                  mid = (bid + ask) / 2;
+                  spreadBps = Math.round(((ask - bid) / mid) * 10000);
+                }
                 
-                regime: "hedge",
-                style: "hedge",
+                // Calculate OBI and slip estimation using Binance depth
+                const obi = computeOBI(depth, OBI_TOPN);
                 
-                // Golden metrics (preserved)
-                vol_1h_pct: cand.vol_1h_pct,
-                funding_rate: cand.funding_rate,
-                funding_rate_raw: cand.funding_rate_raw,
-                oi_delta_pct: cand.oi_delta_pct,
-                volume_1h_usd: cand.volume_1h_usd,
-                basis_bps: cand.basis_bps,
-                current_oi_usd: cand.current_oi_usd,
+                const sideSlipL = slipFromDepth(depth, mid, "long", NOTIONAL);
+                const sideSlipS = slipFromDepth(depth, mid, "short", NOTIONAL);
+                const slipL = sideSlipL?.slip_bps ?? Math.round(spreadBps / 2);
+                const slipS = sideSlipS?.slip_bps ?? Math.round(spreadBps / 2);
                 
-                confidence: cand.hedge_confidence,
-                hedge_confidence: cand.hedge_confidence,
+                const costLong = COST_BPS + slipL;
+                const costShort = COST_BPS + slipS;
                 
-                hold_sec: 3600,
+                // Depth quality
+                const d1 = depthWithinPctUSD(depth, mid, 0.01);
+                const depth1pUSD = (d1.asksUSD || 0) + (d1.bidsUSD || 0);
                 
-                reasons: reasonBuilder({
+                // Determine regime based on volatility and funding
+                const regime = (cand.vol_1h_pct >= 1.5 && Math.abs(cand.funding_rate) >= 0.0003) ? "trend" : "meanrevert";
+                
+                // Get calibrated probabilities
+                const coeffL = getCoeffs(state, "long", regime);
+                const coeffS = getCoeffs(state, "short", regime);
+                const nL = Math.max(1, Math.min(500, coeffL?.n || 0));
+                const nS = Math.max(1, Math.min(500, coeffS?.n || 0));
+                
+                // Base probability from golden metrics
+                const pBase = 0.45 + 0.35 * Math.tanh(cand.vol_1h_pct / 3);
+                
+                // Direction bias from funding rate
+                const fundingBias = -Math.sign(cand.funding_rate_raw) * Math.min(0.15, Math.abs(cand.funding_rate_raw) * 100);
+                
+                const pLong0 = clamp(pBase + fundingBias, 0.30, 0.85);
+                const pShort0 = clamp(pBase - fundingBias, 0.30, 0.85);
+                
+                const pLong = calibrateP(state, "long", regime, pLong0);
+                const pShort = calibrateP(state, "short", regime, pShort0);
+                const pLong_lcb = wilsonLCB(pLong, nL, WILSON_Z);
+                const pShort_lcb = wilsonLCB(pShort, nS, WILSON_Z);
+                
+                // ATR estimation from 1h volatility
+                const atr_bps = Math.round(cand.vol_1h_pct * 100);
+                
+                // TP/SL based on volatility
+                const MAX_SL_BPS = 80;
+                let candLong = null, candShort = null;
+                
+                if (DIRECTION !== "short") {
+                  let tp = Math.round(atr_bps * LONG_BOUNCE_TP_ATR);
+                  let sl = Math.round(atr_bps * LONG_BOUNCE_SL_ATR);
+                  sl = Math.min(sl, MAX_SL_BPS);
+                  tp = Math.max(tp, Math.round(sl * 1.5));
+                  
+                  const evLCB = Math.round(pLong_lcb * tp - (1 - pLong_lcb) * sl - costLong);
+                  const edgeL = tp / Math.max(1, LONG_EDGE_MULT_MIN * costLong);
+                  const evScoreL = evLCB / Math.max(8, EXP_LCB_MIN_BPS_BASE);
+                  const viabMultL = clamp(0.5 * clamp(edgeL, 0.3, 1.4) + 0.5 * clamp(evScoreL, 0.3, 1.4), 0.3, 1.3);
+                  
+                  candLong = {
+                    side: "long",
+                    p_lcb: pLong_lcb,
+                    p_raw: pLong0,
+                    ev_bps: evLCB,
+                    exp_lcb_bps: evLCB,
+                    tp_bps: tp,
+                    sl_bps: sl,
+                    cost_bps: costLong,
+                    style: "hedge",
+                    regime,
+                    viab_mult: viabMultL
+                  };
+                }
+                
+                if (DIRECTION !== "long") {
+                  let tp = Math.round(atr_bps * 1.0);
+                  let sl = Math.round(atr_bps * 0.5);
+                  sl = Math.min(sl, MAX_SL_BPS);
+                  tp = Math.max(tp, Math.round(sl * 1.5));
+                  
+                  const evLCB = Math.round(pShort_lcb * tp - (1 - pShort_lcb) * sl - costShort);
+                  const edgeS = tp / Math.max(1, 4 * costShort);
+                  const evScoreS = evLCB / Math.max(8, EXP_LCB_MIN_BPS_BASE);
+                  const viabMultS = clamp(0.5 * clamp(edgeS, 0.3, 1.4) + 0.5 * clamp(evScoreS, 0.3, 1.4), 0.3, 1.3);
+                  
+                  candShort = {
+                    side: "short",
+                    p_lcb: pShort_lcb,
+                    p_raw: pShort0,
+                    ev_bps: evLCB,
+                    exp_lcb_bps: evLCB,
+                    tp_bps: tp,
+                    sl_bps: sl,
+                    cost_bps: costShort,
+                    style: "hedge",
+                    regime,
+                    viab_mult: viabMultS
+                  };
+                }
+                
+                // Choose better side
+                const chosen = candLong && candShort
+                  ? (candLong.exp_lcb_bps >= candShort.exp_lcb_bps ? candLong : candShort)
+                  : (candLong || candShort || null);
+                
+                if (!chosen) continue;
+                
+                // ========== FINAL CONFIDENCE CALCULATION ==========
+                // Base from golden 4 metrics (already 0-100)
+                const baseConf = cand.hedge_confidence;
+                
+                // Execution quality multipliers
+                const spreadMult = clamp(1 - Math.max(0, (spreadBps - 5)) / 30, 0.5, 1.1);
+                const depthMult = clamp(depth1pUSD / Math.max(1, DEPTH_1P_MIN_USD), 0.3, 1.2);
+                const slipMult = clamp(1 - Math.max(0, (chosen.cost_bps - COST_BPS)) / 25, 0.5, 1.1);
+                const oiMult = clamp(cand.current_oi_usd / 50_000_000, 0.4, 1.3);
+                
+                // EV multiplier
+                const evMult = clamp(chosen.viab_mult || 1, 0.3, 1.3);
+                
+                // Direction bias for BTC regime
+                const btcMult = (chosen.side === "long" && !btcUp1h) ? 0.85 : 1.0;
+                
+                // Funding alignment bonus
+                const fundingAlignBonus = (
+                  (chosen.side === "short" && cand.funding_rate_raw > 0) ||
+                  (chosen.side === "long" && cand.funding_rate_raw < 0)
+                ) ? 1.1 : 1.0;
+                
+                // Shadow analysis from Bybit 1m candles
+                const shadowAnalysis = await getSymbolShadowAnalysis(cand.symbol);
+                const shadowMult = shadowAnalysis.shadowMult;
+
+                // Final confidence
+                const finalConf = Math.round(
+                  baseConf * spreadMult * depthMult * slipMult * oiMult * evMult * btcMult * fundingAlignBonus * shadowMult
+                );
+                
+                // Build reasons
+                const reasons = reasonBuilder({
                   vol_1h_pct: cand.vol_1h_pct,
                   funding_rate: cand.funding_rate,
                   oi_delta_pct: cand.oi_delta_pct,
                   volume_1h_usd: cand.volume_1h_usd,
-                  basis_bps: cand.basis_bps
-                }),
+                  basis_bps: cand.basis_bps,
+                  clean_candle_pct: shadowAnalysis.cleanCandlePct
+                });
                 
-                ret5: []
-              });
-            }
+                refined.push({
+                  symbol: cand.symbol,
+                  base: cand.base,
+                  quote: cand.quote,
+                  
+                  side: chosen.side,
+                  p_lcb: +chosen.p_lcb.toFixed(3),
+                  p_raw: +chosen.p_raw.toFixed(3),
+                  exp_bps: chosen.ev_bps,
+                  exp_lcb_bps: chosen.exp_lcb_bps,
+                  tp_bps: chosen.tp_bps,
+                  sl_bps: chosen.sl_bps,
+                  rrr: +(chosen.tp_bps / Math.max(1, chosen.sl_bps)).toFixed(2),
+                  spread_bps: spreadBps,
+                  cost_bps: chosen.cost_bps,
+                  atr_bps,
+                  regime: chosen.regime,
+                  style: chosen.style,
+                  
+                  // Golden metrics
+                  vol_1h_pct: cand.vol_1h_pct,
+                  funding_rate: cand.funding_rate,
+                  funding_rate_raw: cand.funding_rate_raw,
+                  oi_delta_pct: cand.oi_delta_pct,
+                  volume_1h_usd: cand.volume_1h_usd,
+                  basis_bps: cand.basis_bps,
+                  current_oi_usd: cand.current_oi_usd,
+                  
+                  // Prices
+                  mark_price: cand.mark_price,
+                  spot_price: cand.spot_price,
+                  
+                  // Execution quality
+                  depth1p_usd: depth1pUSD,
+                  obi,
+                  slip_est: chosen.side === "long" ? slipL : slipS,
+                  
+                  // Shadow analysis
+                  shadow_analysis: shadowAnalysis,
+                  shadow_mult: shadowMult,
 
-            log(`✅ Selected ${selected.length} ideas (TOP ${TARGET_TOP_N} from Top 10)`);
+                  // TTL (max 2 hours for hedge trades)
+                  hold_sec: clamp(3600, TTL_MIN, TTL_MAX), // Default 1 hour
+                  
+                  confidence: clamp(finalConf, 0, 100),
+                  hedge_confidence: cand.hedge_confidence,
+                  reasons,
+                  
+                  ret5: [] // Simplified
+                });
+                
+              } catch (e) {
+                log(`Refine error for ${cand.symbol}:`, e?.message || e);
+              }
+            }
+            
+            log(`🔍 Refined ${refined.length} candidates with execution quality + shadow analysis`);
+
+            // Log shadow stats for top 5
+            const shadowStats = refined.slice(0, 5).map(r => 
+              `${r.symbol}: shadow=${(r.shadow_analysis?.avgShadowRatio || 0.5).toFixed(2)} mult=${(r.shadow_mult || 1).toFixed(2)} clean=${((r.shadow_analysis?.cleanCandlePct || 0.5) * 100).toFixed(0)}%`
+            );
+            log(`📊 Shadow analysis (top 5): ${shadowStats.join(" | ")}`);
+
+            // ========== FINAL SELECTION ==========
+            refined.sort((a, b) => b.confidence - a.confidence);
+            
+            const TARGET_TOP_N = Math.max(1, TOP_N || 3);
+            
+            const selected = [];
+            for (const cand of refined) {
+              if (selected.length >= TARGET_TOP_N) break;
+              
+              // Simple diversity: don't pick same base twice
+              const alreadyHaveBase = selected.some(s => s.base === cand.base);
+              if (!alreadyHaveBase) {
+                selected.push(cand);
+              }
+            }
+            
+            // Fill remaining slots if needed
+            if (selected.length < TARGET_TOP_N) {
+              const haveSyms = new Set(selected.map(s => s.symbol));
+              for (const c of refined) {
+                if (selected.length >= TARGET_TOP_N) break;
+                if (!haveSyms.has(c.symbol)) {
+                  selected.push(c);
+                  haveSyms.add(c.symbol);
+                }
+              }
+            }
+            
+            log(`✅ Selected ${selected.length} ideas for pushing`);
 
             // ========== GENERATE FLIPPED IDEAS ==========
             const flipped = selected.map(orig => ({
@@ -1899,7 +2164,7 @@ jobs:
                 sl_bps: x.sl_bps,
                 rrr: x.rrr,
                 exp_lcb_bps: x.exp_lcb_bps,
-                ev_bps: x.ev_bps,
+                ev_bps: x.exp_bps,
                 cost_bps: x.cost_bps,
 
                 p_win: x.p_lcb,
@@ -1924,7 +2189,13 @@ jobs:
                   oi_delta_pct: x.oi_delta_pct,
                   volume_1h_usd: x.volume_1h_usd,
                   basis_bps: x.basis_bps,
-                  hedge_confidence: x.hedge_confidence
+                  hedge_confidence: x.hedge_confidence,
+                  
+                  // Shadow analysis from Bybit
+                  shadow_avg_ratio: x.shadow_analysis?.avgShadowRatio,
+                  shadow_clean_pct: x.shadow_analysis?.cleanCandlePct,
+                  shadow_mult: x.shadow_mult,
+                  shadow_source: x.shadow_analysis?.source
                 },
 
                 confidence: x.confidence,
@@ -2101,6 +2372,9 @@ jobs:
               funding_rate: +(p.predicted?.funding_rate || 0).toFixed(5),
               oi_delta_pct: +(p.predicted?.oi_delta_pct || 0).toFixed(1),
               volume_1h_usd: Math.round((p.predicted?.volume_1h_usd || 0) / 1e6) + "M",
+              shadow_avg: +(p.predicted?.shadow_avg_ratio || 0.5).toFixed(2),
+              shadow_clean_pct: +((p.predicted?.shadow_clean_pct || 0.5) * 100).toFixed(0),
+              shadow_mult: +(p.predicted?.shadow_mult || 1).toFixed(2),
               reasons: p.reasons_text,
               p_cal: +p.p_lcb.toFixed(3),
               ev_bps: p.ev_bps,
@@ -2120,6 +2394,7 @@ jobs:
               counts: {
                 binance_universe: binanceSymbols.length,
                 metrics_fetched: allMetrics.length,
+                refined: refined.length,
                 selected: picks.length
               },
               dd_gate: { pnl24_bps, peak_dd_bps, throttle },
