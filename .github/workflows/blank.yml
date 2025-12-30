@@ -1868,6 +1868,7 @@ jobs:
                 volume_1h_usd: cand.volume_1h_usd,
                 basis_bps: cand.basis_bps,
                 current_oi_usd: cand.current_oi_usd,
+                spot_price: cand.spot_price,
                 
                 // Shadow analysis
                 shadow_analysis: shadowAnalysis,
