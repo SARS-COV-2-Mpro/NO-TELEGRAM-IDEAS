@@ -1,0 +1,43 @@
+name: 🔄 A3 Workflow
+
+on:
+  repository_dispatch:
+    types: [run_A3]
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  a3-job:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 🚀 A3 Running
+        run: |
+          echo "⏳ A3 started at $(date)"
+          # Your 8 min work here
+          sleep 480  # 8 minutes
+          echo "✅ A3 finished at $(date)"
+
+      - name: ➡️ Trigger A1 + B (Restart Cycle)
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // Trigger A1 (restart cycle)
+            await github.rest.repos.createDispatchEvent({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              event_type: 'run_A1'
+            });
+            console.log('✅ Triggered A1');
+            
+            // Trigger B
+            await github.rest.repos.createDispatchEvent({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              event_type: 'run_B'
+            });
+            console.log('✅ Triggered B');
