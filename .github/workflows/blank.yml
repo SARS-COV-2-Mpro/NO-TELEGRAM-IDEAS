@@ -245,7 +245,7 @@ jobs:
           const MEXC_BASES=[process.env.MEXC_BASE,"https://api.mexc.com","https://www.mexc.com"].filter(Boolean);
 
           // Bybit endpoints (public, no API key needed)
-          const BYBIT_BASE = "https://api.bybit.com";
+          const BYBIT_BASE = "https://lonely-manya-mazetofutures-c11b521d.koyeb.app/mainnet";
           
           const MIN_TF_ALIGN=(Number(process.env.MIN_TF_ALIGN||"0.60"));
           let TF_WEIGHTS={}; try{ TF_WEIGHTS=JSON.parse(process.env.TF_WEIGHTS||"{}"); }catch{ TF_WEIGHTS={}; }
