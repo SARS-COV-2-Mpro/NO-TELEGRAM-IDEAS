@@ -11,7 +11,7 @@ permissions:
 jobs:
   a2:
     runs-on: ubuntu-latest
-    timeout-minutes: 15  # Also reduced from 20
+    timeout-minutes: 10  # Also reduced from 20
 
     steps:
       - name: 🚀 A2 Work
