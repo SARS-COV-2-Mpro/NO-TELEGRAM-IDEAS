@@ -2472,7 +2472,7 @@ jobs:
             mkdir -p /tmp
             : > /tmp/push_resp.txt
             http_code=$(curl -g -sS -o /tmp/push_resp.txt -w "%{http_code}" -X POST \
-              -H "Content-Type": "application/json" \
+              -H "Content-Type: application/json" \
               -H "Authorization: Bearer ${PUSH_TOKEN}" \
               --data-raw "${payload}" \
               --max-time 12 \
