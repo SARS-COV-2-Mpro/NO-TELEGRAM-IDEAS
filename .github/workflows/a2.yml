@@ -1,4 +1,4 @@
-name: 🔄 A2 (10 min)
+name: 🔄 A2 (8 min)
 
 on:
   repository_dispatch:
@@ -11,13 +11,13 @@ permissions:
 jobs:
   a2:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15  # Also reduced from 20
 
     steps:
       - name: 🚀 A2 Work
         run: |
           echo "⏳ A2 started at $(date)"
-          sleep 600  # 10 minutes - replace with your actual work
+          sleep 480  # ← Changed from 600 to 480 (8 minutes)
           echo "✅ A2 done at $(date)"
 
       - name: ➡️ Trigger A3
