@@ -245,7 +245,7 @@ jobs:
           const MEXC_BASES=[process.env.MEXC_BASE,"https://api.mexc.com","https://www.mexc.com"].filter(Boolean);
 
           // Bybit endpoints (public, no API key needed)
-          const BYBIT_BASE = "https://lonely-manya-mazetofutures-c11b521d.koyeb.app/mainnet";
+          const BYBIT_BASE = "https://api.bybit.com";
           
           const MIN_TF_ALIGN=(Number(process.env.MIN_TF_ALIGN||"0.60"));
           let TF_WEIGHTS={}; try{ TF_WEIGHTS=JSON.parse(process.env.TF_WEIGHTS||"{}"); }catch{ TF_WEIGHTS={}; }
@@ -308,10 +308,10 @@ jobs:
           const LONG_SIMILARITY_RHO=Number(process.env.LONG_SIMILARITY_RHO||"0.84");
 
           // Golden 4 metrics ideal thresholds (for confidence scoring, NOT gates)
-          const IDEAL_VOL_1H_PCT = 2.0;       // |1h price change| >= 2%
-          const IDEAL_FUNDING_RATE = 0.0004;  // |funding| >= 0.04%
-          const IDEAL_OI_DELTA_PCT = 10.0;    // |ΔOI 1-2h| >= 10%
-          const IDEAL_VOLUME_1H_USD = 60_000_000; // 1h volume >= $60M
+          const IDEAL_VOL_15M_PCT = 0.8;       // |15m price change| >= 0.8%
+          const IDEAL_FUNDING_RATE = 0.0004;   // |funding| >= 0.04% (unchanged)
+          const IDEAL_OI_DELTA_PCT = 4.0;      // |ΔOI| >= 4% (reduced for 15m)
+          const IDEAL_VOLUME_15M_USD = 15_000_000; // 15m volume >= $15M
           const IDEAL_SPREAD_BPS = 3;      // Ideal spread <= 3 bps
 
           // Confidence weights for hedge trading (sum = 1.0)
@@ -329,7 +329,7 @@ jobs:
               LONG_DOWN_RSI_CUTOFF, LONG_MR_DIVERGENCE_REQ, LONG_EDGE_MULT_MIN,
               LONG_BOUNCE_SL_ATR, LONG_BOUNCE_TP_ATR, LONG_SIMILARITY_RHO, TOP_N, MAX_SPREAD_BPS,
               EXP_LCB_MIN_BPS_BASE, COST_BPS, NOTIONAL, DEPTH_LIMIT, OBI_TOPN, MIN_TF_ALIGN, TF_WEIGHTS,
-              IDEAL_VOL_1H_PCT, IDEAL_FUNDING_RATE, IDEAL_OI_DELTA_PCT, IDEAL_VOLUME_1H_USD, IDEAL_SPREAD_BPS,
+              IDEAL_VOL_15M_PCT, IDEAL_FUNDING_RATE, IDEAL_OI_DELTA_PCT, IDEAL_VOLUME_15M_USD, IDEAL_SPREAD_BPS,
               WEIGHT_VOL_1H, WEIGHT_FUNDING, WEIGHT_OI_DELTA, WEIGHT_VOLUME, WEIGHT_SPREAD
             };
             return hashObj(knobs);
@@ -532,14 +532,14 @@ jobs:
             return [];
           }
 
-          // Fetch 1h kline for price change % and volume
-          async function fetchBybit1hKline(symbol) {
-            const cacheKey = `bybit_1h_${symbol}`;
+          // Fetch 15m kline for price change % and volume
+          async function fetchBybit15mKline(symbol) {
+            const cacheKey = `bybit_15m_${symbol}`;
             const cached = getCached(cache.bybit, cacheKey, TTL.bybit);
             if (cached) return cached;
             
             try {
-              const url = `${BYBIT_BASE}/v5/market/kline?category=linear&symbol=${symbol}&interval=60&limit=2`;
+              const url = `${BYBIT_BASE}/v5/market/kline?category=linear&symbol=${symbol}&interval=15&limit=2`;
               const response = await fetchWithTimeout(url, {}, 10000);
               if (!response.ok) return null;
               
@@ -729,7 +729,7 @@ jobs:
           async function fetchGoldenMetricsWithSpread(symbol) {
             try {
               const [kline, funding, oiHist, spot] = await Promise.all([
-                fetchBybit1hKline(symbol),
+                fetchBybit15mKline(symbol),
                 fetchBybitFundingRate(symbol),
                 fetchBybitOIHist(symbol),
                 fetchBybitSpotPrice(symbol)
@@ -894,10 +894,10 @@ jobs:
           function calculateHedgeConfidence(metrics) {
             if (!metrics) return 0;
             
-            const volNorm = Math.tanh((metrics.vol_1h_pct || 0) / IDEAL_VOL_1H_PCT);
+            const volNorm = Math.tanh((metrics.vol_1h_pct || 0) / IDEAL_VOL_15M_PCT);
             const fundingNorm = Math.tanh((metrics.funding_rate || 0) / IDEAL_FUNDING_RATE);
             const oiNorm = Math.tanh((metrics.oi_delta_pct || 0) / IDEAL_OI_DELTA_PCT);
-            const volUsdNorm = Math.tanh((metrics.volume_1h_usd || 0) / IDEAL_VOLUME_1H_USD);
+            const volUsdNorm = Math.tanh((metrics.volume_1h_usd || 0) / IDEAL_VOLUME_15M_USD);
             
             // NEW: Spread score (lower spread = higher score)
             // spread_bps of 3 or less = 1.0, spread of 15+ = ~0
@@ -1729,7 +1729,7 @@ jobs:
             const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
             const throttle=(pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
 
-            // ========== FETCH GOLDEN METRICS FOR ALL BINANCE SYMBOLS ==========
+            // ========== FETCH GOLDEN METRICS FOR ALL BYBIT SYMBOLS ==========
             log("📊 Fetching golden metrics for all symbols...");
             
             const BATCH_SIZE = 15;
@@ -2211,10 +2211,10 @@ jobs:
               idea_logs: ideaLogs,
               calibration_health: calibHealth,
               golden_metrics_config: {
-                ideal_vol_1h_pct: IDEAL_VOL_1H_PCT,
+                ideal_vol_1h_pct: IDEAL_VOL_15M_PCT,
                 ideal_funding_rate: IDEAL_FUNDING_RATE,
                 ideal_oi_delta_pct: IDEAL_OI_DELTA_PCT,
-                ideal_volume_1h_usd: IDEAL_VOLUME_1H_USD,
+                ideal_volume_1h_usd: IDEAL_VOLUME_15M_USD,
                 weights: {
                   vol_1h: WEIGHT_VOL_1H,
                   funding: WEIGHT_FUNDING,
