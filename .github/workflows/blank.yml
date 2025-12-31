@@ -2,7 +2,7 @@ name: Ideas Pusher (BYBIT Ultimate 7.7.7)
 
 on:
   schedule:
-    - cron: "*/25 * * * *"
+    - cron: "*/30 * * * *"
   repository_dispatch:
     types: [run_B]
   workflow_dispatch: {}
@@ -534,12 +534,12 @@ jobs:
 
           // Fetch 1h kline for price change % and volume
           async function fetchBybit1hKline(symbol) {
-            const cacheKey = `bybit_15m_${symbol}`;
+            const cacheKey = `bybit_1h_${symbol}`;
             const cached = getCached(cache.bybit, cacheKey, TTL.bybit);
             if (cached) return cached;
             
             try {
-              const url = `${BYBIT_BASE}/v5/market/kline?category=linear&symbol=${symbol}&interval=15&limit=2`;
+              const url = `${BYBIT_BASE}/v5/market/kline?category=linear&symbol=${symbol}&interval=60&limit=2`;
               const response = await fetchWithTimeout(url, {}, 10000);
               if (!response.ok) return null;
               
