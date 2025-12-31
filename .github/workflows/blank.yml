@@ -243,8 +243,8 @@ jobs:
           const BYBIT_SECRET_KEY = process.env.BYBIT_SECRET_KEY || "";
           
           // Bybit endpoints
-          const BYBIT_API = process.env.BYBIT_BASE || "https://api.bybit.com";
-          const BYBIT_SPOT = process.env.BYBIT_BASE || "https://api.bybit.com";
+          const BYBIT_API = process.env.BYBIT_BASE || "https://lonely-manya-mazetofutures-c11b521d.koyeb.app/mainnet";
+          const BYBIT_SPOT = process.env.BYBIT_BASE || "https://lonely-manya-mazetofutures-c11b521d.koyeb.app/mainnet";
           
           const MIN_TF_ALIGN=(Number(process.env.MIN_TF_ALIGN||"0.60"));
           let TF_WEIGHTS={}; try{ TF_WEIGHTS=JSON.parse(process.env.TF_WEIGHTS||"{}"); }catch{ TF_WEIGHTS={}; }
