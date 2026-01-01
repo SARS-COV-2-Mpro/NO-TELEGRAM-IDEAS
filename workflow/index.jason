@@ -1,1 +1,3424 @@
-n
+// ============================================================
+// BYBIT FUTURES EXECUTOR - POSITION IDENTITY SYSTEM v1.0
+// PRODUCTION-READY HEDGE MODE IMPLEMENTATION
+// 20-STAGE TRAILING SYSTEM (MICRO + BASE + MINOR + MAJOR + 15 ULTRA)
+// ============================================================
+
+// ============================================================
+// GLOBAL VARIABLES
+// ============================================================
+
+let GIST_STATE_CACHE = null;
+let GIST_STATE_DIRTY = false;
+let TIME_OFFSET = 0;
+
+let EXINFO_CACHE = { ts: 0, symbols: [], bySymbol: {} };
+let MARKET_INFO_CACHE = new Map();
+
+// Cache hedge-mode enablement per symbol to avoid repeated switch calls
+let SYMBOL_HEDGE_CACHE = new Map();
+
+// ============================================================
+// CONSTANTS
+// ============================================================
+
+const INTER_ORDER_SLEEP = 200;
+const INTER_TPSL_SLEEP = 250;
+
+const MAX_EXECUTION_TIME = 50000;        // 50 seconds for full cycle
+const MAX_MONITOR_TIME = 55000;          // 55 seconds for monitor
+
+const RECV_WINDOW = 5000;                // Bybit typical recvWindow
+const PLANNED_IDEA_TTL = 30 * 60 * 1000; // 30 minutes
+
+const MAKER_OFFSET_BPS = 2;              // 0.02% from market price
+const MAKER_ORDER_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const MIN_REARM_INTERVAL = 3 * 60 * 1000; // 3 minutes
+
+const MAX_RETRIES = 3;
+const RETRY_DELAY_BASE = 300;
+
+// ============================================================
+// BYBIT CONSTANTS
+// ============================================================
+
+const BYBIT_CATEGORY = 'linear';
+
+// Bybit hedge identifiers
+const POSITION_IDX = Object.freeze({
+  ONE_WAY: 0,
+  LONG: 1,
+  SHORT: 2
+});
+
+// ============================================================
+// INTERNAL POSITION SIDES (IMMUTABLE)
+// ============================================================
+
+const POSITION_SIDES = Object.freeze({
+  LONG: 'LONG',
+  SHORT: 'SHORT'
+});
+
+// ============================================================
+// CORE IDENTITY FUNCTIONS
+// ============================================================
+
+function normalizeSide(side) {
+  if (!side) throw new Error('Side is required but got: ' + side);
+  const s = String(side).trim().toUpperCase();
+
+  if (s === 'BUY' || s === 'LONG') return POSITION_SIDES.LONG;
+  if (s === 'SELL' || s === 'SHORT') return POSITION_SIDES.SHORT;
+
+  if (s === 'BOTH' || s === '0') {
+    throw new Error('Invalid side "BOTH": hedge mode (LONG/SHORT) is required.');
+  }
+
+  throw new Error(`Invalid side: "${side}". Expected: BUY/SELL/LONG/SHORT`);
+}
+
+function normalizeSideSafe(side) {
+  try { return normalizeSide(side); } catch { return null; }
+}
+
+function makePositionKey(symbol, side) {
+  if (!symbol) throw new Error('Symbol is required for position key');
+  const posSide = normalizeSide(side);
+  return `${symbol}:${posSide}`;
+}
+
+function parsePositionKey(key) {
+  if (!key || typeof key !== 'string') throw new Error(`Invalid position key: ${key}`);
+
+  const colonIndex = key.lastIndexOf(':');
+  if (colonIndex === -1) throw new Error(`Invalid position key format (no colon): ${key}`);
+
+  const symbol = key.substring(0, colonIndex);
+  const posSide = key.substring(colonIndex + 1);
+
+  if (!symbol) throw new Error(`Invalid position key (empty symbol): ${key}`);
+  if (posSide !== POSITION_SIDES.LONG && posSide !== POSITION_SIDES.SHORT) {
+    throw new Error(`Invalid positionSide in key: ${key}`);
+  }
+  return { symbol, posSide };
+}
+
+function sideToPositionIdx(side) {
+  const s = normalizeSide(side);
+  return s === POSITION_SIDES.LONG ? POSITION_IDX.LONG : POSITION_IDX.SHORT;
+}
+
+function positionIdxToSide(idx) {
+  const n = Number(idx);
+  if (n === POSITION_IDX.LONG) return POSITION_SIDES.LONG;
+  if (n === POSITION_IDX.SHORT) return POSITION_SIDES.SHORT;
+  throw new Error(`Invalid positionIdx: ${idx}. Expected 1 (Long) or 2 (Short)`);
+}
+
+// Bybit order side strings
+function getOpenOrderSide(posSide) {
+  const s = normalizeSide(posSide);
+  return s === POSITION_SIDES.LONG ? 'Buy' : 'Sell';
+}
+function getCloseOrderSide(posSide) {
+  const s = normalizeSide(posSide);
+  return s === POSITION_SIDES.LONG ? 'Sell' : 'Buy';
+}
+
+function isLongSide(side) {
+  try { return normalizeSide(side) === POSITION_SIDES.LONG; } catch { return false; }
+}
+
+// ============================================================
+// POSITION VALIDATION & CREATION
+// ============================================================
+
+function validatePosition(pos) {
+  if (!pos) throw new Error('Position is null/undefined');
+  if (!pos.symbol) throw new Error('Position missing symbol');
+  if (!pos.positionSide) throw new Error(`Position ${pos.symbol} missing positionSide`);
+  if (pos.positionSide !== POSITION_SIDES.LONG && pos.positionSide !== POSITION_SIDES.SHORT) {
+    throw new Error(`Position ${pos.symbol} has invalid positionSide: ${pos.positionSide}`);
+  }
+  if (!pos.positionKey) throw new Error(`Position ${pos.symbol} missing positionKey`);
+
+  const expectedKey = makePositionKey(pos.symbol, pos.positionSide);
+  if (pos.positionKey !== expectedKey) {
+    throw new Error(`Position key mismatch: got "${pos.positionKey}", expected "${expectedKey}"`);
+  }
+  return true;
+}
+
+function isValidPosition(pos) {
+  try {
+    validatePosition(pos);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function createPosition(symbol, side, data = {}) {
+  if (!symbol) throw new Error('Symbol is required to create position');
+
+  const posSide = normalizeSide(side);
+  const positionKey = makePositionKey(symbol, posSide);
+
+  const position = {
+    ...data,
+
+    // identity
+    symbol,
+    positionSide: posSide,
+    positionKey,
+
+    // Bybit anchor
+    positionIdx: sideToPositionIdx(posSide),
+
+    // compatibility
+    side_exchange: posSide === POSITION_SIDES.LONG ? 'Buy' : 'Sell',
+    orderSide: getOpenOrderSide(posSide),
+
+    base: data.base || symbol.replace(/(USDT|USDC|USD)$/, ''),
+    quote: data.quote || 'USDT'
+  };
+
+  validatePosition(position);
+  return position;
+}
+
+function migratePosition(legacyPos) {
+  if (!legacyPos) return null;
+
+  try {
+    if (legacyPos.positionKey && legacyPos.positionSide) {
+      validatePosition(legacyPos);
+      return legacyPos;
+    }
+
+    let symbol = legacyPos.symbol || legacyPos.symbolFull;
+    if (!symbol && legacyPos.base) symbol = `${legacyPos.base}USDT`;
+    if (!symbol) return null;
+
+    if (!symbol.endsWith('USDT') && !symbol.endsWith('USDC')) symbol = `${symbol}USDT`;
+
+    let sideHint = legacyPos.positionSide || legacyPos.side_exchange || legacyPos.side;
+    if (!sideHint && legacyPos.positionIdx !== undefined) {
+      sideHint = positionIdxToSide(legacyPos.positionIdx);
+    }
+    if (!sideHint) return null;
+
+    return createPosition(symbol, sideHint, legacyPos);
+  } catch (e) {
+    console.error('[migrate] Error:', e?.message || e, legacyPos);
+    return null;
+  }
+}
+
+// ============================================================
+// SMALL UTILS
+// ============================================================
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json' }
+  });
+}
+
+function toInt(x, d) {
+  const n = parseInt(x, 10);
+  return Number.isFinite(n) ? n : d;
+}
+
+function toNum(x, d) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : d;
+}
+// ============================================================
+// TIME SYNCHRONIZATION
+// ============================================================
+
+async function syncServerTime(env) {
+  try {
+    const baseUrl = (env.BYBIT_BASE_URL || '').trim();
+    if (!baseUrl) return;
+
+    const r = await fetch(`${baseUrl}/v5/market/time`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json'
+      }
+    });
+    
+    const j = await r.json().catch(() => null);
+
+    if (j && j.retCode === 0 && j.result?.timeSecond) {
+      const serverMs = parseInt(j.result.timeSecond, 10) * 1000;
+      TIME_OFFSET = serverMs - Date.now();
+      if (Math.abs(TIME_OFFSET) > 1000) {
+        console.log('[sync] Time offset detected:', TIME_OFFSET, 'ms');
+      }
+    }
+  } catch (e) {
+    console.error('[sync] Failed:', e?.message || e);
+  }
+}
+
+function getTimestamp() {
+  return Date.now() + TIME_OFFSET;
+}
+
+// ============================================================
+// SIGNATURE
+// ============================================================
+
+async function createBybitSignature(timestamp, payload, apiKey, secretKey) {
+  const signString = String(timestamp) + String(apiKey) + String(RECV_WINDOW) + String(payload);
+
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw',
+    enc.encode(secretKey),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+
+  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(signString));
+  return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// ============================================================
+// BYBIT REQUEST CORE
+// ============================================================
+
+async function bybitRequest(endpoint, params, method, env) {
+  const baseUrl = (env.BYBIT_BASE_URL || '').trim();
+  const apiKey = (env.BYBIT_KEY || '').trim();
+  const secretKey = (env.BYBIT_SECRET_KEY || '').trim();
+
+  if (!baseUrl) throw new Error('Missing BYBIT_BASE_URL');
+  if (!apiKey) throw new Error('Missing BYBIT_API_KEY');
+  if (!secretKey) throw new Error('Missing BYBIT_SECRET');
+
+  const timestamp = String(getTimestamp());
+  let url = `${baseUrl}${endpoint}`;
+  let payload = '';
+  let body = null;
+
+  if (method === 'GET') {
+    payload = typeof params === 'string' ? params : '';
+    if (payload) url = `${url}?${payload}`;
+  } else {
+    payload = JSON.stringify(params || {});
+    body = payload;
+  }
+
+  const signature = await createBybitSignature(timestamp, payload, apiKey, secretKey);
+
+  const headers = {
+    'X-BAPI-API-KEY': apiKey,
+    'X-BAPI-TIMESTAMP': timestamp,
+    'X-BAPI-SIGN': signature,
+    'X-BAPI-RECV-WINDOW': String(RECV_WINDOW),
+    'Content-Type': 'application/json',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'application/json',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Cache-Control': 'no-cache'
+  };
+
+  const res = await fetch(url, { method, headers, body });
+
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`Bybit HTTP ${res.status}: ${t.slice(0, 300)}`);
+  }
+
+  const data = await res.json().catch(() => null);
+  if (!data) throw new Error('Bybit returned invalid JSON');
+
+  if (data.retCode !== 0) {
+    throw new Error(`Bybit API ${data.retCode}: ${data.retMsg}`);
+  }
+
+  return data.result;
+}
+
+async function bybitPublicRequest(endpoint, env) {
+  const baseUrl = (env.BYBIT_BASE_URL || '').trim();
+  if (!baseUrl) throw new Error('Missing BYBIT_BASE_URL');
+
+  const res = await fetch(`${baseUrl}${endpoint}`, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'application/json'
+    }
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`Bybit HTTP ${res.status}: ${t.slice(0, 300)}`);
+  }
+
+  const data = await res.json().catch(() => null);
+  if (!data) throw new Error('Bybit returned invalid JSON');
+
+  if (data.retCode !== 0) {
+    throw new Error(`Bybit API ${data.retCode}: ${data.retMsg}`);
+  }
+
+  return data.result;
+}
+
+// ============================================================
+// RETRY WRAPPER
+// ============================================================
+
+async function withRetry(fn, maxRetries = MAX_RETRIES, env = null) {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const msg = e?.message || '';
+
+      if (msg.includes('10002') && env && attempt < maxRetries - 1) {
+        await syncServerTime(env);
+        await sleep(RETRY_DELAY_BASE);
+        continue;
+      }
+
+      if (msg.includes('10006') && attempt < maxRetries - 1) {
+        await sleep(1000);
+        continue;
+      }
+
+      if ((msg.includes('10000') || msg.includes('502') || msg.includes('503') || msg.includes('504')) && attempt < maxRetries - 1) {
+        await sleep(RETRY_DELAY_BASE * (attempt + 1));
+        continue;
+      }
+
+      if (attempt === maxRetries - 1) throw e;
+      await sleep(RETRY_DELAY_BASE * (attempt + 1));
+    }
+  }
+}
+
+// ============================================================
+// HEDGE MODE (PER SYMBOL) + CACHE
+// ============================================================
+
+async function ensureHedgeModeForSymbol(symbol, env) {
+  if (!symbol) return;
+  if (SYMBOL_HEDGE_CACHE.get(symbol) === true) return;
+
+  try {
+    await bybitRequest('/v5/position/switch-mode', {
+      category: BYBIT_CATEGORY,
+      symbol,
+      mode: 3
+    }, 'POST', env);
+
+    SYMBOL_HEDGE_CACHE.set(symbol, true);
+    console.log(`[hedge] ✓ Hedge mode enabled for ${symbol}`);
+  } catch (e) {
+    const msg = e?.message || '';
+
+    if (msg.includes('110025')) {
+      SYMBOL_HEDGE_CACHE.set(symbol, true);
+      console.log(`[hedge] ✓ ${symbol} already in hedge mode`);
+      return;
+    }
+
+    if (msg.includes('110026')) {
+      SYMBOL_HEDGE_CACHE.set(symbol, true);
+      console.warn(`[hedge] ${symbol} margin mode conflict; continuing`);
+      return;
+    }
+
+    if (msg.includes('34036')) {
+      throw new Error(`Cannot change position mode for ${symbol} while positions are open`);
+    }
+
+    throw e;
+  }
+}
+
+async function ensureHedgeMode(env) {
+  try {
+    await ensureHedgeModeForSymbol('BTCUSDT', env);
+  } catch (e) {
+    console.error('[hedge] CRITICAL:', e?.message || e);
+  }
+}
+
+// ============================================================
+// EXCHANGE INFO & SYMBOL RESOLUTION
+// ============================================================
+
+async function getExchangeSymbols(env) {
+  const FRESH_MS = 10 * 60 * 1000;
+  if (EXINFO_CACHE.symbols.length && (Date.now() - EXINFO_CACHE.ts < FRESH_MS)) {
+    return EXINFO_CACHE.symbols;
+  }
+
+  try {
+    const result = await bybitPublicRequest(
+      `/v5/market/instruments-info?category=${BYBIT_CATEGORY}&limit=1000`,
+      env
+    );
+
+    const all = result.list || [];
+    const symbols = all
+      .filter(s => s.status === 'Trading' && s.quoteCoin === 'USDT')
+      .map(s => s.symbol);
+
+    const bySymbol = {};
+    for (const s of all) bySymbol[s.symbol] = s;
+
+    EXINFO_CACHE = { ts: Date.now(), symbols, bySymbol };
+    console.log(`[exsymbols] Cached ${symbols.length} symbols`);
+    return symbols;
+  } catch (e) {
+    console.error('[exsymbols] Error:', e?.message || e);
+    return EXINFO_CACHE.symbols || [];
+  }
+}
+
+function canonicalBase(b) {
+  return (b || '').toString().toUpperCase().replace(/USDT$/, '').trim();
+}
+
+const DEFAULT_ALIAS_MAP = {
+  FLOKI: ['FLOKI', '1000FLOKI'],
+  PEPE: ['PEPE', '1000PEPE'],
+  SHIB: ['1000SHIB', 'SHIB'],
+  BONK: ['BONK', '1000BONK'],
+  SATS: ['SATS', '1000SATS'],
+  CAT: ['CAT', '1000CAT'],
+  RATS: ['RATS', '1000RATS'],
+  CHEEMS: ['CHEEMS', '1000000CHEEMS'],
+  MOG: ['MOG', '1000000MOG']
+};
+
+function parseAliasMap(env) {
+  try {
+    const raw = env.SYMBOL_ALIASES || '{}';
+    const m = JSON.parse(raw);
+    const out = {};
+    for (const [k, arr] of Object.entries(m || {})) {
+      out[k.toUpperCase()] = (arr || []).map(x => canonicalBase(x));
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+async function resolveSymbolSmart(baseOrFull, env) {
+  const base0 = canonicalBase(baseOrFull);
+  if (!base0) return null;
+
+  const aliasMap = { ...DEFAULT_ALIAS_MAP, ...parseAliasMap(env) };
+  const candidates = [];
+  const pushUnique = s => { if (s && !candidates.includes(s)) candidates.push(s); };
+
+  const noNum = base0.replace(/^\d+/, '');
+
+  pushUnique(`${base0}USDT`);
+  if (noNum !== base0) {
+    pushUnique(`${noNum}USDT`);
+    pushUnique(`1000${noNum}USDT`);
+    pushUnique(`100${noNum}USDT`);
+    pushUnique(`10000${noNum}USDT`);
+    pushUnique(`1000000${noNum}USDT`);
+  } else {
+    pushUnique(`1000${base0}USDT`);
+    pushUnique(`100${base0}USDT`);
+    pushUnique(`10000${base0}USDT`);
+    pushUnique(`1000000${base0}USDT`);
+  }
+
+  const aliases = aliasMap[base0] || aliasMap[noNum] || [];
+  for (const a of aliases) {
+    const c = canonicalBase(a);
+    pushUnique(`${c}USDT`);
+    pushUnique(`1000${c}USDT`);
+    pushUnique(`1000000${c}USDT`);
+  }
+
+  const exSyms = await getExchangeSymbols(env);
+  const found = candidates.find(s => exSyms.includes(s));
+  if (found) return found;
+
+  const variants = new Set([base0, noNum, `1000${noNum}`, `100${noNum}`, `10000${noNum}`].map(x => x.toUpperCase()));
+  const fuzzy = exSyms.find(s => {
+    if (!s.endsWith('USDT')) return false;
+    const b = s.slice(0, -4);
+    const bNoNum = b.replace(/^\d+/, '');
+    return variants.has(b.toUpperCase()) || variants.has(bNoNum.toUpperCase());
+  });
+
+  return fuzzy || null;
+}
+
+// ============================================================
+// MARKET INFO (price, tick, step)
+// ============================================================
+
+async function getMarketInfoCached(symbol, env) {
+  const CACHE_MS = 5 * 60 * 1000;
+  const cached = MARKET_INFO_CACHE.get(symbol);
+  if (cached && (Date.now() - cached.ts < CACHE_MS)) return cached.data;
+
+  const data = { valid: false };
+
+  try {
+    const ticker = await bybitPublicRequest(
+      `/v5/market/tickers?category=${BYBIT_CATEGORY}&symbol=${symbol}`,
+      env
+    );
+
+    if (ticker.list && ticker.list.length) {
+      data.price = parseFloat(ticker.list[0].lastPrice);
+      data.markPrice = parseFloat(ticker.list[0].markPrice);
+    }
+
+    let info = EXINFO_CACHE.bySymbol[symbol];
+    if (!info) {
+      const inst = await bybitPublicRequest(
+        `/v5/market/instruments-info?category=${BYBIT_CATEGORY}&symbol=${symbol}`,
+        env
+      );
+      if (inst.list && inst.list.length) {
+        info = inst.list[0];
+        EXINFO_CACHE.bySymbol[symbol] = info;
+      }
+    }
+
+    if (!info) {
+      MARKET_INFO_CACHE.set(symbol, { ts: Date.now(), data });
+      return data;
+    }
+
+    const lot = info.lotSizeFilter || {};
+    data.stepSize = parseFloat(lot.qtyStep || '0.001');
+    data.minQty = parseFloat(lot.minOrderQty || '0.001');
+    data.maxQty = parseFloat(lot.maxOrderQty || '1000');
+    data.maxMktQty = parseFloat(lot.maxMktOrderQty || '100');
+    data.minNotional = parseFloat(lot.minNotionalValue || '5');
+
+    const stepStr = String(lot.qtyStep || '0.001');
+    data.qtyDecimals = stepStr.includes('.') ? stepStr.split('.')[1].replace(/0+$/, '').length : 0;
+
+    const pf = info.priceFilter || {};
+    data.tickSize = parseFloat(pf.tickSize || '0.01');
+
+    const tickStr = String(pf.tickSize || '0.01');
+    data.priceDecimals = tickStr.includes('.') ? tickStr.split('.')[1].replace(/0+$/, '').length : 0;
+
+    const lev = info.leverageFilter || {};
+    data.maxLeverage = parseFloat(lev.maxLeverage || '100');
+    data.minLeverage = parseFloat(lev.minLeverage || '1');
+
+    data.valid = Number.isFinite(data.price) && data.price > 0 && Number.isFinite(data.tickSize) && data.tickSize > 0;
+    MARKET_INFO_CACHE.set(symbol, { ts: Date.now(), data });
+  } catch (e) {
+    console.error('[market] Error:', symbol, e?.message || e);
+  }
+
+  return data;
+}
+
+// ============================================================
+// FORMATTING + PRICE HELPERS
+// ============================================================
+
+function floorToTick(px, tick) {
+  if (!(tick > 0)) return px;
+  return Math.floor(px / tick) * tick;
+}
+function ceilToTick(px, tick) {
+  if (!(tick > 0)) return px;
+  return Math.ceil(px / tick) * tick;
+}
+function floorToStep(qty, step) {
+  if (!(step > 0)) return qty;
+  return Math.floor(qty / step) * step;
+}
+
+function formatQty(qty, dec) {
+  return (qty ?? 0).toFixed(Math.max(0, dec || 0)).replace(/\.?0+$/, '');
+}
+function formatPx(px, dec) {
+  return (px ?? 0).toFixed(Math.max(0, dec || 2)).replace(/\.?0+$/, '');
+}
+
+function priceFromPercentClosest(entryPrice, signedPercent, side, tick) {
+  const isLong = isLongSide(side);
+
+  let ideal;
+  if (isLong) ideal = entryPrice * (1 + signedPercent / 100);
+  else ideal = entryPrice * (1 - signedPercent / 100);
+
+  const flo = floorToTick(ideal, tick);
+  const cei = ceilToTick(ideal, tick);
+
+  const effPct = (px) => {
+    if (isLong) return ((px / entryPrice) - 1) * 100;
+    return (1 - (px / entryPrice)) * 100;
+  };
+
+  const diffFlo = Math.abs(effPct(flo) - signedPercent);
+  const diffCei = Math.abs(effPct(cei) - signedPercent);
+  return diffFlo <= diffCei ? flo : cei;
+}
+
+function calculateMakerPrice(currentPrice, orderSide, tickSize, priceDecimals) {
+  const offsetPct = MAKER_OFFSET_BPS / 10000;
+
+  let limitPrice;
+  if (orderSide === 'Buy') {
+    limitPrice = floorToTick(currentPrice * (1 - offsetPct), tickSize);
+  } else {
+    limitPrice = ceilToTick(currentPrice * (1 + offsetPct), tickSize);
+  }
+
+  return formatPx(limitPrice, priceDecimals);
+}
+// ============================================================
+// BALANCE (FIXED: USDT ONLY)
+// ============================================================
+
+async function getAvailableBalance(env) {
+  const result = await bybitRequest(
+    '/v5/account/wallet-balance',
+    'accountType=UNIFIED',
+    'GET',
+    env
+  );
+
+  const list = result.list || [];
+  if (!list.length) {
+    console.warn('[balance] No account data returned');
+    return 0;
+  }
+
+  const account = list[0];
+  const coins = account.coin || [];
+  const usdtCoin = coins.find(c => c.coin === 'USDT');
+
+  if (!usdtCoin) {
+    console.error('[balance] ⚠️ No USDT found in wallet!');
+    return 0;
+  }
+
+  const walletBalance = parseFloat(usdtCoin.walletBalance || '0');
+  const locked = parseFloat(usdtCoin.locked || '0');
+  const available = walletBalance - locked;
+
+  console.log(`[balance] USDT: wallet=${walletBalance.toFixed(2)}, locked=${locked.toFixed(2)}, available=${available.toFixed(2)}`);
+  return available;
+}
+
+async function getAvailableBalanceWithRetry(env) {
+  return await withRetry(async () => await getAvailableBalance(env), MAX_RETRIES, env).catch(() => 0);
+}
+
+// ============================================================
+// LEVERAGE
+// ============================================================
+
+async function setLeverage(symbol, leverage, env) {
+  try {
+    await bybitRequest('/v5/position/set-leverage', {
+      category: BYBIT_CATEGORY,
+      symbol,
+      buyLeverage: String(leverage),
+      sellLeverage: String(leverage)
+    }, 'POST', env);
+
+    console.log(`[leverage] ✓ ${symbol} set to ${leverage}x`);
+  } catch (e) {
+    const msg = e?.message || '';
+    if (msg.includes('110043')) {
+      console.log(`[leverage] ✓ ${symbol} already at ${leverage}x`);
+      return;
+    }
+    console.error('[leverage] Error:', symbol, msg);
+  }
+}
+
+// ============================================================
+// EXCHANGE POSITION LOOKUPS
+// ============================================================
+
+async function getAllOpenPositions(env) {
+  const result = await bybitRequest(
+    '/v5/position/list',
+    `category=${BYBIT_CATEGORY}&settleCoin=USDT`,
+    'GET',
+    env
+  );
+
+  const positions = result.list || [];
+
+  return positions
+    .filter(p => parseFloat(p.size || '0') > 0)
+    .map(p => {
+      const posIdx = Number(p.positionIdx);
+      if (posIdx === POSITION_IDX.ONE_WAY) {
+        throw new Error(`Position ${p.symbol} is one-way (positionIdx=0). Hedge mode required.`);
+      }
+
+      const posSide = positionIdxToSide(posIdx);
+
+      return {
+        symbol: p.symbol,
+        positionSide: posSide,
+        positionKey: makePositionKey(p.symbol, posSide),
+        positionIdx: posIdx,
+        size: parseFloat(p.size),
+        avgPrice: parseFloat(p.avgPrice),
+        markPrice: parseFloat(p.markPrice),
+        unrealizedPnl: parseFloat(p.unrealisedPnl || '0'),
+        leverage: parseInt(p.leverage || '1', 10),
+
+        takeProfit: p.takeProfit ? parseFloat(p.takeProfit) : null,
+        stopLoss: p.stopLoss ? parseFloat(p.stopLoss) : null,
+        tpslMode: p.tpslMode || 'Full',
+
+        side: posSide === POSITION_SIDES.LONG ? 'Buy' : 'Sell',
+        side_exchange: posSide === POSITION_SIDES.LONG ? 'Buy' : 'Sell'
+      };
+    });
+}
+
+async function getAllOpenPositionsWithRetry(env) {
+  return await withRetry(async () => await getAllOpenPositions(env), MAX_RETRIES, env);
+}
+
+async function buildPositionMap(env) {
+  const positions = await getAllOpenPositionsWithRetry(env);
+  const map = new Map();
+  for (const p of positions) map.set(p.positionKey, p);
+  return map;
+}
+
+async function getExchangePosition(symbol, expectedSide, env) {
+  if (!symbol) throw new Error('symbol is required');
+  if (!expectedSide) throw new Error('expectedSide is REQUIRED');
+
+  const posSide = normalizeSide(expectedSide);
+  const posIdx = sideToPositionIdx(posSide);
+
+  const result = await bybitRequest(
+    '/v5/position/list',
+    `category=${BYBIT_CATEGORY}&symbol=${symbol}`,
+    'GET',
+    env
+  );
+
+  const list = result.list || [];
+
+  const match = list.find(p =>
+    p.symbol === symbol &&
+    Number(p.positionIdx) === posIdx &&
+    parseFloat(p.size || '0') > 0
+  );
+
+  if (!match) return null;
+
+  return {
+    symbol: match.symbol,
+    positionSide: posSide,
+    positionKey: makePositionKey(symbol, posSide),
+    positionIdx: posIdx,
+    size: parseFloat(match.size),
+    avgPrice: parseFloat(match.avgPrice),
+    markPrice: parseFloat(match.markPrice),
+    unrealizedPnl: parseFloat(match.unrealisedPnl || '0'),
+    leverage: parseInt(match.leverage || '1', 10),
+    takeProfit: match.takeProfit ? parseFloat(match.takeProfit) : null,
+    stopLoss: match.stopLoss ? parseFloat(match.stopLoss) : null,
+    tpslMode: match.tpslMode || 'Full',
+    side: posSide === POSITION_SIDES.LONG ? 'Buy' : 'Sell',
+    side_exchange: posSide === POSITION_SIDES.LONG ? 'Buy' : 'Sell'
+  };
+}
+
+async function getPositionInfoWithRetry(symbol, env, expectedSide) {
+  return await withRetry(async () => await getExchangePosition(symbol, expectedSide, env), MAX_RETRIES, env)
+    .catch(() => null);
+}
+
+// ============================================================
+// ORDERS
+// ============================================================
+
+async function getOrdersForPosition(symbol, posSide, env) {
+  const normalizedSide = normalizeSide(posSide);
+  const posIdx = sideToPositionIdx(normalizedSide);
+
+  const result = await bybitRequest(
+    '/v5/order/realtime',
+    `category=${BYBIT_CATEGORY}&symbol=${symbol}`,
+    'GET',
+    env
+  );
+
+  const orders = result.list || [];
+  return orders.filter(o => Number(o.positionIdx) === posIdx);
+}
+
+async function cancelOrder(symbol, orderId, env) {
+  try {
+    await bybitRequest('/v5/order/cancel', {
+      category: BYBIT_CATEGORY,
+      symbol,
+      orderId
+    }, 'POST', env);
+
+    return true;
+  } catch (e) {
+    const msg = e?.message || '';
+    if (msg.includes('110001')) return true;
+    return false;
+  }
+}
+
+async function cancelPositionOrders(symbol, posSide, env) {
+  const normalizedSide = normalizeSide(posSide);
+  const posIdx = sideToPositionIdx(normalizedSide);
+  const key = makePositionKey(symbol, normalizedSide);
+
+  try {
+    const result = await bybitRequest(
+      '/v5/order/realtime',
+      `category=${BYBIT_CATEGORY}&symbol=${symbol}`,
+      'GET',
+      env
+    );
+
+    const allOrders = result.list || [];
+    const targetOrders = allOrders.filter(o => Number(o.positionIdx) === posIdx);
+
+    if (targetOrders.length === 0) {
+      console.log(`[cancel] ${key} no orders to cancel (posIdx=${posIdx})`);
+      return 0;
+    }
+
+    console.log(`[cancel] ${key} canceling ${targetOrders.length} orders (posIdx=${posIdx})`);
+
+    let canceled = 0;
+    for (const o of targetOrders) {
+      const ok = await cancelOrder(symbol, o.orderId, env);
+      if (ok) canceled++;
+      await sleep(80);
+    }
+
+    console.log(`[cancel] ${key} canceled ${canceled}/${targetOrders.length} orders`);
+    return canceled;
+  } catch (e) {
+    console.error(`[cancel] ${key} error:`, e?.message || e);
+    return 0;
+  }
+}
+
+async function cancelAllSymbolOrders(symbol, env) {
+  try {
+    await bybitRequest('/v5/order/cancel-all', {
+      category: BYBIT_CATEGORY,
+      symbol
+    }, 'POST', env);
+
+    console.log(`[cancel] ✓ Canceled all orders for ${symbol}`);
+    return true;
+  } catch (e) {
+    const msg = e?.message || '';
+    if (msg.includes('110001')) return true;
+    console.error(`[cancel] ${symbol} cancel-all error:`, msg);
+    return false;
+  }
+}
+
+// ============================================================
+// ORDER HISTORY + CLOSED PNL
+// ============================================================
+
+async function getOrderHistoryWithRetry(symbol, startTime, env) {
+  const query = startTime
+    ? `category=${BYBIT_CATEGORY}&symbol=${symbol}&limit=50&startTime=${startTime}`
+    : `category=${BYBIT_CATEGORY}&symbol=${symbol}&limit=50`;
+
+  return await withRetry(
+    async () => {
+      const r = await bybitRequest('/v5/order/history', query, 'GET', env);
+      return r.list || [];
+    },
+    MAX_RETRIES,
+    env
+  ).catch(() => []);
+}
+
+async function getClosedPnL(symbol, limit, env) {
+  return await withRetry(
+    async () => {
+      const r = await bybitRequest(
+        '/v5/position/closed-pnl',
+        `category=${BYBIT_CATEGORY}&symbol=${symbol}&limit=${limit || 10}`,
+        'GET',
+        env
+      );
+      return r.list || [];
+    },
+    MAX_RETRIES,
+    env
+  ).catch(() => []);
+}
+
+// ============================================================
+// TP/SL SETTER WITH RETRY (BYBIT trading-stop)
+// ============================================================
+
+async function setPositionTPSL({ symbol, positionSide, takeProfit, stopLoss, env }) {
+  const posSide = normalizeSide(positionSide);
+  const posIdx = sideToPositionIdx(posSide);
+  const key = makePositionKey(symbol, posSide);
+
+  const body = {
+    category: BYBIT_CATEGORY,
+    symbol,
+    positionIdx: posIdx,
+    tpslMode: 'Full',
+    tpTriggerBy: 'MarkPrice',
+    slTriggerBy: 'MarkPrice'
+  };
+
+  if (takeProfit !== null && takeProfit !== undefined && Number(takeProfit) !== 0) {
+    body.takeProfit = String(takeProfit);
+  }
+  if (stopLoss !== null && stopLoss !== undefined && Number(stopLoss) !== 0) {
+    body.stopLoss = String(stopLoss);
+  }
+
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      await bybitRequest('/v5/position/trading-stop', body, 'POST', env);
+      return { success: true };
+    } catch (e) {
+      const msg = e?.message || '';
+
+      if (msg.includes('110017') || msg.includes('110001')) {
+        return { success: false, reason: 'position_closed_or_missing' };
+      }
+
+      if (msg.includes('10002') && attempt < MAX_RETRIES - 1) {
+        await syncServerTime(env);
+        await sleep(RETRY_DELAY_BASE);
+        continue;
+      }
+
+      if (attempt === MAX_RETRIES - 1) {
+        return { success: false, reason: msg };
+      }
+
+      await sleep(RETRY_DELAY_BASE * (attempt + 1));
+    }
+  }
+
+  return { success: false, reason: 'max_retries_exceeded' };
+}
+
+async function clearPositionTPSL(symbol, positionSide, env) {
+  const posSide = normalizeSide(positionSide);
+  return await setPositionTPSL({
+    symbol,
+    positionSide: posSide,
+    takeProfit: 0,
+    stopLoss: 0,
+    env
+  });
+}
+
+async function hasProtection(symbol, posSide, env) {
+  const pos = await getExchangePosition(symbol, posSide, env);
+  if (!pos) return { hasTP: false, hasSL: false, isFullyProtected: false, position: null };
+
+  const hasTP = pos.takeProfit !== null && pos.takeProfit > 0;
+  const hasSL = pos.stopLoss !== null && pos.stopLoss > 0;
+
+  return { hasTP, hasSL, isFullyProtected: hasTP && hasSL, position: pos };
+}
+
+// ============================================================
+// GIST STATE MANAGEMENT (FIXED)
+// ============================================================
+
+async function loadGistState(env) {
+  const init = {
+    v: 'bybit-position-identity-system-v1.0-20stage',
+    exchange: 'bybit',
+    pending: [],
+    closed: [],
+    equity: [],
+    sym_stats_real: {},
+    critical_failures: [],
+    last_batch: null,
+    last_monitor: null,
+    lastReconcileTs: 0,
+    migrated_at: null
+  };
+
+  // CRITICAL: Always set cache FIRST (this was the bug)
+  GIST_STATE_CACHE = init;
+
+  if (!env.GIST_TOKEN || !env.GIST_ID) {
+    console.warn('[gist] Missing GIST_TOKEN or GIST_ID');
+    return GIST_STATE_CACHE;
+  }
+
+  try {
+    const r = await fetch(`https://api.github.com/gists/${env.GIST_ID}`, {
+      headers: {
+        'Authorization': `Bearer ${env.GIST_TOKEN}`,
+        'Accept': 'application/vnd.github+json',
+        'User-Agent': 'cf-worker-bybit-position-identity/1.0'
+      }
+    });
+
+    if (!r.ok) {
+      console.warn('[gist] Load failed:', r.status);
+      return GIST_STATE_CACHE;
+    }
+
+    const g = await r.json();
+    const c = g.files?.['state.json']?.content;
+
+    if (!c) {
+      console.warn('[gist] No state.json content');
+      return GIST_STATE_CACHE;
+    }
+
+    const s = JSON.parse(c);
+
+    s.pending = Array.isArray(s.pending) ? s.pending : [];
+    s.closed = Array.isArray(s.closed) ? s.closed : [];
+    s.equity = Array.isArray(s.equity) ? s.equity : [];
+    s.sym_stats_real = s.sym_stats_real || {};
+    s.critical_failures = Array.isArray(s.critical_failures) ? s.critical_failures : [];
+
+    GIST_STATE_CACHE = { ...init, ...s };
+
+    const activeCount = GIST_STATE_CACHE.pending.filter(p => p.status === 'active').length;
+    const pendingCount = GIST_STATE_CACHE.pending.filter(p => p.status === 'pending_fill').length;
+    console.log(`[gist] ✓ Loaded: ${activeCount} active, ${pendingCount} pending_fill`);
+
+    return GIST_STATE_CACHE;
+  } catch (e) {
+    console.error('[gist] Load error:', e?.message || e);
+    return GIST_STATE_CACHE;
+  }
+}
+
+async function getGistStateCache(env) {
+  if (GIST_STATE_CACHE) return GIST_STATE_CACHE;
+  return await loadGistState(env);
+}
+
+async function flushGistState(env) {
+  if (!GIST_STATE_DIRTY) {
+    console.log('[gist] Not dirty, skip save');
+    return;
+  }
+
+  if (!GIST_STATE_CACHE) {
+    console.error('[gist] ⚠️ CACHE IS NULL - cannot save!');
+    return;
+  }
+
+  if (!env.GIST_TOKEN || !env.GIST_ID) {
+    console.error('[gist] ⚠️ Missing credentials');
+    return;
+  }
+
+  try {
+    GIST_STATE_CACHE.last_monitor = { ts: new Date().toISOString(), ts_ms: Date.now() };
+
+    const r = await fetch(`https://api.github.com/gists/${env.GIST_ID}`, {
+      method: 'PATCH',
+      headers: {
+        'Authorization': `Bearer ${env.GIST_TOKEN}`,
+        'Accept': 'application/vnd.github+json',
+        'Content-Type': 'application/json',
+        'User-Agent': 'cf-worker-bybit-position-identity/1.0'
+      },
+      body: JSON.stringify({
+        files: { 'state.json': { content: JSON.stringify(GIST_STATE_CACHE, null, 2) } }
+      })
+    });
+
+    if (!r.ok) {
+      const t = await r.text().catch(() => '');
+      console.error('[gist] Save failed:', r.status, t.slice(0, 200));
+    } else {
+      GIST_STATE_DIRTY = false;
+      console.log('[gist] ✓ Saved successfully');
+    }
+  } catch (e) {
+    console.error('[gist] Save error:', e?.message || e);
+  }
+}
+// ============================================================
+// STATE POSITION OPERATIONS
+// ============================================================
+
+function findPositionInState(state, symbol, posSide) {
+  const targetKey = makePositionKey(symbol, posSide);
+  const pending = state.pending || [];
+
+  let found = pending.find(p => p.positionKey === targetKey);
+
+  if (!found) {
+    found = pending.find(p => {
+      if (p.positionKey) return false;
+      if (p.symbol !== symbol) return false;
+
+      if (p.positionIdx !== undefined) {
+        try {
+          const s = positionIdxToSide(p.positionIdx);
+          return s === posSide;
+        } catch {}
+      }
+
+      const s = normalizeSideSafe(p.positionSide || p.side_exchange || p.side);
+      return s === posSide;
+    });
+  }
+
+  return found || null;
+}
+
+function findPositionIndexInState(state, symbol, posSide) {
+  const targetKey = makePositionKey(symbol, posSide);
+  const pending = state.pending || [];
+
+  let idx = pending.findIndex(p => p.positionKey === targetKey);
+
+  if (idx < 0) {
+    idx = pending.findIndex(p => {
+      if (p.positionKey) return false;
+      if (p.symbol !== symbol) return false;
+
+      if (p.positionIdx !== undefined) {
+        try {
+          const s = positionIdxToSide(p.positionIdx);
+          return s === posSide;
+        } catch {}
+      }
+
+      const s = normalizeSideSafe(p.positionSide || p.side_exchange || p.side);
+      return s === posSide;
+    });
+  }
+
+  return idx;
+}
+
+function updatePositionInState(state, symbol, posSide, updates) {
+  const targetKey = makePositionKey(symbol, posSide);
+  const idx = findPositionIndexInState(state, symbol, posSide);
+
+  if (idx < 0) return false;
+
+  state.pending[idx] = {
+    ...state.pending[idx],
+    ...updates,
+
+    symbol,
+    positionSide: posSide,
+    positionKey: targetKey,
+    positionIdx: sideToPositionIdx(posSide),
+
+    side_exchange: posSide === POSITION_SIDES.LONG ? 'Buy' : 'Sell',
+    orderSide: getOpenOrderSide(posSide)
+  };
+
+  GIST_STATE_DIRTY = true;
+  return true;
+}
+
+function addPositionToState(state, position) {
+  validatePosition(position);
+
+  const existing = findPositionInState(state, position.symbol, position.positionSide);
+  if (existing) {
+    return updatePositionInState(state, position.symbol, position.positionSide, position);
+  }
+
+  state.pending = state.pending || [];
+  state.pending.push(position);
+  GIST_STATE_DIRTY = true;
+  return true;
+}
+
+function removePositionFromState(state, symbol, posSide) {
+  const idx = findPositionIndexInState(state, symbol, posSide);
+  if (idx < 0) return null;
+
+  const removed = state.pending.splice(idx, 1)[0];
+  GIST_STATE_DIRTY = true;
+  return removed;
+}
+
+function getActivePositions(state) {
+  return (state.pending || []).filter(p => p.status === 'active' || p.status === 'pending_fill');
+}
+
+// ============================================================
+// STATE MIGRATION
+// ============================================================
+
+async function migrateStateToPositionKeys(env) {
+  const state = await loadGistState(env);
+
+  if (state.migrated_at) return { migrated: 0, errors: 0, skipped: 'already_migrated' };
+
+  let migrated = 0;
+  let errors = 0;
+
+  const migratedPositions = [];
+
+  for (const p of state.pending || []) {
+    if (p.positionKey && p.positionSide) {
+      try {
+        validatePosition(p);
+        continue;
+      } catch {}
+    }
+
+    if (p.status !== 'active' && p.status !== 'pending_fill') continue;
+
+    const mig = migratePosition(p);
+    if (mig) {
+      migratedPositions.push(mig);
+      migrated++;
+    } else {
+      errors++;
+    }
+  }
+
+  if (migrated > 0) {
+    const nonActive = (state.pending || []).filter(p => p.status !== 'active' && p.status !== 'pending_fill');
+    const alreadyValid = (state.pending || []).filter(p => {
+      if (p.status !== 'active' && p.status !== 'pending_fill') return false;
+      try { validatePosition(p); return true; } catch { return false; }
+    });
+
+    state.pending = [...nonActive, ...alreadyValid, ...migratedPositions];
+    state.migrated_at = new Date().toISOString();
+    state.exchange = 'bybit';
+    GIST_STATE_DIRTY = true;
+  }
+
+  await flushGistState(env);
+  return { migrated, errors };
+}
+
+// ============================================================
+// 20-STAGE TRAILING CONFIG
+// (MICRO + BASE + MINOR + MAJOR + ULTRA_1 to ULTRA_15)
+// ============================================================
+
+function resolveTrailingConfig(env) {
+  // Parse base stages
+  const initial_sl = parseFloat(env.INITIAL_SL_PERCENT);
+  const micro_tp = parseFloat(env.MICRO_TP_PERCENT);
+  const base_tp = parseFloat(env.BASE_TP_PERCENT);
+  const minor_tp = parseFloat(env.MINOR_TP_PERCENT);
+  const major_tp = parseFloat(env.MAJOR_TP_PERCENT);
+
+  // Parse all 15 ultra stages
+  const ultra_1_tp = parseFloat(env.ULTRA_1_TP_PERCENT);
+  const ultra_2_tp = parseFloat(env.ULTRA_2_TP_PERCENT);
+  const ultra_3_tp = parseFloat(env.ULTRA_3_TP_PERCENT);
+  const ultra_4_tp = parseFloat(env.ULTRA_4_TP_PERCENT);
+  const ultra_5_tp = parseFloat(env.ULTRA_5_TP_PERCENT);
+  const ultra_6_tp = parseFloat(env.ULTRA_6_TP_PERCENT);
+  const ultra_7_tp = parseFloat(env.ULTRA_7_TP_PERCENT);
+  const ultra_8_tp = parseFloat(env.ULTRA_8_TP_PERCENT);
+  const ultra_9_tp = parseFloat(env.ULTRA_9_TP_PERCENT);
+  const ultra_10_tp = parseFloat(env.ULTRA_10_TP_PERCENT);
+  const ultra_11_tp = parseFloat(env.ULTRA_11_TP_PERCENT);
+  const ultra_12_tp = parseFloat(env.ULTRA_12_TP_PERCENT);
+  const ultra_13_tp = parseFloat(env.ULTRA_13_TP_PERCENT);
+  const ultra_14_tp = parseFloat(env.ULTRA_14_TP_PERCENT);
+  const ultra_15_tp = parseFloat(env.ULTRA_15_TP_PERCENT);
+
+  // Parse offsets
+  const trailing_offset = parseFloat(env.TRAILING_STOP_OFFSET_PERCENT);
+  const micro_trailing_offset = parseFloat(env.MICRO_TRAILING_STOP_OFFSET_PERCENT);
+
+  // Validate initial SL
+  if (!Number.isFinite(initial_sl) || initial_sl >= 0) {
+    throw new Error('INITIAL_SL_PERCENT must be negative (e.g., -2.5)');
+  }
+
+  // Validate base stages
+  if (!Number.isFinite(micro_tp) || micro_tp <= 0) {
+    throw new Error('MICRO_TP_PERCENT must be positive');
+  }
+  if (!Number.isFinite(base_tp) || base_tp <= micro_tp) {
+    throw new Error('BASE_TP_PERCENT must be > MICRO_TP_PERCENT');
+  }
+  if (!Number.isFinite(minor_tp) || minor_tp <= base_tp) {
+    throw new Error('MINOR_TP_PERCENT must be > BASE_TP_PERCENT');
+  }
+  if (!Number.isFinite(major_tp) || major_tp <= minor_tp) {
+    throw new Error('MAJOR_TP_PERCENT must be > MINOR_TP_PERCENT');
+  }
+
+  // Validate ultra stages (each must be > previous)
+  if (!Number.isFinite(ultra_1_tp) || ultra_1_tp <= major_tp) {
+    throw new Error('ULTRA_1_TP_PERCENT must be > MAJOR_TP_PERCENT');
+  }
+  if (!Number.isFinite(ultra_2_tp) || ultra_2_tp <= ultra_1_tp) {
+    throw new Error('ULTRA_2_TP_PERCENT must be > ULTRA_1_TP_PERCENT');
+  }
+  if (!Number.isFinite(ultra_3_tp) || ultra_3_tp <= ultra_2_tp) {
+    throw new Error('ULTRA_3_TP_PERCENT must be > ULTRA_2_TP_PERCENT');
+  }
+  if (!Number.isFinite(ultra_4_tp) || ultra_4_tp <= ultra_3_tp) {
+    throw new Error('ULTRA_4_TP_PERCENT must be > ULTRA_3_TP_PERCENT');
+  }
+  if (!Number.isFinite(ultra_5_tp) || ultra_5_tp <= ultra_4_tp) {
+    throw new Error('ULTRA_5_TP_PERCENT must be > ULTRA_4_TP_PERCENT');
+  }
+  if (!Number.isFinite(ultra_6_tp) || ultra_6_tp <= ultra_5_tp) {
+    throw new Error('ULTRA_6_TP_PERCENT must be > ULTRA_5_TP_PERCENT');
+  }
+  if (!Number.isFinite(ultra_7_tp) || ultra_7_tp <= ultra_6_tp) {
+    throw new Error('ULTRA_7_TP_PERCENT must be > ULTRA_6_TP_PERCENT');
+  }
+  if (!Number.isFinite(ultra_8_tp) || ultra_8_tp <= ultra_7_tp) {
+    throw new Error('ULTRA_8_TP_PERCENT must be > ULTRA_7_TP_PERCENT');
+  }
+  if (!Number.isFinite(ultra_9_tp) || ultra_9_tp <= ultra_8_tp) {
+    throw new Error('ULTRA_9_TP_PERCENT must be > ULTRA_8_TP_PERCENT');
+  }
+  if (!Number.isFinite(ultra_10_tp) || ultra_10_tp <= ultra_9_tp) {
+    throw new Error('ULTRA_10_TP_PERCENT must be > ULTRA_9_TP_PERCENT');
+  }
+  if (!Number.isFinite(ultra_11_tp) || ultra_11_tp <= ultra_10_tp) {
+    throw new Error('ULTRA_11_TP_PERCENT must be > ULTRA_10_TP_PERCENT');
+  }
+  if (!Number.isFinite(ultra_12_tp) || ultra_12_tp <= ultra_11_tp) {
+    throw new Error('ULTRA_12_TP_PERCENT must be > ULTRA_11_TP_PERCENT');
+  }
+  if (!Number.isFinite(ultra_13_tp) || ultra_13_tp <= ultra_12_tp) {
+    throw new Error('ULTRA_13_TP_PERCENT must be > ULTRA_12_TP_PERCENT');
+  }
+  if (!Number.isFinite(ultra_14_tp) || ultra_14_tp <= ultra_13_tp) {
+    throw new Error('ULTRA_14_TP_PERCENT must be > ULTRA_13_TP_PERCENT');
+  }
+  if (!Number.isFinite(ultra_15_tp) || ultra_15_tp <= ultra_14_tp) {
+    throw new Error('ULTRA_15_TP_PERCENT must be > ULTRA_14_TP_PERCENT');
+  }
+
+  // Validate offsets
+  if (!Number.isFinite(trailing_offset) || trailing_offset <= 0) {
+    throw new Error('TRAILING_STOP_OFFSET_PERCENT must be positive');
+  }
+  if (!Number.isFinite(micro_trailing_offset) || micro_trailing_offset <= 0) {
+    throw new Error('MICRO_TRAILING_STOP_OFFSET_PERCENT must be positive');
+  }
+
+  return {
+    initial_sl_percent: initial_sl,
+    micro_tp_percent: micro_tp,
+    base_tp_percent: base_tp,
+    minor_tp_percent: minor_tp,
+    major_tp_percent: major_tp,
+    ultra_1_tp_percent: ultra_1_tp,
+    ultra_2_tp_percent: ultra_2_tp,
+    ultra_3_tp_percent: ultra_3_tp,
+    ultra_4_tp_percent: ultra_4_tp,
+    ultra_5_tp_percent: ultra_5_tp,
+    ultra_6_tp_percent: ultra_6_tp,
+    ultra_7_tp_percent: ultra_7_tp,
+    ultra_8_tp_percent: ultra_8_tp,
+    ultra_9_tp_percent: ultra_9_tp,
+    ultra_10_tp_percent: ultra_10_tp,
+    ultra_11_tp_percent: ultra_11_tp,
+    ultra_12_tp_percent: ultra_12_tp,
+    ultra_13_tp_percent: ultra_13_tp,
+    ultra_14_tp_percent: ultra_14_tp,
+    ultra_15_tp_percent: ultra_15_tp,
+    trailing_offset_percent: trailing_offset,
+    micro_trailing_offset_percent: micro_trailing_offset
+  };
+}
+
+function calculateTrailingLevels(entryPrice, posSide, market, trailing) {
+  const initial_sl_price = priceFromPercentClosest(entryPrice, trailing.initial_sl_percent, posSide, market.tickSize);
+  // Final TP is at ULTRA_15 level
+  const final_tp_price = priceFromPercentClosest(entryPrice, trailing.ultra_15_tp_percent, posSide, market.tickSize);
+
+  return {
+    initial_sl_price,
+    final_tp_price
+  };
+}
+// ============================================================
+// MILESTONE DECISION (HIGHEST TO LOWEST - 20 STAGES)
+// Order: ULTRA_15 → ULTRA_14 → ... → ULTRA_1 → MAJOR → MINOR → BASE → MICRO
+// ============================================================
+
+function shouldTrailStopLoss(position, currentPnL) {
+  const trailing = position.trailing;
+  if (!trailing) return { should: false, reason: 'no_trailing_config' };
+
+  // Already at final stage
+  if (trailing.ultra_15_tp_hit) return { should: false, reason: 'already_at_final_stage' };
+
+  // Check ULTRA_15 (highest)
+  if (!trailing.ultra_15_tp_hit && currentPnL >= trailing.ultra_15_tp_percent) {
+    return {
+      should: true,
+      reason: 'ultra_15_tp_reached',
+      new_stage: 'ultra_15_hit',
+      new_sl_percent: trailing.ultra_15_tp_percent - trailing.trailing_offset_percent
+    };
+  }
+
+  // Check ULTRA_14
+  if (!trailing.ultra_14_tp_hit && currentPnL >= trailing.ultra_14_tp_percent) {
+    return {
+      should: true,
+      reason: 'ultra_14_tp_reached',
+      new_stage: 'ultra_14_hit',
+      new_sl_percent: trailing.ultra_14_tp_percent - trailing.trailing_offset_percent
+    };
+  }
+
+  // Check ULTRA_13
+  if (!trailing.ultra_13_tp_hit && currentPnL >= trailing.ultra_13_tp_percent) {
+    return {
+      should: true,
+      reason: 'ultra_13_tp_reached',
+      new_stage: 'ultra_13_hit',
+      new_sl_percent: trailing.ultra_13_tp_percent - trailing.trailing_offset_percent
+    };
+  }
+
+  // Check ULTRA_12
+  if (!trailing.ultra_12_tp_hit && currentPnL >= trailing.ultra_12_tp_percent) {
+    return {
+      should: true,
+      reason: 'ultra_12_tp_reached',
+      new_stage: 'ultra_12_hit',
+      new_sl_percent: trailing.ultra_12_tp_percent - trailing.trailing_offset_percent
+    };
+  }
+
+  // Check ULTRA_11
+  if (!trailing.ultra_11_tp_hit && currentPnL >= trailing.ultra_11_tp_percent) {
+    return {
+      should: true,
+      reason: 'ultra_11_tp_reached',
+      new_stage: 'ultra_11_hit',
+      new_sl_percent: trailing.ultra_11_tp_percent - trailing.trailing_offset_percent
+    };
+  }
+
+  // Check ULTRA_10
+  if (!trailing.ultra_10_tp_hit && currentPnL >= trailing.ultra_10_tp_percent) {
+    return {
+      should: true,
+      reason: 'ultra_10_tp_reached',
+      new_stage: 'ultra_10_hit',
+      new_sl_percent: trailing.ultra_10_tp_percent - trailing.trailing_offset_percent
+    };
+  }
+
+  // Check ULTRA_9
+  if (!trailing.ultra_9_tp_hit && currentPnL >= trailing.ultra_9_tp_percent) {
+    return {
+      should: true,
+      reason: 'ultra_9_tp_reached',
+      new_stage: 'ultra_9_hit',
+      new_sl_percent: trailing.ultra_9_tp_percent - trailing.trailing_offset_percent
+    };
+  }
+
+  // Check ULTRA_8
+  if (!trailing.ultra_8_tp_hit && currentPnL >= trailing.ultra_8_tp_percent) {
+    return {
+      should: true,
+      reason: 'ultra_8_tp_reached',
+      new_stage: 'ultra_8_hit',
+      new_sl_percent: trailing.ultra_8_tp_percent - trailing.trailing_offset_percent
+    };
+  }
+
+  // Check ULTRA_7
+  if (!trailing.ultra_7_tp_hit && currentPnL >= trailing.ultra_7_tp_percent) {
+    return {
+      should: true,
+      reason: 'ultra_7_tp_reached',
+      new_stage: 'ultra_7_hit',
+      new_sl_percent: trailing.ultra_7_tp_percent - trailing.trailing_offset_percent
+    };
+  }
+
+  // Check ULTRA_6
+  if (!trailing.ultra_6_tp_hit && currentPnL >= trailing.ultra_6_tp_percent) {
+    return {
+      should: true,
+      reason: 'ultra_6_tp_reached',
+      new_stage: 'ultra_6_hit',
+      new_sl_percent: trailing.ultra_6_tp_percent - trailing.trailing_offset_percent
+    };
+  }
+
+  // Check ULTRA_5
+  if (!trailing.ultra_5_tp_hit && currentPnL >= trailing.ultra_5_tp_percent) {
+    return {
+      should: true,
+      reason: 'ultra_5_tp_reached',
+      new_stage: 'ultra_5_hit',
+      new_sl_percent: trailing.ultra_5_tp_percent - trailing.trailing_offset_percent
+    };
+  }
+
+  // Check ULTRA_4
+  if (!trailing.ultra_4_tp_hit && currentPnL >= trailing.ultra_4_tp_percent) {
+    return {
+      should: true,
+      reason: 'ultra_4_tp_reached',
+      new_stage: 'ultra_4_hit',
+      new_sl_percent: trailing.ultra_4_tp_percent - trailing.trailing_offset_percent
+    };
+  }
+
+  // Check ULTRA_3
+  if (!trailing.ultra_3_tp_hit && currentPnL >= trailing.ultra_3_tp_percent) {
+    return {
+      should: true,
+      reason: 'ultra_3_tp_reached',
+      new_stage: 'ultra_3_hit',
+      new_sl_percent: trailing.ultra_3_tp_percent - trailing.trailing_offset_percent
+    };
+  }
+
+  // Check ULTRA_2
+  if (!trailing.ultra_2_tp_hit && currentPnL >= trailing.ultra_2_tp_percent) {
+    return {
+      should: true,
+      reason: 'ultra_2_tp_reached',
+      new_stage: 'ultra_2_hit',
+      new_sl_percent: trailing.ultra_2_tp_percent - trailing.trailing_offset_percent
+    };
+  }
+
+  // Check ULTRA_1
+  if (!trailing.ultra_1_tp_hit && currentPnL >= trailing.ultra_1_tp_percent) {
+    return {
+      should: true,
+      reason: 'ultra_1_tp_reached',
+      new_stage: 'ultra_1_hit',
+      new_sl_percent: trailing.ultra_1_tp_percent - trailing.trailing_offset_percent
+    };
+  }
+
+  // Check MAJOR
+  if (!trailing.major_tp_hit && currentPnL >= trailing.major_tp_percent) {
+    return {
+      should: true,
+      reason: 'major_tp_reached',
+      new_stage: 'major_hit',
+      new_sl_percent: trailing.major_tp_percent - trailing.trailing_offset_percent
+    };
+  }
+
+  // Check MINOR
+  if (!trailing.minor_tp_hit && currentPnL >= trailing.minor_tp_percent) {
+    return {
+      should: true,
+      reason: 'minor_tp_reached',
+      new_stage: 'minor_hit',
+      new_sl_percent: trailing.minor_tp_percent - trailing.trailing_offset_percent
+    };
+  }
+
+  // Check BASE
+  if (!trailing.base_tp_hit && currentPnL >= trailing.base_tp_percent) {
+    return {
+      should: true,
+      reason: 'base_tp_reached',
+      new_stage: 'base_hit',
+      new_sl_percent: trailing.base_tp_percent - trailing.trailing_offset_percent
+    };
+  }
+
+  // Check MICRO (uses micro_trailing_offset_percent with fallback)
+  if (!trailing.micro_tp_hit && currentPnL >= trailing.micro_tp_percent) {
+    return {
+      should: true,
+      reason: 'micro_tp_reached',
+      new_stage: 'micro_hit',
+      new_sl_percent: trailing.micro_tp_percent - (trailing.micro_trailing_offset_percent ?? trailing.trailing_offset_percent)
+    };
+  }
+
+  return { should: false, reason: 'no_milestone_reached' };
+}
+
+// ============================================================
+// setTPSL (Bybit trading-stop) - 20 STAGES
+// ============================================================
+
+async function setTPSL({ symbol, position, market, env }) {
+  validatePosition(position);
+
+  const posSide = position.positionSide;
+  const key = position.positionKey;
+  const entryPrice = position.entry_price;
+  const trailing = position.trailing;
+
+  if (!trailing) {
+    console.error(`[tpsl] ${key} NO TRAILING CONFIG`);
+    return { tp_set: false, sl_set: false, status: 'error_no_config' };
+  }
+
+  if (!entryPrice || entryPrice <= 0) {
+    console.error(`[tpsl] ${key} INVALID ENTRY PRICE: ${entryPrice}`);
+    return { tp_set: false, sl_set: false, status: 'error_no_entry' };
+  }
+
+  const result = { tp_set: false, sl_set: false, status: 'pending' };
+  const isLong = posSide === POSITION_SIDES.LONG;
+
+  console.log(`[tpsl] ========================================`);
+  console.log(`[tpsl] ${key} entry=${entryPrice} stage=${trailing.trailing_stage || 'initial'}`);
+
+  const levels = calculateTrailingLevels(entryPrice, posSide, market, trailing);
+  const finalTpFmt = formatPx(levels.final_tp_price, market.priceDecimals);
+
+  // Determine current SL based on highest stage hit (check from highest to lowest)
+  let currentSlPercent;
+
+  if (trailing.ultra_15_tp_hit) {
+    currentSlPercent = trailing.ultra_15_tp_percent - trailing.trailing_offset_percent;
+    console.log(`[tpsl] ${key} ULTRA_15 stage → SL at ${currentSlPercent.toFixed(2)}%`);
+  } else if (trailing.ultra_14_tp_hit) {
+    currentSlPercent = trailing.ultra_14_tp_percent - trailing.trailing_offset_percent;
+    console.log(`[tpsl] ${key} ULTRA_14 stage → SL at ${currentSlPercent.toFixed(2)}%`);
+  } else if (trailing.ultra_13_tp_hit) {
+    currentSlPercent = trailing.ultra_13_tp_percent - trailing.trailing_offset_percent;
+    console.log(`[tpsl] ${key} ULTRA_13 stage → SL at ${currentSlPercent.toFixed(2)}%`);
+  } else if (trailing.ultra_12_tp_hit) {
+    currentSlPercent = trailing.ultra_12_tp_percent - trailing.trailing_offset_percent;
+    console.log(`[tpsl] ${key} ULTRA_12 stage → SL at ${currentSlPercent.toFixed(2)}%`);
+  } else if (trailing.ultra_11_tp_hit) {
+    currentSlPercent = trailing.ultra_11_tp_percent - trailing.trailing_offset_percent;
+    console.log(`[tpsl] ${key} ULTRA_11 stage → SL at ${currentSlPercent.toFixed(2)}%`);
+  } else if (trailing.ultra_10_tp_hit) {
+    currentSlPercent = trailing.ultra_10_tp_percent - trailing.trailing_offset_percent;
+    console.log(`[tpsl] ${key} ULTRA_10 stage → SL at ${currentSlPercent.toFixed(2)}%`);
+  } else if (trailing.ultra_9_tp_hit) {
+    currentSlPercent = trailing.ultra_9_tp_percent - trailing.trailing_offset_percent;
+    console.log(`[tpsl] ${key} ULTRA_9 stage → SL at ${currentSlPercent.toFixed(2)}%`);
+  } else if (trailing.ultra_8_tp_hit) {
+    currentSlPercent = trailing.ultra_8_tp_percent - trailing.trailing_offset_percent;
+    console.log(`[tpsl] ${key} ULTRA_8 stage → SL at ${currentSlPercent.toFixed(2)}%`);
+  } else if (trailing.ultra_7_tp_hit) {
+    currentSlPercent = trailing.ultra_7_tp_percent - trailing.trailing_offset_percent;
+    console.log(`[tpsl] ${key} ULTRA_7 stage → SL at ${currentSlPercent.toFixed(2)}%`);
+  } else if (trailing.ultra_6_tp_hit) {
+    currentSlPercent = trailing.ultra_6_tp_percent - trailing.trailing_offset_percent;
+    console.log(`[tpsl] ${key} ULTRA_6 stage → SL at ${currentSlPercent.toFixed(2)}%`);
+  } else if (trailing.ultra_5_tp_hit) {
+    currentSlPercent = trailing.ultra_5_tp_percent - trailing.trailing_offset_percent;
+    console.log(`[tpsl] ${key} ULTRA_5 stage → SL at ${currentSlPercent.toFixed(2)}%`);
+  } else if (trailing.ultra_4_tp_hit) {
+    currentSlPercent = trailing.ultra_4_tp_percent - trailing.trailing_offset_percent;
+    console.log(`[tpsl] ${key} ULTRA_4 stage → SL at ${currentSlPercent.toFixed(2)}%`);
+  } else if (trailing.ultra_3_tp_hit) {
+    currentSlPercent = trailing.ultra_3_tp_percent - trailing.trailing_offset_percent;
+    console.log(`[tpsl] ${key} ULTRA_3 stage → SL at ${currentSlPercent.toFixed(2)}%`);
+  } else if (trailing.ultra_2_tp_hit) {
+    currentSlPercent = trailing.ultra_2_tp_percent - trailing.trailing_offset_percent;
+    console.log(`[tpsl] ${key} ULTRA_2 stage → SL at ${currentSlPercent.toFixed(2)}%`);
+  } else if (trailing.ultra_1_tp_hit) {
+    currentSlPercent = trailing.ultra_1_tp_percent - trailing.trailing_offset_percent;
+    console.log(`[tpsl] ${key} ULTRA_1 stage → SL at ${currentSlPercent.toFixed(2)}%`);
+  } else if (trailing.major_tp_hit) {
+    currentSlPercent = trailing.major_tp_percent - trailing.trailing_offset_percent;
+    console.log(`[tpsl] ${key} MAJOR stage → SL at ${currentSlPercent.toFixed(2)}%`);
+  } else if (trailing.minor_tp_hit) {
+    currentSlPercent = trailing.minor_tp_percent - trailing.trailing_offset_percent;
+    console.log(`[tpsl] ${key} MINOR stage → SL at ${currentSlPercent.toFixed(2)}%`);
+  } else if (trailing.base_tp_hit) {
+    currentSlPercent = trailing.base_tp_percent - trailing.trailing_offset_percent;
+    console.log(`[tpsl] ${key} BASE stage → SL at ${currentSlPercent.toFixed(2)}%`);
+  } else if (trailing.micro_tp_hit) {
+    currentSlPercent = trailing.micro_tp_percent - (trailing.micro_trailing_offset_percent ?? trailing.trailing_offset_percent);
+    console.log(`[tpsl] ${key} MICRO stage → SL at ${currentSlPercent.toFixed(2)}%`);
+  } else {
+    currentSlPercent = trailing.initial_sl_percent;
+    console.log(`[tpsl] ${key} INITIAL stage → SL at ${currentSlPercent.toFixed(2)}%`);
+  }
+
+  const currentSlPrice = priceFromPercentClosest(entryPrice, currentSlPercent, posSide, market.tickSize);
+  const currentSlFmt = formatPx(currentSlPrice, market.priceDecimals);
+
+  if (isLong) {
+    console.log(`[tpsl] ${key} LONG: TP=${finalTpFmt} (above entry) SL=${currentSlFmt} (${currentSlPercent >= 0 ? 'above' : 'below'} entry)`);
+  } else {
+    console.log(`[tpsl] ${key} SHORT: TP=${finalTpFmt} (below entry) SL=${currentSlFmt} (${currentSlPercent >= 0 ? 'below' : 'above'} entry)`);
+  }
+
+  try {
+    const r = await setPositionTPSL({
+      symbol,
+      positionSide: posSide,
+      takeProfit: finalTpFmt,
+      stopLoss: currentSlFmt,
+      env
+    });
+
+    result.tp_set = r.success;
+    result.sl_set = r.success;
+    result.status = r.success ? 'complete' : 'error';
+
+    if (r.success) {
+      console.log(`[tpsl] ${key} ✓ TP/SL placed: TP=${finalTpFmt} SL=${currentSlFmt}`);
+    } else {
+      console.error(`[tpsl] ${key} ✗ TP/SL failed: ${r.reason || 'unknown'}`);
+    }
+
+    console.log(`[tpsl] ${key} RESULT: TP=${result.tp_set} SL=${result.sl_set} status=${result.status}`);
+    console.log(`[tpsl] ========================================`);
+
+  } catch (e) {
+    console.error(`[tpsl] ${key} CRITICAL ERROR:`, e?.message || e);
+    result.status = 'error';
+  }
+
+  return result;
+}
+
+// ============================================================
+// ORDER PLACEMENT (MAKER/TAKER) + FILL POSITION
+// ============================================================
+
+async function placeOrderWithRetry(symbol, side, quantity, market, env, isClose = false) {
+  const qtyFmt = formatQty(floorToStep(quantity, market.stepSize), market.qtyDecimals);
+
+  const posSide = isClose
+    ? (side === 'Sell' ? POSITION_SIDES.LONG : POSITION_SIDES.SHORT)
+    : (side === 'Buy' ? POSITION_SIDES.LONG : POSITION_SIDES.SHORT);
+
+  const posIdx = sideToPositionIdx(posSide);
+  const key = makePositionKey(symbol, posSide);
+
+  const orderMode = (env.ORDER_TYPE || 'maker').toLowerCase().trim();
+
+  await ensureHedgeModeForSymbol(symbol, env);
+
+  if (orderMode === 'taker') {
+    console.log(`[order:taker] ${key} MARKET ${side} qty=${qtyFmt}`);
+
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      try {
+        const r = await bybitRequest('/v5/order/create', {
+          category: BYBIT_CATEGORY,
+          symbol,
+          side,
+          orderType: 'Market',
+          qty: qtyFmt,
+          positionIdx: posIdx,
+          reduceOnly: !!isClose
+        }, 'POST', env);
+
+        if (r?.orderId) {
+          return { success: true, orderId: r.orderId, taker_mode: true, pending_fill: false };
+        }
+      } catch (e) {
+        const msg = e?.message || '';
+
+        if (msg.includes('110007') || msg.includes('110012') || msg.includes('110013') || msg.includes('110044') || msg.includes('110045')) {
+          return { success: false, reason: 'insufficient_margin' };
+        }
+
+        if (msg.includes('10002') && attempt < MAX_RETRIES - 1) {
+          await syncServerTime(env);
+          await sleep(RETRY_DELAY_BASE);
+          continue;
+        }
+
+        if (msg.includes('10006') && attempt < MAX_RETRIES - 1) {
+          await sleep(1000);
+          continue;
+        }
+
+        if (attempt === MAX_RETRIES - 1) {
+          return { success: false, reason: 'taker_error', error: msg.slice(0, 200) };
+        }
+
+        await sleep(RETRY_DELAY_BASE * (attempt + 1));
+      }
+    }
+
+    return { success: false, reason: 'taker_failed_after_retries' };
+  }
+
+  console.log(`[order:maker] ${key} LIMIT(PostOnly) ${side} qty=${qtyFmt}`);
+
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      const limitPrice = calculateMakerPrice(market.price, side, market.tickSize, market.priceDecimals);
+
+      const r = await bybitRequest('/v5/order/create', {
+        category: BYBIT_CATEGORY,
+        symbol,
+        side,
+        orderType: 'Limit',
+        qty: qtyFmt,
+        price: limitPrice,
+        positionIdx: posIdx,
+        timeInForce: 'PostOnly',
+        reduceOnly: !!isClose
+      }, 'POST', env);
+
+      if (r?.orderId) {
+        return { success: true, orderId: r.orderId, taker_mode: false, pending_fill: true, limit_price: limitPrice };
+      }
+    } catch (e) {
+      const msg = e?.message || '';
+      const lower = msg.toLowerCase();
+
+      if (
+        msg.includes('170133') ||
+        lower.includes('postonly') ||
+        lower.includes('post only')
+      ) {
+        const fresh = await getMarketInfoCached(symbol, env);
+        market.price = fresh.price;
+        await sleep(200);
+        continue;
+      }
+
+      if (msg.includes('10001')) {
+        return { success: false, reason: 'invalid_params', error: msg.slice(0, 200) };
+      }
+
+      if (msg.includes('110007') || msg.includes('110012') || msg.includes('110013') || msg.includes('110044') || msg.includes('110045')) {
+        return { success: false, reason: 'insufficient_margin' };
+      }
+
+      if (msg.includes('10002') && attempt < MAX_RETRIES - 1) {
+        await syncServerTime(env);
+        await sleep(RETRY_DELAY_BASE);
+        continue;
+      }
+
+      if (attempt === MAX_RETRIES - 1) {
+        return { success: false, reason: 'maker_error', error: msg.slice(0, 200) };
+      }
+
+      await sleep(RETRY_DELAY_BASE * (attempt + 1));
+    }
+  }
+
+  return { success: false, reason: 'maker_failed_after_retries' };
+}
+
+async function fillPosition(idea, availableBalance, capPct, env, batch_id) {
+  const base0 = idea.symbol || idea.symbol_full || idea.symbolFull || idea.base || '';
+  const sideIn = (idea.side || '').toLowerCase();
+  if (!base0 || !sideIn) return { success: false, error: 'bad_idea_payload' };
+
+  const symbol = await resolveSymbolSmart(base0, env);
+  if (!symbol) return { success: false, error: 'symbol_not_found' };
+
+  let posSide;
+  try {
+    posSide = normalizeSide(sideIn);
+  } catch {
+    return { success: false, error: 'invalid_side' };
+  }
+
+  const key = makePositionKey(symbol, posSide);
+  console.log(`[fill] ${key} starting...`);
+
+  const targetUSDT = availableBalance * capPct;
+  if (!(targetUSDT > 5)) return { success: false, error: 'insufficient_balance' };
+
+  const market = await getMarketInfoCached(symbol, env);
+  if (!market.valid) return { success: false, error: 'market_info_failed' };
+
+  const lev = toInt(env.DEFAULT_LEVERAGE, 5);
+  await setLeverage(symbol, lev, env);
+
+  const qtyRaw = targetUSDT / market.price;
+  const qtyRounded = floorToStep(qtyRaw, market.stepSize);
+  const finalQty = Math.max(qtyRounded, market.minQty);
+
+  const orderSide = getOpenOrderSide(posSide);
+  const order = await placeOrderWithRetry(symbol, orderSide, finalQty, market, env, false);
+  if (!order.success) return { success: false, error: order.reason || 'order_failed', detail: order.error };
+
+  const trailingConfig = resolveTrailingConfig(env);
+
+  const commonData = {
+    idea_id: idea.idea_id,
+    client_order_id: idea.client_order_id,
+    batch_id,
+    order_id: order.orderId,
+    trailing: {
+      // Initial SL
+      initial_sl_percent: trailingConfig.initial_sl_percent,
+      // Base stages
+      micro_tp_percent: trailingConfig.micro_tp_percent,
+      base_tp_percent: trailingConfig.base_tp_percent,
+      minor_tp_percent: trailingConfig.minor_tp_percent,
+      major_tp_percent: trailingConfig.major_tp_percent,
+      // Ultra stages 1-15
+      ultra_1_tp_percent: trailingConfig.ultra_1_tp_percent,
+      ultra_2_tp_percent: trailingConfig.ultra_2_tp_percent,
+      ultra_3_tp_percent: trailingConfig.ultra_3_tp_percent,
+      ultra_4_tp_percent: trailingConfig.ultra_4_tp_percent,
+      ultra_5_tp_percent: trailingConfig.ultra_5_tp_percent,
+      ultra_6_tp_percent: trailingConfig.ultra_6_tp_percent,
+      ultra_7_tp_percent: trailingConfig.ultra_7_tp_percent,
+      ultra_8_tp_percent: trailingConfig.ultra_8_tp_percent,
+      ultra_9_tp_percent: trailingConfig.ultra_9_tp_percent,
+      ultra_10_tp_percent: trailingConfig.ultra_10_tp_percent,
+      ultra_11_tp_percent: trailingConfig.ultra_11_tp_percent,
+      ultra_12_tp_percent: trailingConfig.ultra_12_tp_percent,
+      ultra_13_tp_percent: trailingConfig.ultra_13_tp_percent,
+      ultra_14_tp_percent: trailingConfig.ultra_14_tp_percent,
+      ultra_15_tp_percent: trailingConfig.ultra_15_tp_percent,
+      // Offsets
+      trailing_offset_percent: trailingConfig.trailing_offset_percent,
+      micro_trailing_offset_percent: trailingConfig.micro_trailing_offset_percent,
+      // Hit flags - base stages
+      micro_tp_hit: false,
+      base_tp_hit: false,
+      minor_tp_hit: false,
+      major_tp_hit: false,
+      // Hit flags - ultra stages 1-15
+      ultra_1_tp_hit: false,
+      ultra_2_tp_hit: false,
+      ultra_3_tp_hit: false,
+      ultra_4_tp_hit: false,
+      ultra_5_tp_hit: false,
+      ultra_6_tp_hit: false,
+      ultra_7_tp_hit: false,
+      ultra_8_tp_hit: false,
+      ultra_9_tp_hit: false,
+      ultra_10_tp_hit: false,
+      ultra_11_tp_hit: false,
+      ultra_12_tp_hit: false,
+      ultra_13_tp_hit: false,
+      ultra_14_tp_hit: false,
+      ultra_15_tp_hit: false,
+      // Current stage
+      trailing_stage: 'initial'
+    },
+    p_raw: idea.p_raw ?? idea.p_win ?? null,
+    p_lcb: idea.p_lcb ?? null,
+    regime: idea.regime ?? null,
+    calib_key: idea.calib_key ?? null,
+    predicted: idea.predicted ?? null
+  };
+
+  if (order.taker_mode) {
+    let livePos = null;
+    let verified = false;
+
+    for (let attempt = 0; attempt < 5; attempt++) {
+      await sleep(300 + attempt * 200);
+      livePos = await getPositionInfoWithRetry(symbol, env, posSide);
+      if (livePos && livePos.size > 0) { verified = true; break; }
+    }
+
+    const entryPrice = verified && livePos ? livePos.avgPrice : market.price;
+    const actualQty = verified && livePos ? livePos.size : finalQty;
+
+    return {
+      success: true,
+      position: createPosition(symbol, posSide, {
+        ...commonData,
+        status: 'active',
+        entry_price: entryPrice,
+        qty: actualQty,
+        ts_entry_ms: Date.now(),
+        order_type: 'taker',
+        position_verified: verified,
+        needs_verification: !verified
+      })
+    };
+  }
+
+  if (order.pending_fill) {
+    return {
+      success: true,
+      position: createPosition(symbol, posSide, {
+        ...commonData,
+        status: 'pending_fill',
+        limit_price: order.limit_price,
+        qty: finalQty,
+        ts_order_placed: Date.now(),
+        order_type: 'maker'
+      })
+    };
+  }
+
+  return { success: false, error: 'unknown_order_mode' };
+}
+
+// ============================================================
+// PENDING MAKER ORDER PROCESSING
+// ============================================================
+
+async function processPendingMakerOrder(p, state, env) {
+  validatePosition(p);
+
+  const symbol = p.symbol;
+  const posSide = p.positionSide;
+  const key = p.positionKey;
+  const now = Date.now();
+  const orderAge = now - (p.ts_order_placed || 0);
+
+  console.log(`[monitor:maker] ${key} checking orderId=${p.order_id} age=${Math.round(orderAge / 1000)}s`);
+
+  try {
+    let order = null;
+    try {
+      const rt = await bybitRequest(
+        '/v5/order/realtime',
+        `category=${BYBIT_CATEGORY}&symbol=${symbol}&orderId=${p.order_id}`,
+        'GET',
+        env
+      );
+      order = (rt.list && rt.list.length) ? rt.list[0] : null;
+    } catch {
+      order = null;
+    }
+
+    if (!order) {
+      const hist = await getOrderHistoryWithRetry(symbol, p.ts_order_placed || 0, env);
+      order = hist.find(o => o.orderId === p.order_id) || null;
+    }
+
+    if (!order) {
+      const livePos = await getPositionInfoWithRetry(symbol, env, posSide);
+      if (livePos && livePos.size > 0) {
+        console.log(`[monitor:maker] ${key} order not found but position exists → assume filled`);
+        await promoteMakerToActive(p, livePos, state, env, 'filled_inferred');
+        return;
+      }
+      console.log(`[monitor:maker] ${key} order missing + no position → removing from state`);
+      removePositionFromState(state, symbol, posSide);
+      return;
+    }
+
+    const orderStatus = String(order.orderStatus || '');
+    const executedQty = parseFloat(order.cumExecQty || '0');
+    const originalQty = parseFloat(order.qty || p.qty || '0');
+    const fillPct = originalQty > 0 ? (executedQty / originalQty * 100) : 0;
+
+    const isFullyFilled = (orderStatus === 'Filled') || (executedQty > 0 && executedQty >= originalQty);
+    const isPartiallyFilled = (orderStatus === 'PartiallyFilled') || (executedQty > 0 && executedQty < originalQty);
+    const isNew = (orderStatus === 'New');
+    const isCancelled = (orderStatus === 'Cancelled' || orderStatus === 'Deactivated');
+    const isRejected = (orderStatus === 'Rejected');
+    const isTriggered = (orderStatus === 'Triggered');
+
+    if (isRejected) {
+      console.warn(`[monitor:maker] ${key} rejected → removing`);
+      removePositionFromState(state, symbol, posSide);
+      return;
+    }
+
+    if (isTriggered) {
+      console.log(`[monitor:maker] ${key} triggered → waiting`);
+      return;
+    }
+
+    if (isFullyFilled) {
+      const livePos = await getPositionInfoWithRetry(symbol, env, posSide);
+      if (livePos && livePos.size > 0) {
+        await promoteMakerToActive(p, livePos, state, env, 'full');
+      } else {
+        console.warn(`[monitor:maker] ${key} says filled but no position → removing`);
+        removePositionFromState(state, symbol, posSide);
+      }
+      return;
+    }
+
+    if (isPartiallyFilled) {
+      console.log(`[monitor:maker] ${key} PARTIAL ${fillPct.toFixed(1)}% → promoting to ACTIVE for protection`);
+      const livePos = await getPositionInfoWithRetry(symbol, env, posSide);
+      if (livePos && livePos.size > 0) {
+        await promoteMakerToActive(p, livePos, state, env, 'partial');
+      } else {
+        console.warn(`[monitor:maker] ${key} partial but no position → removing`);
+        removePositionFromState(state, symbol, posSide);
+      }
+      return;
+    }
+
+    if (isCancelled && executedQty === 0) {
+      console.log(`[monitor:maker] ${key} cancelled with no fill → removing`);
+      removePositionFromState(state, symbol, posSide);
+      return;
+    }
+
+    if (orderAge > MAKER_ORDER_TTL_MS) {
+      console.log(`[monitor:maker] ${key} TTL expired; status=${orderStatus} filled=${fillPct.toFixed(1)}%`);
+
+      if (isNew) {
+        await cancelOrder(symbol, p.order_id, env);
+        await sleep(200);
+      }
+
+      const livePos = await getPositionInfoWithRetry(symbol, env, posSide);
+      if (livePos && livePos.size > 0) {
+        await promoteMakerToActive(p, livePos, state, env, executedQty > 0 ? 'partial_ttl' : 'filled_ttl');
+      } else {
+        removePositionFromState(state, symbol, posSide);
+      }
+
+      return;
+    }
+
+    const timeLeft = Math.round((MAKER_ORDER_TTL_MS - orderAge) / 1000);
+    console.log(`[monitor:maker] ${key} pending (${orderStatus}) filled=${fillPct.toFixed(1)}% timeLeft=${timeLeft}s`);
+  } catch (e) {
+    console.error(`[monitor:maker] ${key} error:`, e?.message || e);
+  }
+}
+
+async function promoteMakerToActive(statePos, livePos, state, env, fillType) {
+  const symbol = statePos.symbol;
+  const posSide = statePos.positionSide;
+  const key = statePos.positionKey;
+  const now = Date.now();
+
+  const market = await getMarketInfoCached(symbol, env);
+
+  updatePositionInState(state, symbol, posSide, {
+    status: 'active',
+    entry_price: livePos.avgPrice,
+    qty: livePos.size,
+    ts_entry_ms: now,
+    fill_type: fillType,
+    position_verified: true,
+    needs_verification: false
+  });
+  const updated = findPositionInState(state, symbol, posSide);
+  if (!updated) return;
+
+  const tpsl = await setTPSL({
+    symbol,
+    position: updated,
+    market,
+    env
+  });
+
+  updatePositionInState(state, symbol, posSide, {
+    tp_set: tpsl.tp_set,
+    sl_set: tpsl.sl_set,
+    tpsl_armed: tpsl.tp_set && tpsl.sl_set,
+    tpsl_last_attempt: now
+  });
+
+  console.log(`[monitor:maker] ✓ ${key} promoted to ACTIVE (fill=${fillType}) TP/SL=${tpsl.tp_set && tpsl.sl_set}`);
+}
+// ============================================================
+// TRAILING SL UPDATE (preserve existing TP)
+// ============================================================
+
+async function trailStopLoss(position, trailAction, env) {
+  validatePosition(position);
+
+  const symbol = position.symbol;
+  const posSide = position.positionSide;
+  const key = position.positionKey;
+  const entryPrice = position.entry_price;
+
+  console.log(`[trail] ========================================`);
+  console.log(`[trail] ${key} trailing to stage=${trailAction.new_stage}`);
+  console.log(`[trail] Reason: ${trailAction.reason}`);
+  console.log(`[trail] New SL%: ${trailAction.new_sl_percent.toFixed(2)}%`);
+
+  try {
+    const livePos = await getPositionInfoWithRetry(symbol, env, posSide);
+
+    if (!livePos || livePos.size === 0) {
+      console.warn(`[trail] ${key} position not found on exchange`);
+      return { success: false, reason: 'position_not_found' };
+    }
+
+    if (livePos.positionSide !== posSide) {
+      console.error(`[trail] ${key} SIDE MISMATCH - expected ${posSide}, got ${livePos.positionSide}`);
+      return { success: false, reason: 'side_mismatch' };
+    }
+
+    const market = await getMarketInfoCached(symbol, env);
+
+    const newSlPrice = priceFromPercentClosest(
+      entryPrice,
+      trailAction.new_sl_percent,
+      posSide,
+      market.tickSize
+    );
+    const newSlFmt = formatPx(newSlPrice, market.priceDecimals);
+
+    const isLong = posSide === POSITION_SIDES.LONG;
+    console.log(`[trail] ${key} entry=${entryPrice} newSL=${newSlFmt} (${isLong ? 'LONG' : 'SHORT'})`);
+
+    const existingTp = livePos.takeProfit;
+
+    const r = await setPositionTPSL({
+      symbol,
+      positionSide: posSide,
+      takeProfit: existingTp,
+      stopLoss: newSlFmt,
+      env
+    });
+
+    if (!r.success) {
+      console.error(`[trail] ${key} ✗ Failed to update SL: ${r.reason || 'unknown'}`);
+      return { success: false, reason: r.reason || 'tpsl_update_failed' };
+    }
+
+    console.log(`[trail] ${key} ✓ NEW SL placed at ${newSlFmt}`);
+    console.log(`[trail] ========================================`);
+
+    return {
+      success: true,
+      new_sl_price: newSlPrice,
+      new_stage: trailAction.new_stage
+    };
+
+  } catch (e) {
+    console.error(`[trail] ${key} ERROR:`, e?.message || e);
+    return { success: false, reason: e?.message || 'unknown_error' };
+  }
+}
+
+// ============================================================
+// CHECK TRAILING - 20 STAGES
+// Marks all lower stages as hit when higher stage is reached
+// ============================================================
+
+async function checkTrailing(position, livePos, state, env) {
+  validatePosition(position);
+
+  const trailing = position.trailing;
+  if (!trailing) return;
+
+  const key = position.positionKey;
+  const entryPrice = position.entry_price;
+  const currentPrice = livePos.markPrice;
+  const isLong = position.positionSide === POSITION_SIDES.LONG;
+
+  const currentPnL = isLong
+    ? ((currentPrice / entryPrice) - 1) * 100
+    : ((entryPrice / currentPrice) - 1) * 100;
+
+  const trailAction = shouldTrailStopLoss(position, currentPnL);
+
+  if (trailAction.should) {
+    console.log(`[monitor:trail] 🎯 ${key} MILESTONE HIT: ${trailAction.reason} (PnL=${currentPnL.toFixed(2)}%)`);
+
+    const result = await trailStopLoss(position, trailAction, env);
+
+    if (result.success) {
+      const updatedTrailing = {
+        ...trailing,
+        trailing_stage: trailAction.new_stage
+      };
+
+      // Mark all stages up to and including the hit stage
+      if (trailAction.new_stage === 'ultra_15_hit') {
+        updatedTrailing.micro_tp_hit = true;
+        updatedTrailing.base_tp_hit = true;
+        updatedTrailing.minor_tp_hit = true;
+        updatedTrailing.major_tp_hit = true;
+        updatedTrailing.ultra_1_tp_hit = true;
+        updatedTrailing.ultra_2_tp_hit = true;
+        updatedTrailing.ultra_3_tp_hit = true;
+        updatedTrailing.ultra_4_tp_hit = true;
+        updatedTrailing.ultra_5_tp_hit = true;
+        updatedTrailing.ultra_6_tp_hit = true;
+        updatedTrailing.ultra_7_tp_hit = true;
+        updatedTrailing.ultra_8_tp_hit = true;
+        updatedTrailing.ultra_9_tp_hit = true;
+        updatedTrailing.ultra_10_tp_hit = true;
+        updatedTrailing.ultra_11_tp_hit = true;
+        updatedTrailing.ultra_12_tp_hit = true;
+        updatedTrailing.ultra_13_tp_hit = true;
+        updatedTrailing.ultra_14_tp_hit = true;
+        updatedTrailing.ultra_15_tp_hit = true;
+        console.log(`[monitor:trail] ${key} marked ALL stages (micro→ultra_15) as hit`);
+      } else if (trailAction.new_stage === 'ultra_14_hit') {
+        updatedTrailing.micro_tp_hit = true;
+        updatedTrailing.base_tp_hit = true;
+        updatedTrailing.minor_tp_hit = true;
+        updatedTrailing.major_tp_hit = true;
+        updatedTrailing.ultra_1_tp_hit = true;
+        updatedTrailing.ultra_2_tp_hit = true;
+        updatedTrailing.ultra_3_tp_hit = true;
+        updatedTrailing.ultra_4_tp_hit = true;
+        updatedTrailing.ultra_5_tp_hit = true;
+        updatedTrailing.ultra_6_tp_hit = true;
+        updatedTrailing.ultra_7_tp_hit = true;
+        updatedTrailing.ultra_8_tp_hit = true;
+        updatedTrailing.ultra_9_tp_hit = true;
+        updatedTrailing.ultra_10_tp_hit = true;
+        updatedTrailing.ultra_11_tp_hit = true;
+        updatedTrailing.ultra_12_tp_hit = true;
+        updatedTrailing.ultra_13_tp_hit = true;
+        updatedTrailing.ultra_14_tp_hit = true;
+        console.log(`[monitor:trail] ${key} marked micro→ultra_14 as hit`);
+      } else if (trailAction.new_stage === 'ultra_13_hit') {
+        updatedTrailing.micro_tp_hit = true;
+        updatedTrailing.base_tp_hit = true;
+        updatedTrailing.minor_tp_hit = true;
+        updatedTrailing.major_tp_hit = true;
+        updatedTrailing.ultra_1_tp_hit = true;
+        updatedTrailing.ultra_2_tp_hit = true;
+        updatedTrailing.ultra_3_tp_hit = true;
+        updatedTrailing.ultra_4_tp_hit = true;
+        updatedTrailing.ultra_5_tp_hit = true;
+        updatedTrailing.ultra_6_tp_hit = true;
+        updatedTrailing.ultra_7_tp_hit = true;
+        updatedTrailing.ultra_8_tp_hit = true;
+        updatedTrailing.ultra_9_tp_hit = true;
+        updatedTrailing.ultra_10_tp_hit = true;
+        updatedTrailing.ultra_11_tp_hit = true;
+        updatedTrailing.ultra_12_tp_hit = true;
+        updatedTrailing.ultra_13_tp_hit = true;
+        console.log(`[monitor:trail] ${key} marked micro→ultra_13 as hit`);
+      } else if (trailAction.new_stage === 'ultra_12_hit') {
+        updatedTrailing.micro_tp_hit = true;
+        updatedTrailing.base_tp_hit = true;
+        updatedTrailing.minor_tp_hit = true;
+        updatedTrailing.major_tp_hit = true;
+        updatedTrailing.ultra_1_tp_hit = true;
+        updatedTrailing.ultra_2_tp_hit = true;
+        updatedTrailing.ultra_3_tp_hit = true;
+        updatedTrailing.ultra_4_tp_hit = true;
+        updatedTrailing.ultra_5_tp_hit = true;
+        updatedTrailing.ultra_6_tp_hit = true;
+        updatedTrailing.ultra_7_tp_hit = true;
+        updatedTrailing.ultra_8_tp_hit = true;
+        updatedTrailing.ultra_9_tp_hit = true;
+        updatedTrailing.ultra_10_tp_hit = true;
+        updatedTrailing.ultra_11_tp_hit = true;
+        updatedTrailing.ultra_12_tp_hit = true;
+        console.log(`[monitor:trail] ${key} marked micro→ultra_12 as hit`);
+      } else if (trailAction.new_stage === 'ultra_11_hit') {
+        updatedTrailing.micro_tp_hit = true;
+        updatedTrailing.base_tp_hit = true;
+        updatedTrailing.minor_tp_hit = true;
+        updatedTrailing.major_tp_hit = true;
+        updatedTrailing.ultra_1_tp_hit = true;
+        updatedTrailing.ultra_2_tp_hit = true;
+        updatedTrailing.ultra_3_tp_hit = true;
+        updatedTrailing.ultra_4_tp_hit = true;
+        updatedTrailing.ultra_5_tp_hit = true;
+        updatedTrailing.ultra_6_tp_hit = true;
+        updatedTrailing.ultra_7_tp_hit = true;
+        updatedTrailing.ultra_8_tp_hit = true;
+        updatedTrailing.ultra_9_tp_hit = true;
+        updatedTrailing.ultra_10_tp_hit = true;
+        updatedTrailing.ultra_11_tp_hit = true;
+        console.log(`[monitor:trail] ${key} marked micro→ultra_11 as hit`);
+      } else if (trailAction.new_stage === 'ultra_10_hit') {
+        updatedTrailing.micro_tp_hit = true;
+        updatedTrailing.base_tp_hit = true;
+        updatedTrailing.minor_tp_hit = true;
+        updatedTrailing.major_tp_hit = true;
+        updatedTrailing.ultra_1_tp_hit = true;
+        updatedTrailing.ultra_2_tp_hit = true;
+        updatedTrailing.ultra_3_tp_hit = true;
+        updatedTrailing.ultra_4_tp_hit = true;
+        updatedTrailing.ultra_5_tp_hit = true;
+        updatedTrailing.ultra_6_tp_hit = true;
+        updatedTrailing.ultra_7_tp_hit = true;
+        updatedTrailing.ultra_8_tp_hit = true;
+        updatedTrailing.ultra_9_tp_hit = true;
+        updatedTrailing.ultra_10_tp_hit = true;
+        console.log(`[monitor:trail] ${key} marked micro→ultra_10 as hit`);
+      } else if (trailAction.new_stage === 'ultra_9_hit') {
+        updatedTrailing.micro_tp_hit = true;
+        updatedTrailing.base_tp_hit = true;
+        updatedTrailing.minor_tp_hit = true;
+        updatedTrailing.major_tp_hit = true;
+        updatedTrailing.ultra_1_tp_hit = true;
+        updatedTrailing.ultra_2_tp_hit = true;
+        updatedTrailing.ultra_3_tp_hit = true;
+        updatedTrailing.ultra_4_tp_hit = true;
+        updatedTrailing.ultra_5_tp_hit = true;
+        updatedTrailing.ultra_6_tp_hit = true;
+        updatedTrailing.ultra_7_tp_hit = true;
+        updatedTrailing.ultra_8_tp_hit = true;
+        updatedTrailing.ultra_9_tp_hit = true;
+        console.log(`[monitor:trail] ${key} marked micro→ultra_9 as hit`);
+      } else if (trailAction.new_stage === 'ultra_8_hit') {
+        updatedTrailing.micro_tp_hit = true;
+        updatedTrailing.base_tp_hit = true;
+        updatedTrailing.minor_tp_hit = true;
+        updatedTrailing.major_tp_hit = true;
+        updatedTrailing.ultra_1_tp_hit = true;
+        updatedTrailing.ultra_2_tp_hit = true;
+        updatedTrailing.ultra_3_tp_hit = true;
+        updatedTrailing.ultra_4_tp_hit = true;
+        updatedTrailing.ultra_5_tp_hit = true;
+        updatedTrailing.ultra_6_tp_hit = true;
+        updatedTrailing.ultra_7_tp_hit = true;
+        updatedTrailing.ultra_8_tp_hit = true;
+        console.log(`[monitor:trail] ${key} marked micro→ultra_8 as hit`);
+      } else if (trailAction.new_stage === 'ultra_7_hit') {
+        updatedTrailing.micro_tp_hit = true;
+        updatedTrailing.base_tp_hit = true;
+        updatedTrailing.minor_tp_hit = true;
+        updatedTrailing.major_tp_hit = true;
+        updatedTrailing.ultra_1_tp_hit = true;
+        updatedTrailing.ultra_2_tp_hit = true;
+        updatedTrailing.ultra_3_tp_hit = true;
+        updatedTrailing.ultra_4_tp_hit = true;
+        updatedTrailing.ultra_5_tp_hit = true;
+        updatedTrailing.ultra_6_tp_hit = true;
+        updatedTrailing.ultra_7_tp_hit = true;
+        console.log(`[monitor:trail] ${key} marked micro→ultra_7 as hit`);
+      } else if (trailAction.new_stage === 'ultra_6_hit') {
+        updatedTrailing.micro_tp_hit = true;
+        updatedTrailing.base_tp_hit = true;
+        updatedTrailing.minor_tp_hit = true;
+        updatedTrailing.major_tp_hit = true;
+        updatedTrailing.ultra_1_tp_hit = true;
+        updatedTrailing.ultra_2_tp_hit = true;
+        updatedTrailing.ultra_3_tp_hit = true;
+        updatedTrailing.ultra_4_tp_hit = true;
+        updatedTrailing.ultra_5_tp_hit = true;
+        updatedTrailing.ultra_6_tp_hit = true;
+        console.log(`[monitor:trail] ${key} marked micro→ultra_6 as hit`);
+      } else if (trailAction.new_stage === 'ultra_5_hit') {
+        updatedTrailing.micro_tp_hit = true;
+        updatedTrailing.base_tp_hit = true;
+        updatedTrailing.minor_tp_hit = true;
+        updatedTrailing.major_tp_hit = true;
+        updatedTrailing.ultra_1_tp_hit = true;
+        updatedTrailing.ultra_2_tp_hit = true;
+        updatedTrailing.ultra_3_tp_hit = true;
+        updatedTrailing.ultra_4_tp_hit = true;
+        updatedTrailing.ultra_5_tp_hit = true;
+        console.log(`[monitor:trail] ${key} marked micro→ultra_5 as hit`);
+      } else if (trailAction.new_stage === 'ultra_4_hit') {
+        updatedTrailing.micro_tp_hit = true;
+        updatedTrailing.base_tp_hit = true;
+        updatedTrailing.minor_tp_hit = true;
+        updatedTrailing.major_tp_hit = true;
+        updatedTrailing.ultra_1_tp_hit = true;
+        updatedTrailing.ultra_2_tp_hit = true;
+        updatedTrailing.ultra_3_tp_hit = true;
+        updatedTrailing.ultra_4_tp_hit = true;
+        console.log(`[monitor:trail] ${key} marked micro→ultra_4 as hit`);
+      } else if (trailAction.new_stage === 'ultra_3_hit') {
+        updatedTrailing.micro_tp_hit = true;
+        updatedTrailing.base_tp_hit = true;
+        updatedTrailing.minor_tp_hit = true;
+        updatedTrailing.major_tp_hit = true;
+        updatedTrailing.ultra_1_tp_hit = true;
+        updatedTrailing.ultra_2_tp_hit = true;
+        updatedTrailing.ultra_3_tp_hit = true;
+        console.log(`[monitor:trail] ${key} marked micro→ultra_3 as hit`);
+      } else if (trailAction.new_stage === 'ultra_2_hit') {
+        updatedTrailing.micro_tp_hit = true;
+        updatedTrailing.base_tp_hit = true;
+        updatedTrailing.minor_tp_hit = true;
+        updatedTrailing.major_tp_hit = true;
+        updatedTrailing.ultra_1_tp_hit = true;
+        updatedTrailing.ultra_2_tp_hit = true;
+        console.log(`[monitor:trail] ${key} marked micro→ultra_2 as hit`);
+      } else if (trailAction.new_stage === 'ultra_1_hit') {
+        updatedTrailing.micro_tp_hit = true;
+        updatedTrailing.base_tp_hit = true;
+        updatedTrailing.minor_tp_hit = true;
+        updatedTrailing.major_tp_hit = true;
+        updatedTrailing.ultra_1_tp_hit = true;
+        console.log(`[monitor:trail] ${key} marked micro→ultra_1 as hit`);
+      } else if (trailAction.new_stage === 'major_hit') {
+        updatedTrailing.micro_tp_hit = true;
+        updatedTrailing.base_tp_hit = true;
+        updatedTrailing.minor_tp_hit = true;
+        updatedTrailing.major_tp_hit = true;
+        console.log(`[monitor:trail] ${key} marked micro→major as hit`);
+      } else if (trailAction.new_stage === 'minor_hit') {
+        updatedTrailing.micro_tp_hit = true;
+        updatedTrailing.base_tp_hit = true;
+        updatedTrailing.minor_tp_hit = true;
+        console.log(`[monitor:trail] ${key} marked micro→minor as hit`);
+      } else if (trailAction.new_stage === 'base_hit') {
+        updatedTrailing.micro_tp_hit = true;
+        updatedTrailing.base_tp_hit = true;
+        console.log(`[monitor:trail] ${key} marked micro→base as hit`);
+      } else if (trailAction.new_stage === 'micro_hit') {
+        updatedTrailing.micro_tp_hit = true;
+        console.log(`[monitor:trail] ${key} marked micro as hit`);
+      }
+
+      updatePositionInState(state, position.symbol, position.positionSide, {
+        trailing: updatedTrailing
+      });
+
+      console.log(`[monitor:trail] ✓ ${key} state updated: stage=${trailAction.new_stage}`);
+    }
+  }
+}
+
+// ============================================================
+// CLEANUP: ZOMBIE IDEAS
+// ============================================================
+
+async function cleanupZombieIdeas(state) {
+  const now = Date.now();
+  const before = (state.pending || []).length;
+
+  state.pending = (state.pending || []).filter(p => {
+    if (p.status === 'active' || p.status === 'pending_fill') return true;
+
+    if (p.status === 'planned' || p.status === null || p.status === undefined) {
+      const ideaAge = now - (p.ts_ms || 0);
+      const ttlExpired = p.ttl_ts_ms && p.ttl_ts_ms < now;
+      const tooOld = ideaAge > PLANNED_IDEA_TTL;
+      if (ttlExpired || tooOld) return false;
+    }
+
+    return true;
+  });
+
+  const after = state.pending.length;
+  if (after !== before) {
+    GIST_STATE_DIRTY = true;
+    console.log(`[cleanup] Removed ${before - after} stale ideas`);
+  }
+}
+
+// ============================================================
+// ENTRY PRICE VERIFY (for taker fallback)
+// ============================================================
+
+async function verifyEntryPrice(p, livePos, state) {
+  const stateEntry = Number(p.entry_price || 0);
+  const actualEntry = Number(livePos.avgPrice || 0);
+
+  if (!(stateEntry > 0) || !(actualEntry > 0)) {
+    updatePositionInState(state, p.symbol, p.positionSide, {
+      needs_verification: false,
+      position_verified: true
+    });
+    return;
+  }
+
+  const diffPct = Math.abs(actualEntry - stateEntry) / stateEntry * 100;
+
+  if (diffPct > 0.1) {
+    updatePositionInState(state, p.symbol, p.positionSide, {
+      entry_price: actualEntry,
+      qty: livePos.size,
+      needs_verification: false,
+      position_verified: true,
+      tp_set: false,
+      sl_set: false,
+      tpsl_armed: false
+    });
+  } else {
+    updatePositionInState(state, p.symbol, p.positionSide, {
+      needs_verification: false,
+      position_verified: true
+    });
+  }
+}
+
+// ============================================================
+// EXIT DETECTION (Bybit order history)
+// ============================================================
+
+async function detectExitReason(symbol, positionSide, entryTime, env) {
+  const posSide = normalizeSide(positionSide);
+  const posIdx = sideToPositionIdx(posSide);
+  const closeSide = getCloseOrderSide(posSide);
+
+  const orders = await getOrderHistoryWithRetry(symbol, entryTime || 0, env);
+
+  const filled = (orders || []).filter(o =>
+    Number(o.positionIdx) === posIdx &&
+    String(o.orderStatus) === 'Filled'
+  );
+
+  const tp = filled.find(o => o.stopOrderType === 'TakeProfit' || o.createType === 'CreateByTakeProfit');
+  if (tp) return { reason: 'tp', exitPrice: parseFloat(tp.avgPrice || tp.price || '0'), orderId: tp.orderId };
+
+  const sl = filled.find(o => o.stopOrderType === 'StopLoss' || o.createType === 'CreateByStopLoss');
+  if (sl) return { reason: 'sl', exitPrice: parseFloat(sl.avgPrice || sl.price || '0'), orderId: sl.orderId };
+
+  const manual = filled.find(o =>
+    o.side === closeSide &&
+    o.reduceOnly === true &&
+    (o.stopOrderType === '' || o.stopOrderType === null) &&
+    o.createType === 'CreateByUser'
+  );
+  if (manual) return { reason: 'manual', exitPrice: parseFloat(manual.avgPrice || manual.price || '0'), orderId: manual.orderId };
+
+  const pnl = await getClosedPnL(symbol, 5, env);
+  if (pnl && pnl.length) {
+    const last = pnl[0];
+    return { reason: 'unknown', exitPrice: parseFloat(last.avgExitPrice || '0'), orderId: last.orderId };
+  }
+
+  return { reason: 'unknown', exitPrice: 0, orderId: null };
+}
+
+// ============================================================
+// CLOSE POSITION (STATE + HISTORY)
+// ============================================================
+
+async function closePositionCached(position, exitData, env) {
+  validatePosition(position);
+
+  const state = await getGistStateCache(env);
+
+  const symbol = position.symbol;
+  const posSide = position.positionSide;
+  const key = position.positionKey;
+
+  removePositionFromState(state, symbol, posSide);
+
+  const entryPx = Number(position.entry_price || 0);
+  const exitPx = Number(exitData.exit_price || entryPx);
+
+  const isLong = posSide === POSITION_SIDES.LONG;
+  const ret = (entryPx > 0 && exitPx > 0)
+    ? (isLong ? (exitPx / entryPx - 1) : (entryPx / exitPx - 1))
+    : 0;
+
+  const pnl_percent = ret * 100;
+  const pnl_bps = Math.round(ret * 10000);
+
+  const base = symbol.replace(/(USDT|USDC|USD)$/, '');
+
+  const closedEntry = {
+    ...position,
+    ...exitData,
+    symbol: base,
+    symbolFull: symbol,
+    price_entry: entryPx,
+    price_exit: exitPx,
+    pnl_bps,
+    pnl_percent,
+    status: 'closed',
+    ts_closed: Date.now(),
+    exchange: 'bybit'
+  };
+
+  state.closed = state.closed || [];
+  state.closed.push(closedEntry);
+
+  state.equity = state.equity || [];
+  state.equity.push({ ts_ms: exitData.ts_exit_ms || Date.now(), pnl_bps });
+
+  state.sym_stats_real = state.sym_stats_real || {};
+  if (!state.sym_stats_real[base]) state.sym_stats_real[base] = { n: 0, wins: 0, pnl_sum: 0 };
+
+  state.sym_stats_real[base].n += 1;
+  state.sym_stats_real[base].pnl_sum += pnl_bps;
+  if (pnl_bps > 0) state.sym_stats_real[base].wins += 1;
+
+  state.lastReconcileTs = Date.now();
+  GIST_STATE_DIRTY = true;
+
+  console.log(`[close] ${key} → ${exitData.exit_reason} pnl=${pnl_bps}bps (${pnl_percent.toFixed(2)}%)`);
+}
+
+async function handleClosedPosition(position, state, env) {
+  validatePosition(position);
+
+  const key = position.positionKey;
+  const symbol = position.symbol;
+
+  console.log(`[monitor:closed] ${key} position closed, analyzing exit...`);
+
+  const exit = await detectExitReason(symbol, position.positionSide, position.ts_entry_ms || 0, env);
+  await sleep(150);
+
+  let exitReason = exit.reason || 'unknown';
+  let exitPrice = exit.exitPrice || position.entry_price || 0;
+
+  if (exitReason === 'tp') {
+    console.log(`[monitor:closed] ${key} TP HIT at ${exitPrice}`);
+  } else if (exitReason === 'sl') {
+    console.log(`[monitor:closed] ${key} SL HIT at ${exitPrice}`);
+  } else if (exitReason === 'manual') {
+    console.log(`[monitor:closed] ${key} MANUAL CLOSE at ${exitPrice}`);
+  } else {
+    console.log(`[monitor:closed] ${key} UNKNOWN CLOSE`);
+  }
+
+  await closePositionCached(position, {
+    exit_reason: exitReason,
+    exit_price: exitPrice,
+    exit_order_id: exit.orderId,
+    ts_exit_ms: Date.now()
+  }, env);
+}
+
+// ============================================================
+// REARM LOGIC
+// ============================================================
+
+function shouldRearmTPSL(statePos, livePos, now) {
+  const lastAttempt = statePos.tpsl_last_attempt || statePos.ts_entry_ms || 0;
+  const since = now - lastAttempt;
+
+  const hasTP = livePos.takeProfit !== null && livePos.takeProfit > 0;
+  const hasSL = livePos.stopLoss !== null && livePos.stopLoss > 0;
+
+  if (!hasTP || !hasSL) return { should: true, reason: 'missing_protection' };
+  if (statePos.tpsl_armed !== true) return { should: true, reason: 'not_armed' };
+  if (statePos.needs_verification === true) return { should: true, reason: 'needs_verification' };
+
+  if (since < MIN_REARM_INTERVAL) return { should: false, reason: 'throttled' };
+  if (since > 30 * 60 * 1000) return { should: true, reason: 'periodic_check' };
+
+  return { should: false, reason: 'no_need' };
+}
+
+// ============================================================
+// EMERGENCY GUARD
+// ============================================================
+
+async function checkUnprotectedPositionEmergency(position, livePosition, env) {
+  validatePosition(position);
+
+  const symbol = position.symbol;
+  const posSide = position.positionSide;
+  const key = position.positionKey;
+
+  if (!livePosition) {
+    return { action: 'none', reason: 'no_live_position' };
+  }
+
+  if (livePosition.positionSide !== posSide) {
+    console.error(`[emergency] ${key} SIDE MISMATCH: state=${posSide} exchange=${livePosition.positionSide}`);
+    return { action: 'error', reason: 'side_mismatch' };
+  }
+
+  try {
+    const hasTP = livePosition.takeProfit !== null && livePosition.takeProfit > 0;
+    const hasSL = livePosition.stopLoss !== null && livePosition.stopLoss > 0;
+
+    if (hasTP && hasSL) {
+      return { action: 'none', reason: 'fully_protected' };
+    }
+
+    console.warn(`[emergency] ${key} UNPROTECTED - TP=${hasTP} SL=${hasSL}`);
+
+    const market = await getMarketInfoCached(symbol, env);
+    const tpslResult = await setTPSL({
+      symbol,
+      position,
+      market,
+      env
+    });
+
+    if (tpslResult.tp_set && tpslResult.sl_set) {
+      console.log(`[emergency] ${key} ✓ RE-ARMED successfully`);
+      return { action: 'rearmed', reason: 'rearmed_successfully' };
+    }
+
+    const trailing = position.trailing;
+    if (!trailing) {
+      console.warn(`[emergency] ${key} no trailing config, cannot check thresholds`);
+      return { action: 'none', reason: 'no_trailing_config' };
+    }
+
+    const entryPrice = position.entry_price;
+    const currentPrice = livePosition.markPrice;
+    const isLong = posSide === POSITION_SIDES.LONG;
+
+    let slThreshold, tpThreshold;
+    if (isLong) {
+      slThreshold = entryPrice * (1 + trailing.initial_sl_percent / 100);
+      tpThreshold = entryPrice * (1 + trailing.ultra_15_tp_percent / 100);
+    } else {
+      slThreshold = entryPrice * (1 - trailing.initial_sl_percent / 100);
+      tpThreshold = entryPrice * (1 - trailing.ultra_15_tp_percent / 100);
+    }
+
+    console.log(`[emergency] ${key} Entry=${entryPrice} Current=${currentPrice} SL=${slThreshold.toFixed(4)} TP=${tpThreshold.toFixed(4)}`);
+
+    let beyondThreshold = false;
+    let breachType = '';
+
+    if (isLong) {
+      if (currentPrice <= slThreshold) {
+        beyondThreshold = true;
+        breachType = 'below_sl_threshold';
+      } else if (currentPrice >= tpThreshold) {
+        beyondThreshold = true;
+        breachType = 'above_tp_threshold';
+      }
+    } else {
+      if (currentPrice >= slThreshold) {
+        beyondThreshold = true;
+        breachType = 'above_sl_threshold';
+      } else if (currentPrice <= tpThreshold) {
+        beyondThreshold = true;
+        breachType = 'below_tp_threshold';
+      }
+    }
+
+    if (beyondThreshold) {
+      console.error(`[emergency] 🚨🚨🚨 ${key} UNPROTECTED + ${breachType}`);
+      console.error(`[emergency] 🚨 EMERGENCY CLOSING POSITION`);
+
+      const closeSide = getCloseOrderSide(posSide);
+      const closeResult = await placeOrderWithRetry(
+        symbol,
+        closeSide,
+        livePosition.size,
+        market,
+        env,
+        true
+      );
+
+      if (closeResult.success) {
+        console.log(`[emergency] ✓ ${key} EMERGENCY CLOSED`);
+
+        await closePositionCached(position, {
+          exit_reason: 'emergency_unprotected_threshold_breach',
+          exit_detail: breachType,
+          exit_price: currentPrice,
+          ts_exit_ms: Date.now(),
+          emergency_close: true
+        }, env);
+
+        return { action: 'emergency_closed', reason: breachType };
+      } else {
+        console.error(`[emergency] ✗ ${key} EMERGENCY CLOSE FAILED`);
+        return { action: 'close_failed', reason: 'market_order_rejected' };
+      }
+    }
+
+    console.warn(`[emergency] ${key} unprotected but within safe zone`);
+    return { action: 'none', reason: 'unprotected_but_within_safe_zone' };
+
+  } catch (e) {
+    console.error(`[emergency] ${key} error:`, e?.message || e);
+    return { action: 'error', reason: e?.message || 'unknown' };
+  }
+}
+
+// ============================================================
+// MONITOR LOOP
+// ============================================================
+
+async function monitorPositions(env) {
+  const startTime = Date.now();
+  console.log('[monitor] ========================================');
+  console.log('[monitor] Starting at', new Date().toISOString());
+
+  GIST_STATE_CACHE = null;
+  GIST_STATE_DIRTY = false;
+
+  try {
+    await syncServerTime(env);
+
+    const state = await loadGistState(env);
+
+    const activePositions = (state.pending || []).filter(p => p.status === 'active');
+    const pendingMaker = (state.pending || []).filter(p => p.status === 'pending_fill');
+
+    console.log(`[monitor] Active: ${activePositions.length}, Pending: ${pendingMaker.length}`);
+
+    if (!activePositions.length && !pendingMaker.length) {
+      console.log('[monitor] No positions to monitor');
+      await cleanupZombieIdeas(state);
+      await flushGistState(env);
+      return;
+    }
+
+    const exchangePositions = await getAllOpenPositionsWithRetry(env);
+
+    const exchangeMap = new Map();
+    for (const pos of exchangePositions) {
+      exchangeMap.set(pos.positionKey, pos);
+    }
+
+    console.log(`[monitor] Exchange positions: ${exchangeMap.size}`);
+
+    for (const p of pendingMaker) {
+      if (Date.now() - startTime > MAX_MONITOR_TIME - 10000) {
+        console.warn('[monitor] Timeout approaching, stopping maker check');
+        break;
+      }
+
+      await processPendingMakerOrder(p, state, env);
+      await sleep(300);
+    }
+
+    const refreshedPositions = await getAllOpenPositionsWithRetry(env);
+    const refreshedMap = new Map();
+    for (const pos of refreshedPositions) {
+      refreshedMap.set(pos.positionKey, pos);
+    }
+
+    const currentActive = (state.pending || []).filter(p => p.status === 'active');
+
+    let closedCount = 0;
+    let rearmedCount = 0;
+    let trailedCount = 0;
+
+    for (const p of currentActive) {
+      if (Date.now() - startTime > MAX_MONITOR_TIME - 5000) {
+        console.warn('[monitor] Timeout approaching, stopping active check');
+        break;
+      }
+
+      try {
+        try {
+          validatePosition(p);
+        } catch (e) {
+          console.error(`[monitor] Invalid position in state:`, e?.message || e);
+          continue;
+        }
+
+        const key = p.positionKey;
+        const livePos = refreshedMap.get(key);
+        const now = Date.now();
+
+        if (!livePos || livePos.size === 0) {
+          console.log(`[monitor] ${key} not found on exchange → closed`);
+          await handleClosedPosition(p, state, env);
+          closedCount++;
+          await sleep(200);
+          continue;
+        }
+
+        if (p.needs_verification === true) {
+          console.log(`[monitor:verify] ${key} verifying entry price...`);
+
+          const stateEntryPrice = p.entry_price;
+          const actualEntryPrice = livePos.avgPrice;
+          const priceDiff = Math.abs(actualEntryPrice - stateEntryPrice);
+          const diffPercent = (priceDiff / stateEntryPrice) * 100;
+
+          if (diffPercent > 0.1) {
+            console.warn(`[monitor:verify] ${key} entry mismatch: state=${stateEntryPrice} actual=${actualEntryPrice} (${diffPercent.toFixed(2)}%)`);
+
+            updatePositionInState(state, p.symbol, p.positionSide, {
+              entry_price: actualEntryPrice,
+              qty: livePos.size,
+              needs_verification: false,
+              position_verified: true,
+              entry_price_source: 'exchange_position',
+              tp_set: false,
+              sl_set: false,
+              tpsl_armed: false
+            });
+          } else {
+            console.log(`[monitor:verify] ${key} entry OK (diff: ${diffPercent.toFixed(3)}%)`);
+            updatePositionInState(state, p.symbol, p.positionSide, {
+              needs_verification: false,
+              position_verified: true
+            });
+          }
+        }
+
+        const emergencyResult = await checkUnprotectedPositionEmergency(p, livePos, env);
+
+        if (emergencyResult.action === 'emergency_closed') {
+          console.log(`[monitor] 🚨 ${key} EMERGENCY CLOSED`);
+          closedCount++;
+          await sleep(300);
+          continue;
+        } else if (emergencyResult.action === 'rearmed') {
+          rearmedCount++;
+        }
+
+        const hasTP = livePos.takeProfit !== null && livePos.takeProfit > 0;
+        const hasSL = livePos.stopLoss !== null && livePos.stopLoss > 0;
+        const isProtected = hasTP && hasSL;
+
+        if (!isProtected) {
+          const needsRearm = shouldRearmTPSL(p, livePos, now);
+
+          if (needsRearm.should) {
+            console.log(`[monitor:rearm] ${key} RE-ARM: ${needsRearm.reason}`);
+
+            const market = await getMarketInfoCached(p.symbol, env);
+            const tpslResult = await setTPSL({
+              symbol: p.symbol,
+              position: p,
+              market,
+              env
+            });
+
+            updatePositionInState(state, p.symbol, p.positionSide, {
+              tp_set: tpslResult.tp_set,
+              sl_set: tpslResult.sl_set,
+              tpsl_armed: tpslResult.tp_set && tpslResult.sl_set,
+              tpsl_last_attempt: now,
+              rearm_count: (p.rearm_count || 0) + 1
+            });
+
+            if (tpslResult.tp_set && tpslResult.sl_set) {
+              rearmedCount++;
+            }
+          }
+        }
+
+        if (p.trailing) {
+          const trailingBefore = p.trailing.trailing_stage || 'initial';
+          await checkTrailing(p, livePos, state, env);
+
+          const updatedP = findPositionInState(state, p.symbol, p.positionSide);
+          if (updatedP && updatedP.trailing && updatedP.trailing.trailing_stage !== trailingBefore) {
+            trailedCount++;
+          }
+        }
+
+      } catch (e) {
+        console.error('[monitor] Position error:', e?.message || e);
+      }
+
+      await sleep(300);
+    }
+
+    await cleanupZombieIdeas(state);
+    await flushGistState(env);
+
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+    console.log('[monitor] ========================================');
+    console.log(`[monitor] ✅ COMPLETE in ${elapsed}s`);
+    console.log(`[monitor] Closed: ${closedCount} | Re-armed: ${rearmedCount} | Trailed: ${trailedCount}`);
+    console.log('[monitor] ========================================');
+
+  } catch (e) {
+    console.error('[monitor] CRITICAL ERROR:', e?.message || e);
+    await flushGistState(env);
+  }
+}
+// ============================================================
+// FLUSH ALL
+// ============================================================
+
+async function closeAllPositionsAndOrders(state, env, startTime) {
+  console.log('[flush] start');
+
+  const MAX_FLUSH_ATTEMPTS = 3;
+
+  for (let attempt = 1; attempt <= MAX_FLUSH_ATTEMPTS; attempt++) {
+    const rt = await bybitRequest('/v5/order/realtime', `category=${BYBIT_CATEGORY}&settleCoin=USDT&limit=50`, 'GET', env);
+    const orders = rt.list || [];
+
+    const bySym = {};
+    for (const o of orders) {
+      bySym[o.symbol] = bySym[o.symbol] || [];
+      bySym[o.symbol].push(o);
+    }
+
+    for (const sym of Object.keys(bySym)) {
+      await cancelAllSymbolOrders(sym, env);
+      await sleep(100);
+    }
+
+    const positions = await getAllOpenPositionsWithRetry(env);
+    for (const p of positions) {
+      if (Date.now() - startTime > MAX_EXECUTION_TIME - 10000) break;
+
+      const closeSide = getCloseOrderSide(p.positionSide);
+      const market = await getMarketInfoCached(p.symbol, env);
+
+      await placeOrderWithRetry(p.symbol, closeSide, p.size, market, env, true);
+      await sleep(200);
+    }
+
+    const rt2 = await bybitRequest('/v5/order/realtime', `category=${BYBIT_CATEGORY}&settleCoin=USDT&limit=50`, 'GET', env);
+    const leftOrders = (rt2.list || []).length;
+    const leftPos = (await getAllOpenPositionsWithRetry(env)).length;
+
+    if (leftOrders === 0 && leftPos === 0) break;
+
+    if (attempt === MAX_FLUSH_ATTEMPTS) {
+      throw new Error(`FLUSH FAILED: ${leftOrders} orders + ${leftPos} positions remain`);
+    }
+
+    await sleep(1000);
+  }
+
+  const before = (state.pending || []).length;
+  state.pending = (state.pending || []).filter(p => p.status !== 'active' && p.status !== 'pending_fill');
+  if ((state.pending || []).length !== before) GIST_STATE_DIRTY = true;
+
+  console.log('[flush] done');
+}
+
+// ============================================================
+// TWO-PHASE CYCLE (close all -> open new)
+// ============================================================
+
+async function processCycleTwoPhase(ideas, env, startTime) {
+  const batch_id = `batch_${Date.now()}`;
+
+  GIST_STATE_CACHE = null;
+  GIST_STATE_DIRTY = false;
+
+  const state = await loadGistState(env);
+
+  await ensureHedgeMode(env);
+
+  await closeAllPositionsAndOrders(state, env, startTime);
+
+  const ledger = {
+    batch_id,
+    received: ideas.map(i => i.idea_id || i.client_order_id || 'unknown'),
+    executed: [],
+    rejected: [],
+    failed: [],
+    tpsl_status: []
+  };
+
+  const balance = await getAvailableBalanceWithRetry(env);
+  const capPct = toNum(env.CAPITAL_PERCENTAGE, 0.10);
+
+  const filled = [];
+
+  for (let i = 0; i < ideas.length; i++) {
+    if (Date.now() - startTime > MAX_EXECUTION_TIME - 10000) break;
+
+    try {
+      const r = await fillPosition(ideas[i], balance, capPct, env, batch_id);
+      if (r.success) {
+        filled.push(r.position);
+        ledger.executed.push(ideas[i].idea_id || ideas[i].client_order_id || 'unknown');
+      } else {
+        ledger.rejected.push({ id: ideas[i].idea_id || ideas[i].client_order_id || 'unknown', reason: r.error });
+      }
+    } catch (e) {
+      ledger.failed.push({ id: ideas[i].idea_id || ideas[i].client_order_id || 'unknown', reason: e?.message || String(e) });
+    }
+
+    await sleep(INTER_ORDER_SLEEP);
+  }
+
+  const filledActive = filled.filter(p => p.status === 'active');
+  for (const pos of filledActive) {
+    if (Date.now() - startTime > MAX_EXECUTION_TIME - 3000) break;
+
+    const market = await getMarketInfoCached(pos.symbol, env);
+    const r = await setTPSL({ symbol: pos.symbol, position: pos, market, env });
+
+    pos.tpsl_armed = r.tp_set && r.sl_set;
+    pos.tpsl_last_attempt = Date.now();
+    ledger.tpsl_status.push({ positionKey: pos.positionKey, tp_set: r.tp_set, sl_set: r.sl_set, status: r.status });
+
+    await sleep(INTER_TPSL_SLEEP);
+  }
+
+  const finalState = await getGistStateCache(env);
+  for (const pos of filled) addPositionToState(finalState, pos);
+
+  finalState.last_batch = {
+    ts: new Date().toISOString(),
+    ts_ms: Date.now(),
+    execution_time_ms: Date.now() - startTime,
+    exchange: 'bybit',
+    trailing_system: '20-stage',
+    ...ledger
+  };
+
+  await flushGistState(env);
+}
+
+async function processCycleWithTimeout(ideas, env) {
+  const startTime = Date.now();
+  try {
+    await syncServerTime(env);
+    await processCycleTwoPhase(ideas, env, startTime);
+  } catch (e) {
+    console.error('[cycle] CRITICAL:', e?.message || e);
+    await flushGistState(env);
+  }
+}
+
+// ============================================================
+// SYSTEM INTEGRITY TESTS
+// ============================================================
+
+async function validateSystemIntegrity(env) {
+  const results = { exchange: 'bybit', passed: 0, failed: 0, errors: [] };
+
+  const tests = [
+    {
+      name: 'Public time endpoint',
+      fn: async () => {
+        const r = await bybitPublicRequest('/v5/market/time', env);
+        if (!r?.timeSecond) throw new Error('Missing timeSecond');
+        return `timeSecond=${r.timeSecond}`;
+      }
+    },
+    {
+      name: 'Auth key info',
+      fn: async () => {
+        const r = await bybitRequest('/v5/user/query-api', '', 'GET', env);
+        if (!r?.id) throw new Error('Missing key id');
+        return `id=${r.id}`;
+      }
+    },
+    {
+      name: 'USDT balance read',
+      fn: async () => {
+        const b = await getAvailableBalanceWithRetry(env);
+        if (!Number.isFinite(b)) throw new Error('Balance not finite');
+        return `USDT=${b}`;
+      }
+    },
+    {
+      name: 'Market info BTCUSDT',
+      fn: async () => {
+        const m = await getMarketInfoCached('BTCUSDT', env);
+        if (!m.valid) throw new Error('Market invalid');
+        if (!(m.tickSize > 0) || !(m.stepSize > 0)) throw new Error('Bad filters');
+        return `price=${m.price} tick=${m.tickSize} step=${m.stepSize}`;
+      }
+    },
+    {
+      name: 'Side mapping',
+      fn: async () => {
+        if (sideToPositionIdx('LONG') !== 1) throw new Error('LONG->1 failed');
+        if (sideToPositionIdx('SHORT') !== 2) throw new Error('SHORT->2 failed');
+        if (positionIdxToSide(1) !== 'LONG') throw new Error('1->LONG failed');
+        if (positionIdxToSide(2) !== 'SHORT') throw new Error('2->SHORT failed');
+        return 'ok';
+      }
+    },
+    {
+      name: 'Trailing config validation',
+      fn: async () => {
+        try {
+          const config = resolveTrailingConfig(env);
+          if (!config.ultra_15_tp_percent) throw new Error('Missing ultra_15_tp_percent');
+          if (!config.micro_trailing_offset_percent) throw new Error('Missing micro_trailing_offset_percent');
+          return `stages=20 final_tp=${config.ultra_15_tp_percent}%`;
+        } catch (e) {
+          throw new Error(`Config error: ${e.message}`);
+        }
+      }
+    }
+  ];
+
+  for (const t of tests) {
+    try {
+      const out = await t.fn();
+      results.passed++;
+      console.log(`[test] ✓ ${t.name}: ${out}`);
+    } catch (e) {
+      results.failed++;
+      results.errors.push({ name: t.name, error: e?.message || String(e) });
+      console.error(`[test] ✗ ${t.name}:`, e?.message || e);
+    }
+  }
+
+  return results;
+}
+// ============================================================
+// WORKER EXPORT
+// ============================================================
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    if (url.pathname === '/health') {
+      return jsonResponse({
+        status: 'ok',
+        exchange: 'bybit',
+        version: 'bybit-position-identity-system-v1.0-20stage',
+        trailing_system: '20-stage (MICRO+BASE+MINOR+MAJOR+ULTRA_1-15)',
+        hedge_mode: 'required (positionIdx 1/2)',
+        base_url: env.BYBIT_BASE_URL || null,
+        ts: Date.now()
+      });
+    }
+
+    const requireAuth = () => {
+      const authHeader = request.headers.get('Authorization') || '';
+      const token = (env.PUSH_TOKEN || '').trim();
+      const presented = authHeader.replace(/^Bearer\s+/i, '').trim();
+      return !!token && presented === token;
+    };
+
+    if (url.pathname === '/signals/push' && request.method === 'POST') {
+      if (!requireAuth()) return jsonResponse({ error: 'Unauthorized' }, 401);
+
+      const payload = await request.json().catch(() => ({}));
+      const ideas = Array.isArray(payload.ideas) ? payload.ideas : [];
+
+      if (!ideas.length) return jsonResponse({ success: true, accepted: 0 }, 202);
+
+      ctx.waitUntil(
+        Promise.race([
+          processCycleWithTimeout(ideas, env),
+          sleep(MAX_EXECUTION_TIME).then(() => console.error('[push] TIMEOUT'))
+        ])
+      );
+
+      return jsonResponse({ success: true, accepted: ideas.length }, 202);
+    }
+
+    if (url.pathname === '/monitor' && request.method === 'POST') {
+      if (!requireAuth()) return jsonResponse({ error: 'Unauthorized' }, 401);
+
+      ctx.waitUntil(monitorPositions(env));
+      return jsonResponse({ success: true }, 202);
+    }
+
+    if (url.pathname === '/migrate' && request.method === 'POST') {
+      if (!requireAuth()) return jsonResponse({ error: 'Unauthorized' }, 401);
+
+      const r = await migrateStateToPositionKeys(env);
+      return jsonResponse(r);
+    }
+
+    if (url.pathname === '/test' && request.method === 'POST') {
+      if (!requireAuth()) return jsonResponse({ error: 'Unauthorized' }, 401);
+
+      const r = await validateSystemIntegrity(env);
+      return jsonResponse(r);
+    }
+
+    return new Response('Bybit Position Identity System v1.0 - 20 Stage Trailing', { status: 200 });
+  },
+
+  async scheduled(event, env, ctx) {
+    console.log('[scheduled] Monitor triggered at', new Date().toISOString());
+    ctx.waitUntil(monitorPositions(env));
+  }
+};
+
+
