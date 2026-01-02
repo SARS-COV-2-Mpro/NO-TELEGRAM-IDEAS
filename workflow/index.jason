@@ -1,1 +1,31 @@
-v
+To make the GIST wipe happen at run 3 instead of run 6, you need to make these changes:
+
+1. **Line 2364** - Change the log message:
+```javascript
+// FROM:
+log(`🔄 Run ${state.run_counter}/6`);
+// TO:
+log(`🔄 Run ${state.run_counter}/3`);
+```
+
+2. **Line 2366** - Change the wipe condition:
+```javascript
+// FROM:
+const SHOULD_WIPE = (state.run_counter >= 6);
+// TO:
+const SHOULD_WIPE = (state.run_counter >= 3);
+```
+
+3. **Line 2369** - Update the wipe log message:
+```javascript
+// FROM:
+log("🗑️  RUN 6: WIPE GIST AND RESTART FRESH");
+// TO:
+log("🗑️  RUN 3: WIPE GIST AND RESTART FRESH");
+```
+
+These three changes will make the GIST wipe and reset happen every 3 runs instead of every 6 runs. The system will now:
+- Run 1: Normal operation
+- Run 2: Normal operation  
+- Run 3: Wipe GIST and restart fresh with run_counter reset to 0
+- Then repeat the cycle
