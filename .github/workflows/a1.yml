@@ -12,7 +12,7 @@ permissions:
 jobs:
   a1:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 8
 
     steps:
       - name: 🚀 A1 Work
