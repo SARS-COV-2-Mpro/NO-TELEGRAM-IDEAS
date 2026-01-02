@@ -1,7 +1,8 @@
-name: Ideas Pusher (BYBIT Ultimate 7.7.7)
+name: Ideas Pusher (Bybit Ultimate 7.7.7)
 
 on:
-
+  schedule:
+    - cron: "*/30 * * * *"
   repository_dispatch:
     types: [run_B]
   workflow_dispatch: {}
@@ -10,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ideas-mexc-ultimate
+  group: ideas-bybit-ultimate
   cancel-in-progress: true
 
 jobs:
@@ -25,26 +26,27 @@ jobs:
       WORKER_PUSH_URL_V2: ${{ secrets.WORKER_PUSH_URL_V2 }}
 
       # Required for trade reconciliation
-      MEXC_API_KEY: ${{ secrets.MEXC_API_KEY }}
-      MEXC_SECRET_KEY: ${{ secrets.MEXC_SECRET_KEY }}
+      BYBIT_API_KEY: ${{ secrets.BYBIT_API_KEY }}
+      BYBIT_API_SECRET: ${{ secrets.BYBIT_API_SECRET }}
 
       # Optional (safe defaults inside the script)
       GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
       GIST_ID: ${{ secrets.GIST_ID }}
 
       # Exchange + tuning knobs (via Repo/Org Variables)
-      EXCHANGE: mexc
+      EXCHANGE: bybit
       MIN_QV_USD: ${{ vars.MIN_QV_USD }}
       TOP_N: ${{ vars.TOP_N }}
       MAX_SPREAD_BPS: ${{ vars.MAX_SPREAD_BPS }}
       EXP_LCB_MIN_BPS: ${{ vars.EXP_LCB_MIN_BPS }}
       FEES_BPS: ${{ vars.FEES_BPS }}
       NOTIONAL_USD: ${{ vars.NOTIONAL_USD }}
-      MEXC_DEPTH_LIMIT: ${{ vars.MEXC_DEPTH_LIMIT }}
+      BYBIT_DEPTH_LIMIT: ${{ vars.BYBIT_DEPTH_LIMIT }}
       OBI_TOPN: ${{ vars.OBI_TOPN }}
       ACTIVE_UTC_START: ${{ vars.ACTIVE_UTC_START }}
       ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
-      MEXC_BASE: ${{ vars.MEXC_BASE }}
+      BYBIT_BASE: ${{ vars.BYBIT_BASE }}
+      BYBIT_TESTNET: ${{ vars.BYBIT_TESTNET }}
       FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}
 
       # New Confidence Model Knobs
@@ -132,6 +134,15 @@ jobs:
           const toCSVLine=(row,keys)=> keys.map(k=>{ let v=row?.[k]; if(v==null) return ""; if(typeof v==="object") v=JSON.stringify(v); const s=String(v); return s.includes(",")||s.includes("\n")||s.includes('"')? `"${s.replace(/"/g,'""')}"`: s; }).join(",");
 
           const slopeBps=(arr,len=21)=>{ if(!arr?.length||arr.length<Math.max(5,len)) return 0; const s=arr.slice(-len); const n=s.length; const last=s[n-1]||1; const mx=(n-1)/2; let num=0,den=0; for(let i=0;i<n;i++){ const x=i, y=((s[i]||last)-last)/last*10000; num+=(x-mx)*y; den+=(x-mx)*(x-mx); } return den>0? num/den : 0; };
+          
+          // Bybit HMAC-SHA256 Signature Generator
+          const bybitSign = (params, secret) => {
+            const timestamp = Date.now().toString();
+            const sortedParams = Object.keys(params).sort().map(k => `${k}=${params[k]}`).join('&');
+            const signPayload = timestamp + BYBIT_API_KEY + BYBIT_RECV_WINDOW + sortedParams;
+            const signature = crypto.createHmac('sha256', secret).update(signPayload).digest('hex');
+            return { timestamp, signature };
+          };
 
           const computeMTFIndicators=(km,weights)=>{ const TFs=["1m","3m","5m","15m","30m","1h","2h","4h","12h","1d"]; const wNorm=(()=>{ let out={}; let sw=0; for(const tf of TFs){ const w=+((weights&&weights[tf])||0); if(w>0){ out[tf]=w; sw+=w; } } if(sw<=0){ out={"1m":0.08,"3m":0.08,"5m":0.12,"15m":0.15,"30m":0.12,"1h":0.12,"2h":0.10,"4h":0.08,"12h":0.07,"1d":0.08}; sw=1; } for(const k of Object.keys(out)) out[k]=out[k]/sw; return out; })();
             const perTF={}; const agg={ rsi:0, adx:0, atr_bps:0, roc1:0, roc3:0 }; let ww=0; const retSeries={};
@@ -216,24 +227,7 @@ jobs:
           const microprice=(bid,ask,qb,qa)=>{ const d=(qb||1)+(qa||1); return (ask*qb + bid*qa)/d; };
           const ofiProxy=(d0,d1)=>{ const lev=(side,d)=>d?.[side]?.slice(0,3).map(x=>+x[1]||0)||[]; const sum=a=>a.reduce((x,y)=>x+y,0); if(!d0||!d1) return 0; return (sum(lev("bids",d1))-sum(lev("bids",d0))) - (sum(lev("asks",d1))-sum(lev("asks",d0))); };
           const bookSlope=(depth, mid)=>{ const toPts=(levels)=>{ let cum=0; const pts=[]; for(const [ps,qs] of (levels||[])){ const p=+ps,q=+qs; if(!(p>0&&q>0)) continue; cum+=p*q; const x=Math.log(Math.abs(p-mid)/mid + 1e-6), y=Math.log(cum+1); pts.push([x,y]); if(pts.length>=10) break; } return pts; }; if(!depth?.asks?.length||!depth?.bids?.length||!(mid>0)) return { slope:0, r2:0 }; const pts=toPts(depth.asks).concat(toPts(depth.bids)); if(pts.length<6) return { slope:0, r2:0 }; const xs=pts.map(p=>p[0]), ys=pts.map(p=>p[1]), mx=mean(xs), my=mean(ys); let num=0,den=0,vy=0; for(let i=0;i<xs.length;i++){ const dx=xs[i]-mx, dy=ys[i]-my; num+=dx*dy; den+=dx*dx; vy+=dy*dy; } return { slope: den>1e-9? num/den : 0, r2: den>1e-9 && vy>1e-9? (num*num)/(den*vy):0 }; };
-          const reasonBuilder=(ctx)=>{ 
-            const out=[]; 
-            // Momentum 5m (2x importance)
-            if((ctx.momentum_5m||0)>=0.1) out.push({ factor:"Momentum_5m", value:+(ctx.momentum_5m||0).toFixed(3)+"%", contribution:+Math.min(30,(ctx.momentum_5m)*50).toFixed(1) }); 
-            // Spread (2x importance - lower is better, so invert)
-            if((ctx.spread_bps||999)<=10) out.push({ factor:"Spread", value:(ctx.spread_bps||0)+"bps", contribution:+Math.min(30, Math.max(0, 15-ctx.spread_bps)*2).toFixed(1) }); 
-            // Vol 5m
-            if((ctx.vol_5m_pct||0)>=0.3) out.push({ factor:"Vol_5m_pct", value:+(ctx.vol_5m_pct||0).toFixed(2)+"%", contribution:+Math.min(15,(ctx.vol_5m_pct)*10).toFixed(1) }); 
-            // Funding
-            if((ctx.funding_rate||0)>=0.0003) out.push({ factor:"Funding", value:+(ctx.funding_rate*100||0).toFixed(3)+"%", contribution:+Math.min(10, ctx.funding_rate*10000).toFixed(1) }); 
-            // OI delta
-            if((ctx.oi_delta_pct||0)>=5) out.push({ factor:"OI_delta", value:+(ctx.oi_delta_pct||0).toFixed(1)+"%", contribution:+Math.min(8,(ctx.oi_delta_pct)*0.5).toFixed(1) }); 
-            // Volume 5m
-            if((ctx.volume_5m_usd||0)>=2000000) out.push({ factor:"Volume_5m", value:Math.round((ctx.volume_5m_usd||0)/1000000)+"M", contribution:+Math.min(7, (ctx.volume_5m_usd||0)/2000000).toFixed(1) }); 
-            // Basis
-            if((ctx.basis_bps||0)>5) out.push({ factor:"Basis", value:+(ctx.basis_bps||0).toFixed(1)+"bps", contribution:+Math.min(5, ctx.basis_bps*0.3).toFixed(1) }); 
-            return out.sort((a,b)=>Math.abs(b.contribution)-Math.abs(a.contribution)).slice(0,5); 
-          };
+          const reasonBuilder=(ctx)=>{ const out=[]; if((ctx.vol_1h_pct||0)>=1.5) out.push({ factor:"Vol_1h_pct", value:+(ctx.vol_1h_pct||0).toFixed(2), contribution:+Math.min(20,(ctx.vol_1h_pct)*5).toFixed(1) }); if((ctx.funding_rate||0)>=0.0003) out.push({ factor:"Funding", value:+(ctx.funding_rate*100||0).toFixed(3), contribution:+Math.min(15, ctx.funding_rate*10000).toFixed(1) }); if((ctx.oi_delta_pct||0)>=5) out.push({ factor:"OI_delta_pct", value:+(ctx.oi_delta_pct||0).toFixed(1), contribution:+Math.min(12,(ctx.oi_delta_pct)*0.8).toFixed(1) }); if((ctx.volume_1h_usd||0)>=30000000) out.push({ factor:"Volume_1h", value:Math.round((ctx.volume_1h_usd||0)/1000000)+"M", contribution:+Math.min(10, (ctx.volume_1h_usd||0)/10000000).toFixed(1) }); if((ctx.basis_bps||0)>5) out.push({ factor:"Basis_bps", value:+(ctx.basis_bps||0).toFixed(1), contribution:+Math.min(8, ctx.basis_bps*0.5).toFixed(1) }); return out.sort((a,b)=>Math.abs(b.contribution)-Math.abs(a.contribution)).slice(0,5); };
           const cholesky=(A)=>{ const n=A.length; const L=Array.from({length:n},()=>Array(n).fill(0)); for(let i=0;i<n;i++){ for(let j=0;j<=i;j++){ let s=0; for(let k=0;k<j;k++) s+=L[i][k]*L[j][k]; const v=A[i][j]-s; if(i===j){ if(v<=1e-12) return null; L[i][j]=Math.sqrt(Math.max(v,1e-12)); } else L[i][j]=v/(L[j][j]||1e-12); } } return L; };
           const choleskySafe=(S)=>{ const L=cholesky(S); if(L) return L; const n=S.length; const Sc=S.map((r,i)=> r.map((v,j)=> v + (i===j?1e-6:0))); return cholesky(Sc); };
           const sampleMultiT=(muVec,Sigma,df=6,M=1000)=>{ const n=muVec.length; const L=choleskySafe(Sigma); if(!L) return []; const out=[]; for(let m=0;m<M;m++){ const z=Array(n).fill(0).map(()=>randn()); const y=Array(n).fill(0); for(let i=0;i<n;i++){ let s=0; for(let k=0;k<i;k++) s+=L[i][k]*z[k]; y[i]=s; } let chi=0; for(let i=0;i<df;i++){ const zc=randn(); chi+=zc*zc; } const scale=Math.sqrt(df/Math.max(1e-9,chi)); out.push(y.map((yi,i)=> (muVec[i]||0) + yi*scale)); } return out; };
@@ -249,19 +243,19 @@ jobs:
           const setCached=(map,key,v)=>map.set(key,{ v, ts: Date.now() });
 
           // ---------- Config / ENV ----------
-          const TARGET_EXCHANGE = "bybit_linear";
+          const TARGET_EXCHANGE = "bybit_linear";  // ← CHANGED for Bybit
           const MARKET_TYPE     = "futures";
           const MARGIN_MODE     = "isolated";
           const LEVERAGE        = 1;
-
-          // We keep MEXC env vars for now (unused in this version)
+          
           const EXCHANGE=(process.env.EXCHANGE||"bybit").toLowerCase();
-          const MEXC_API_KEY = process.env.MEXC_API_KEY || "";
-          const MEXC_SECRET_KEY = process.env.MEXC_SECRET_KEY || "";
-          const MEXC_BASES=[process.env.MEXC_BASE,"https://api.mexc.com","https://www.mexc.com"].filter(Boolean);
+          const BYBIT_API_KEY = process.env.BYBIT_API_KEY || "";
+          const BYBIT_API_SECRET = process.env.BYBIT_API_SECRET || "";
+          const BYBIT_TESTNET = (process.env.BYBIT_TESTNET || "false").toLowerCase() === "true";
+          const BYBIT_BASE = process.env.BYBIT_BASE || (BYBIT_TESTNET ? "https://api-testnet.bybit.com" : "https://api.bybit.com");
+          const BYBIT_RECV_WINDOW = "5000";
 
-          // Bybit endpoints (public, no API key needed)
-          const BYBIT_BASE = "https://lonely-manya-mazetofutures-c11b521d.koyeb.app/mainnet";
+          const BYBIT_API = BYBIT_BASE;
           
           const MIN_TF_ALIGN=(Number(process.env.MIN_TF_ALIGN||"0.60"));
           let TF_WEIGHTS={}; try{ TF_WEIGHTS=JSON.parse(process.env.TF_WEIGHTS||"{}"); }catch{ TF_WEIGHTS={}; }
@@ -296,7 +290,7 @@ jobs:
           const EXP_LCB_MIN_BPS_BASE=Number(process.env.EXP_LCB_MIN_BPS||"12");
           const EMA_FAST=21, EMA_SLOW=50, ADX_P=14, ATR_P=14, K1M=240, K5M=300, K15M=300, K1H=300, K4H=300;
           const VWAP_5M_WIN=36, COST_BPS=Number(process.env.FEES_BPS||"10"), NOTIONAL=Number(process.env.NOTIONAL_USD||"300");
-          const DEPTH_LIMIT=Number(process.env.BYBIT_DEPTH_LIMIT||"50");
+          const DEPTH_LIMIT=Number(process.env.BYBIT_DEPTH_LIMIT||"50");  // ← CHANGED
           const OBI_TOPN=Number(process.env.OBI_TOPN||"12");
           const COOLDOWN_MS=3*60*60*1000, FLIP_GUARD_MS=30*60*1000;
           const DD_24H_LIMIT_BPS=-150, DD_PEAK_LIMIT_BPS=-300;
@@ -323,23 +317,17 @@ jobs:
           const LONG_BOUNCE_SL_ATR=Number(process.env.LONG_BOUNCE_SL_ATR||"0.50"), LONG_BOUNCE_TP_ATR=Number(process.env.LONG_BOUNCE_TP_ATR||"0.90");
           const LONG_SIMILARITY_RHO=Number(process.env.LONG_SIMILARITY_RHO||"0.84");
 
-          // Golden metrics ideal thresholds (5m based)
-          const IDEAL_VOL_5M_PCT = 0.5;         // |5m price change| >= 0.5%
-          const IDEAL_MOMENTUM_5M = 0.3;        // momentum acceleration >= 0.3%
-          const IDEAL_FUNDING_RATE = 0.0004;    // |funding| >= 0.04%
-          const IDEAL_OI_DELTA_PCT = 10.0;      // |ΔOI| >= 10%
-          const IDEAL_VOLUME_5M_USD = 5_000_000; // 5m volume >= $5M
-          const IDEAL_SPREAD_BPS = 3;           // Ideal spread <= 3 bps
+          // Golden 4 metrics ideal thresholds (for confidence scoring, NOT gates)
+          const IDEAL_VOL_1H_PCT = 2.0;       // |1h price change| >= 2%
+          const IDEAL_FUNDING_RATE = 0.0004;  // |funding| >= 0.04%
+          const IDEAL_OI_DELTA_PCT = 10.0;    // |ΔOI 1-2h| >= 10%
+          const IDEAL_VOLUME_1H_USD = 60_000_000; // 1h volume >= $60M
 
-          // Confidence weights (sum = 1.0)
-          // momentum_5m and spread have 2x power
-          const WEIGHT_MOMENTUM_5M = 0.30;   // 2x power (0.15 * 2)
-          const WEIGHT_SPREAD = 0.30;        // 2x power (0.15 * 2)
-          const WEIGHT_VOL_5M = 0.15;        // 1x power
-          const WEIGHT_FUNDING = 0.10;       // 1x power
-          const WEIGHT_OI_DELTA = 0.08;      // 1x power
-          const WEIGHT_VOLUME = 0.07;        // 1x power
-
+          // Confidence weights for hedge trading (sum = 1.0)
+          const WEIGHT_VOL_1H = 0.40;      // 1h volatility - HIGHEST priority
+          const WEIGHT_FUNDING = 0.25;     // Funding rate
+          const WEIGHT_OI_DELTA = 0.20;    // Open Interest change
+          const WEIGHT_VOLUME = 0.15;      // 1h volume
 
           const CONFIG_HASH=(()=>{ try{
             const knobs={
@@ -348,8 +336,8 @@ jobs:
               LONG_DOWN_RSI_CUTOFF, LONG_MR_DIVERGENCE_REQ, LONG_EDGE_MULT_MIN,
               LONG_BOUNCE_SL_ATR, LONG_BOUNCE_TP_ATR, LONG_SIMILARITY_RHO, TOP_N, MAX_SPREAD_BPS,
               EXP_LCB_MIN_BPS_BASE, COST_BPS, NOTIONAL, DEPTH_LIMIT, OBI_TOPN, MIN_TF_ALIGN, TF_WEIGHTS,
-              IDEAL_VOL_5M_PCT, IDEAL_MOMENTUM_5M, IDEAL_FUNDING_RATE, IDEAL_OI_DELTA_PCT, IDEAL_VOLUME_5M_USD, IDEAL_SPREAD_BPS,
-              WEIGHT_MOMENTUM_5M, WEIGHT_SPREAD, WEIGHT_VOL_5M, WEIGHT_FUNDING, WEIGHT_OI_DELTA, WEIGHT_VOLUME
+              IDEAL_VOL_1H_PCT, IDEAL_FUNDING_RATE, IDEAL_OI_DELTA_PCT, IDEAL_VOLUME_1H_USD,
+              WEIGHT_VOL_1H, WEIGHT_FUNDING, WEIGHT_OI_DELTA, WEIGHT_VOLUME
             };
             return hashObj(knobs);
           }catch{ return "cfg-unknown"; } })();
@@ -360,18 +348,6 @@ jobs:
           const HEALTH_URL=(()=>{ try{ const u=new URL(PUSH_URL); return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;}catch{return PUSH_URL.replace(/\/signals\/push(\?.*)?$/,"/health");}})();
           log("health GET", HEALTH_URL);
           try{ const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`,"User-Agent":UA }},5000); let t=""; try{ t=await r.text(); }catch{} log("health status", r?.status||"ERR", (t||"").slice(0,160)); }catch(e){ log("health error", e?.message||e); }
-
-          // Pre-warm Bybit API
-          log("🔥 Pre-warming Bybit API...");
-          try { 
-            const warmResp = await fetchWithTimeout(`${BYBIT_BASE}/v5/market/time`, {}, 30000); 
-            let warmText = "";
-            try { warmText = await warmResp.text(); } catch {}
-            log("✅ Bybit pre-warm status:", warmResp?.status || "timeout", warmText.slice(0, 100));
-          } catch (e) { 
-            log("⚠️ Bybit pre-warm timeout:", e?.message || e); 
-          }
-          await sleep(2000);
 
           // ========== FAKE FLUSH START ==========
           log("🚀 FAKE FLUSH: Sending 2 fake ideas immediately...");
@@ -483,8 +459,7 @@ jobs:
           log("🏁 FAKE FLUSH complete. Starting REAL processing...");
           // ========== FAKE FLUSH END ==========
 
-          // ---------- MEXC Adapter (REMOVED - NOT NEEDED FOR BINANCE) ----------
-          // Kept minimal for compatibility if needed later
+          // ---------- MEXC Adapter (REMOVED - NOT NEEDED FOR BYBIT) ----------
           async function pickMexcBase(){ return "https://api.mexc.com"; }
           const BASE=await pickMexcBase();
           const api=(path,params={})=>{ const u=new URL(path,BASE); for(const [k,v] of Object.entries(params)){ if(v!==undefined&&v!==null) u.searchParams.set(k,String(v)); } return u.toString(); };
@@ -502,105 +477,80 @@ jobs:
           const tfInd=()=>null;                               // Stub
           async function getConversionRate() { return 1; }    // Stub
 
-          // ========== BYBIT API FUNCTIONS ==========
-
-          // Fetch all USDT linear perpetual symbols
-          async function fetchBybitFuturesSymbols() {
-            const cacheKey = "bybit_futures_symbols";
+          // ---------- Bybit Linear API Functions (Public, No Auth needed for market data) ----------
+          
+          async function fetchBybitLinearSymbols() {
+            const cacheKey = "bybit_linear_symbols";
             const cached = getCached(cache.bybit, cacheKey, 300_000);
             if (cached) return cached;
             
-            const url = `${BYBIT_BASE}/v5/market/instruments-info?category=linear`;
-            
-            for (let attempt = 0; attempt < 3; attempt++) {
-              try {
-                log(`📡 Fetching Bybit instruments (attempt ${attempt + 1}/3)`);
-                const response = await fetchWithTimeout(url, {}, 60000);
-                
-                if (!response.ok) {
-                  if (attempt < 2) { await sleep(2000 + attempt * 1000); continue; }
-                  return [];
-                }
-                
-                const data = await response.json();
-                if (data?.retCode !== 0 || !Array.isArray(data?.result?.list)) return [];
-                
-                const symbols = data.result.list
-                  .filter(s => 
-                    s.quoteCoin === "USDT" &&
-                    s.status === "Trading" &&
-                    s.contractType === "LinearPerpetual"
-                  )
-                  .map(s => ({
-                    symbol: s.symbol,
-                    base: s.baseCoin,
-                    quote: s.quoteCoin,
-                    pricePrecision: s.priceScale,
-                    quantityPrecision: s.qtyStep
-                  }));
-                
-                setCached(cache.bybit, cacheKey, symbols);
-                log(`✅ Bybit: ${symbols.length} USDT perpetuals found`);
-                return symbols;
-                
-              } catch (e) {
-                log(`❌ Attempt ${attempt + 1}/3 failed:`, e?.message || e);
-                if (attempt < 2) await sleep(3000 + attempt * 2000);
+            try {
+              const url = `${BYBIT_API}/v5/market/instruments-info?category=linear`;
+              log("Fetching Bybit exchangeInfo from:", url);
+              
+              const data = await getJSON(url, 20000, 2);
+              if (!data || data.retCode !== 0 || !data.result?.list) {
+                log(`Bybit exchangeInfo failed: ${data?.retMsg || "Unknown error"}`);
+                return [];
               }
+              
+              const symbols = data.result.list
+                .filter(s => 
+                  s.status === "Trading" && 
+                  s.quoteCoin === "USDT" &&
+                  s.contractType === "LinearPerpetual"
+                )
+                .map(s => ({
+                  symbol: s.symbol,           
+                  base: s.baseCoin,          
+                  quote: s.quoteCoin,        
+                  pricePrecision: s.priceScale,
+                  quantityPrecision: s.lotSizeFilter?.qtyStep ? Math.abs(Math.log10(parseFloat(s.lotSizeFilter.qtyStep))) : 3
+                }));
+              
+              setCached(cache.bybit, cacheKey, symbols);
+              log(`📊 Bybit Linear: ${symbols.length} USDT perpetuals found`);
+              return symbols;
+            } catch (e) {
+              log("fetchBybitLinearSymbols error:", e?.message || e);
+              return [];
             }
-            return [];
           }
 
-          // Fetch 5m kline for price change % and volume
-          async function fetchBybit5mKline(symbol) {
-            const cacheKey = `bybit_5m_${symbol}`;
+          // Fetch 1h kline for price change % and volume
+          async function fetchBybit1hKline(symbol) {
+            const cacheKey = `bybit_1h_${symbol}`;
             const cached = getCached(cache.bybit, cacheKey, TTL.bybit);
             if (cached) return cached;
             
             try {
-              const url = `${BYBIT_BASE}/v5/market/kline?category=linear&symbol=${symbol}&interval=5&limit=3`;
-              const response = await fetchWithTimeout(url, {}, 10000);
-              if (!response.ok) return null;
+              // Interval 60 = 1 hour. Limit 2 to get current and previous closed.
+              // Bybit returns newest first (descending time).
+              const url = `${BYBIT_API}/v5/market/kline?category=linear&symbol=${symbol}&interval=60&limit=2`;
+              const data = await getJSON(url, 10000, 2);
               
-              const data = await response.json();
-              if (data?.retCode !== 0 || !Array.isArray(data?.result?.list) || data.result.list.length < 3) return null;
-
-              // Bybit returns newest first, so reverse
-              const candles = data.result.list.reverse();
-
-              // candles[0] = oldest, candles[1] = previous, candles[2] = last (most recent)
-              const oldestClose = +candles[0][4];
-              const prevOpen = +candles[1][1];
-              const prevClose = +candles[1][4];
-              const prevVolume = +candles[1][6];
-
-              const lastOpen = +candles[2][1];
-              const lastClose = +candles[2][4];
-              const lastHigh = +candles[2][2];
-              const lastLow = +candles[2][3];
-              const lastVolume = +candles[2][6];
-
-              // Price change % for each candle
-              const prevCandleChangePct = prevOpen > 0 ? Math.abs((prevClose - prevOpen) / prevOpen) * 100 : 0;
-              const lastCandleChangePct = lastOpen > 0 ? Math.abs((lastClose - lastOpen) / lastOpen) * 100 : 0;
-
-              // Momentum = how much bigger is last candle change vs previous candle change
-              const momentum5m = lastCandleChangePct - prevCandleChangePct;
-
+              if (!data || data.retCode !== 0 || !data.result?.list || data.result.list.length < 2) return null;
+              
+              // list[0] is current, list[1] is previous
+              const klines = data.result.list;
+              const currClose = +klines[0][4];
+              const prevClose = +klines[1][4];
+              const currVolume = +klines[0][6]; // Turnover (quote volume in USDT) for current candle
+              const currHigh = +klines[0][2];
+              const currLow = +klines[0][3];
+              
+              const priceChange1h = prevClose > 0 ? ((currClose - prevClose) / prevClose) : 0;
+              const vol1hPct = Math.abs(priceChange1h) * 100;
+              
               const result = {
                 symbol,
-                prevOpen,
                 prevClose,
-                lastOpen,
-                lastClose,
-                lastHigh,
-                lastLow,
-                volume5mUSD: lastVolume,
-                prevVolume5mUSD: prevVolume,
-                prevCandleChangePct,
-                lastCandleChangePct,
-                momentum5m,
-                vol5mPct: lastCandleChangePct,
+                currClose,
+                currHigh,
+                currLow,
+                volume1hUSD: currVolume,
+                priceChange1h,
+                vol1hPct,
                 ts: Date.now()
               };
               
@@ -611,32 +561,24 @@ jobs:
             }
           }
 
-          // Fetch current funding rate and ticker data
+          // Fetch current funding rate
           async function fetchBybitFundingRate(symbol) {
             const cacheKey = `bybit_funding_${symbol}`;
             const cached = getCached(cache.bybit, cacheKey, TTL.bybit);
             if (cached) return cached;
             
             try {
-              const url = `${BYBIT_BASE}/v5/market/tickers?category=linear&symbol=${symbol}`;
-              const response = await fetchWithTimeout(url, {}, 10000);
-              if (!response.ok) return null;
+              const url = `${BYBIT_API}/v5/market/tickers?category=linear&symbol=${symbol}`;
+              const data = await getJSON(url, 10000, 2);
+              if (!data || data.retCode !== 0 || !data.result?.list?.length) return null;
               
-              const data = await response.json();
-              if (data?.retCode !== 0 || !data?.result?.list?.[0]) return null;
-              
-              const ticker = data.result.list[0];
-              
+              const t = data.result.list[0];
               const result = {
                 symbol,
-                markPrice: +ticker.markPrice || 0,
-                indexPrice: +ticker.indexPrice || 0,
-                lastFundingRate: +ticker.fundingRate || 0,
-                nextFundingTime: +ticker.nextFundingTime || 0,
-                bid: +ticker.bid1Price || 0,
-                ask: +ticker.ask1Price || 0,
-                bidQty: +ticker.bid1Size || 0,
-                askQty: +ticker.ask1Size || 0,
+                markPrice: +t.markPrice || 0,
+                indexPrice: +t.indexPrice || 0,
+                lastFundingRate: +t.fundingRate || 0,
+                nextFundingTime: +t.nextFundingTime || 0,
                 ts: Date.now()
               };
               
@@ -647,42 +589,63 @@ jobs:
             }
           }
 
-          // Fetch Open Interest history
+          // Fetch current Open Interest
+          async function fetchBybitOI(symbol) {
+            const cacheKey = `bybit_oi_${symbol}`;
+            const cached = getCached(cache.bybit, cacheKey, TTL.bybit);
+            if (cached) return cached;
+            
+            try {
+              const url = `${BYBIT_API}/v5/market/open-interest?category=linear&symbol=${symbol}&intervalTime=1h&limit=1`;
+              const data = await getJSON(url, 10000, 2);
+              if (!data || data.retCode !== 0 || !data.result?.list?.length) return null;
+              
+              const result = {
+                symbol,
+                openInterest: +data.result.list[0].openInterest || 0,
+                ts: Date.now()
+              };
+              
+              setCached(cache.bybit, cacheKey, result);
+              return result;
+            } catch (e) {
+              return null;
+            }
+          }
+
+          // Fetch OI history for ΔOI calculation
           async function fetchBybitOIHist(symbol) {
             const cacheKey = `bybit_oi_hist_${symbol}`;
             const cached = getCached(cache.bybit, cacheKey, TTL.bybit);
             if (cached) return cached;
             
             try {
-              const url = `${BYBIT_BASE}/v5/market/open-interest?category=linear&symbol=${symbol}&intervalTime=1h&limit=3`;
-              const response = await fetchWithTimeout(url, {}, 10000);
-              if (!response.ok) return null;
+              // Limit 3 to get current + previous 2 hours
+              const url = `${BYBIT_API}/v5/market/open-interest?category=linear&symbol=${symbol}&intervalTime=1h&limit=3`;
+              const data = await getJSON(url, 10000, 2);
+              if (!data || data.retCode !== 0 || !data.result?.list || data.result.list.length < 2) return null;
               
-              const data = await response.json();
-              if (data?.retCode !== 0 || !Array.isArray(data?.result?.list) || data.result.list.length < 2) return null;
-              
-              // Newest first
+              // Bybit returns newest first
               const list = data.result.list;
-              const current = +list[0]?.openInterest || 0;
-              const prev1h = +list[1]?.openInterest || 0;
-              const prev2h = list[2] ? +list[2]?.openInterest : prev1h;
+              const current = +list[0].openInterest || 0;
+              const prev1h = +list[1].openInterest || 0;
+              const prev2h = list[2] ? +list[2].openInterest : prev1h;
+
+              // We need price to get USD value usually, but for pct change raw OI is fine assuming price relatively stable or just use raw OI change
+              // To get USD value accurately we need price. Let's assume we can fetch price or just use raw unit change pct which is similar.
+              // Ideally we multiply by mark price, but for % change it cancels out roughly.
+              // Let's stick to raw OI units for % change calculation to be safe, or we can fetch price.
+              // The main logic uses "OI_delta_pct" which is traditionally OI value change.
               
-              // Get mark price to convert to USD (from funding endpoint which we likely already have cached)
-              const fundingData = await fetchBybitFundingRate(symbol);
-              const markPrice = fundingData?.markPrice || 1;
+              const oiDelta1h = prev1h > 0 ? ((current - prev1h) / prev1h) : 0;
+              const oiDelta2h = prev2h > 0 ? ((current - prev2h) / prev2h) : 0;
               
-              const currentUSD = current * markPrice;
-              const prev1hUSD = prev1h * markPrice;
-              const prev2hUSD = prev2h * markPrice;
-              
-              const oiDelta1h = prev1hUSD > 0 ? ((currentUSD - prev1hUSD) / prev1hUSD) : 0;
-              const oiDelta2h = prev2hUSD > 0 ? ((currentUSD - prev2hUSD) / prev2hUSD) : 0;
-              
+              // We will store raw units here, consumer can multiply by price if needed for absolute USD
               const result = {
                 symbol,
-                currentOI_USD: currentUSD,
-                prev1hOI_USD: prev1hUSD,
-                prev2hOI_USD: prev2hUSD,
+                currentOI: current,
+                prev1hOI: prev1h,
+                prev2hOI: prev2h,
                 oiDelta1hPct: Math.abs(oiDelta1h) * 100,
                 oiDelta2hPct: Math.abs(oiDelta2h) * 100,
                 oiDelta1hRaw: oiDelta1h,
@@ -696,23 +659,56 @@ jobs:
             }
           }
 
-          // Fetch spot price (Bybit spot)
+          // Fetch spot price (index price from tickers is good enough/better for basis)
           async function fetchBybitSpotPrice(symbol) {
-            const cacheKey = `bybit_spot_${symbol}`;
-            const cached = getCached(cache.bybit, cacheKey, TTL.bybit);
+            // Bybit doesn't have a unified spot/linear ticker endpoint easily without changing category
+            // We reuse index price from funding call or make a new ticker call
+            return null; // Logic will use indexPrice from funding
+          }
+
+          // NEW: Fetch Bybit Linear orderbook
+          async function fetchBybitLinearDepth(symbol) {
+            const cacheKey = `bybit_depth_${symbol}`;
+            const cached = getCached(cache.bybit, cacheKey, 5000); 
             if (cached) return cached;
             
             try {
-              const url = `${BYBIT_BASE}/v5/market/tickers?category=spot&symbol=${symbol}`;
-              const response = await fetchWithTimeout(url, {}, 8000);
-              if (!response.ok) return null;
+              const url = `${BYBIT_API}/v5/market/orderbook?category=linear&symbol=${symbol}&limit=${DEPTH_LIMIT}`;
+              const data = await getJSON(url, 8000, 2);
+              if (!data || data.retCode !== 0 || !data.result?.b || !data.result?.a) return null;
               
-              const data = await response.json();
-              if (data?.retCode !== 0 || !data?.result?.list?.[0]) return null;
+              // Transform to standard structure: { bids: [[p,q],...], asks: [[p,q],...] }
+              const result = {
+                bids: data.result.b,
+                asks: data.result.a,
+                ts: +data.result.ts || Date.now()
+              };
+
+              setCached(cache.bybit, cacheKey, result);
+              return result;
+            } catch (e) {
+              return null;
+            }
+          }
+
+          // NEW: Fetch Bybit Linear ticker
+          async function fetchBybitLinearTicker(symbol) {
+            const cacheKey = `bybit_ticker_${symbol}`;
+            const cached = getCached(cache.bybit, cacheKey, 5000);
+            if (cached) return cached;
+            
+            try {
+              const url = `${BYBIT_API}/v5/market/tickers?category=linear&symbol=${symbol}`;
+              const data = await getJSON(url, 8000, 2);
+              if (!data || data.retCode !== 0 || !data.result?.list?.length) return null;
               
+              const t = data.result.list[0];
               const result = {
                 symbol,
-                spotPrice: +data.result.list[0].lastPrice,
+                bid: +t.bid1Price,
+                ask: +t.ask1Price,
+                bidQty: +t.bid1Size,
+                askQty: +t.ask1Size,
                 ts: Date.now()
               };
               
@@ -723,34 +719,7 @@ jobs:
             }
           }
 
-          // Fetch orderbook depth
-          async function fetchBybitFuturesDepth(symbol) {
-            const cacheKey = `bybit_depth_${symbol}`;
-            const cached = getCached(cache.bybit, cacheKey, 5000);
-            if (cached) return cached;
-            
-            try {
-              const url = `${BYBIT_BASE}/v5/market/orderbook?category=linear&symbol=${symbol}&limit=${DEPTH_LIMIT}`;
-              const response = await fetchWithTimeout(url, {}, 8000);
-              if (!response.ok) return null;
-              
-              const data = await response.json();
-              if (data?.retCode !== 0 || !data?.result) return null;
-              
-              // Convert Bybit format to standard format
-              const result = {
-                bids: (data.result.b || []).map(x => [x[0], x[1]]),
-                asks: (data.result.a || []).map(x => [x[0], x[1]])
-              };
-              
-              setCached(cache.bybit, cacheKey, result);
-              return result;
-            } catch (e) {
-              return null;
-            }
-          }
-
-          // Calculate basis (futures premium over spot)
+          // Calculate basis (futures premium over spot/index)
           function calculateBasis(futuresPrice, spotPrice) {
             if (!futuresPrice || !spotPrice || spotPrice <= 0) return { basis: 0, basis_bps: 0 };
             const basis = (futuresPrice - spotPrice) / spotPrice;
@@ -760,79 +729,61 @@ jobs:
             };
           }
 
-          // Fetch all golden metrics WITH spread in one function
-          async function fetchGoldenMetricsWithSpread(symbol) {
+          // Fetch all 4 golden metrics for a symbol
+          async function fetchGoldenMetrics(symbol) {
             try {
-              const [kline, funding, oiHist, spot] = await Promise.all([
-                fetchBybit5mKline(symbol),
+              const [kline, funding, oiHist] = await Promise.all([
+                fetchBybit1hKline(symbol),
                 fetchBybitFundingRate(symbol),
-                fetchBybitOIHist(symbol),
-                fetchBybitSpotPrice(symbol)
+                fetchBybitOIHist(symbol)
               ]);
               
               if (!kline) return null;
               
-              const basisInfo = calculateBasis(funding?.markPrice, spot?.spotPrice);
+              // Use indexPrice from funding response as "spot" for basis
+              const indexPrice = funding?.indexPrice || 0;
+              const basisInfo = calculateBasis(funding?.markPrice, indexPrice);
               
-              // Calculate spread from funding (which includes bid/ask)
-              let spread_bps = 999;
-              let mid = funding?.markPrice || kline.lastClose || 0;
-              if (funding?.bid && funding?.ask && funding.bid > 0) {
-                mid = (funding.bid + funding.ask) / 2;
-                spread_bps = Math.round(((funding.ask - funding.bid) / mid) * 10000);
-              }
-              
+              // Convert OI units to USD estimates using current close
+              const currentPrice = kline.currClose;
+              const currentOI_USD = (oiHist?.currentOI || 0) * currentPrice;
+
               return {
                 symbol,
-                vol_5m_pct: kline.vol5mPct || 0,
-                prev_candle_change_pct: kline.prevCandleChangePct || 0,
-                last_candle_change_pct: kline.lastCandleChangePct || 0,
-                momentum_5m: kline.momentum5m || 0,
+                vol_1h_pct: kline.vol1hPct || 0,
+                price_change_1h: kline.priceChange1h || 0,
                 funding_rate: Math.abs(funding?.lastFundingRate || 0),
                 funding_rate_raw: funding?.lastFundingRate || 0,
                 oi_delta_pct: Math.max(oiHist?.oiDelta1hPct || 0, oiHist?.oiDelta2hPct || 0),
                 oi_delta_1h_pct: oiHist?.oiDelta1hPct || 0,
                 oi_delta_2h_pct: oiHist?.oiDelta2hPct || 0,
-                current_oi_usd: oiHist?.currentOI_USD || 0,
-                volume_5m_usd: kline.volume5mUSD || 0,
-                mark_price: mid,
-                spot_price: spot?.spotPrice || 0,
+                current_oi_usd: currentOI_USD,
+                volume_1h_usd: kline.volume1hUSD || 0,
+                mark_price: funding?.markPrice || kline.currClose || 0,
+                spot_price: indexPrice || 0,
                 basis_bps: basisInfo.basis_bps,
-                spread_bps,
-                bid: funding?.bid || 0,
-                ask: funding?.ask || 0,
                 ts: Date.now()
               };
             } catch (e) {
+              log(`fetchGoldenMetrics error for ${symbol}:`, e?.message || e);
               return null;
             }
           }
-          
-          // Calculate hedge confidence score based on 5m metrics
+
+          // Calculate hedge confidence score based on 4 golden metrics
           function calculateHedgeConfidence(metrics) {
             if (!metrics) return 0;
             
-            // 5m momentum score (2x weight) - higher momentum = better
-            const momentumNorm = Math.tanh((metrics.momentum_5m || 0) / IDEAL_MOMENTUM_5M);
-            
-            // Spread score (2x weight) - lower spread = better
-            const spreadScore = metrics.spread_bps != null 
-              ? Math.max(0, 1 - (metrics.spread_bps - IDEAL_SPREAD_BPS) / 12)
-              : 0.5;
-            
-            // Other metrics (1x weight each)
-            const volNorm = Math.tanh((metrics.vol_5m_pct || 0) / IDEAL_VOL_5M_PCT);
+            const volNorm = Math.tanh((metrics.vol_1h_pct || 0) / IDEAL_VOL_1H_PCT);
             const fundingNorm = Math.tanh((metrics.funding_rate || 0) / IDEAL_FUNDING_RATE);
             const oiNorm = Math.tanh((metrics.oi_delta_pct || 0) / IDEAL_OI_DELTA_PCT);
-            const volUsdNorm = Math.tanh((metrics.volume_5m_usd || 0) / IDEAL_VOLUME_5M_USD);
+            const volUsdNorm = Math.tanh((metrics.volume_1h_usd || 0) / IDEAL_VOLUME_1H_USD);
             
             const rawScore = 
-              WEIGHT_MOMENTUM_5M * momentumNorm +   // 2x power
-              WEIGHT_SPREAD * spreadScore +          // 2x power
-              WEIGHT_VOL_5M * volNorm +              // 1x power
-              WEIGHT_FUNDING * fundingNorm +         // 1x power
-              WEIGHT_OI_DELTA * oiNorm +             // 1x power
-              WEIGHT_VOLUME * volUsdNorm;            // 1x power
+              WEIGHT_VOL_1H * volNorm +
+              WEIGHT_FUNDING * fundingNorm +
+              WEIGHT_OI_DELTA * oiNorm +
+              WEIGHT_VOLUME * volUsdNorm;
             
             const confidence = Math.round(rawScore * 100);
             
@@ -846,7 +797,7 @@ jobs:
           }
 
           // ---------- Heartbeat & Zombie detection ----------
-          // Disabled for Bybit version (no signed API needed for reads)
+          // CHANGED: Disabled for Bybit version (no signed API needed for reads)
           async function heartbeatCheck(state){
             const res={ mismatches:0, zombies:0, details:[] };
             // Bybit version doesn't check open orders (would require API keys)
@@ -857,7 +808,7 @@ jobs:
           // ⚠️ THIS SECTION IS 100% UNCHANGED FROM ORIGINAL
           async function loadState(){
             const token=process.env.GIST_TOKEN, id=process.env.GIST_ID;
-            const init={ v:"bybit-hedge-7.0",
+            const init={ v:"bybit-hedge-7.0",  // ← CHANGED version string
               run_counter: 0,
               cooldown:{}, cooldown_side:{}, pending:[], equity:[], closed:[],
               mr_lockout:{}, sym_stats:{}, sym_stats_real:{}, calibCoeffs:{}, lastReconcileTs:0,
@@ -1555,7 +1506,7 @@ jobs:
             return { closedAudit, disagreements, tradesCsv };
           }
 
-          // Stub for candle sim (not needed for Bybit-only)
+          // CHANGED: Stub for candle sim (not needed for Bybit-only)
           async function candleSimForIdea(p){
             return { status:"sim_disabled", closed:false };
           }
@@ -1566,13 +1517,12 @@ jobs:
 
             // Increment run counter and check for wipe
             state.run_counter = (state.run_counter || 0) + 1;
-            log(`🔄 Run ${state.run_counter}/3`);
+            log(`🔄 Run ${state.run_counter}/6`);
 
-
-            const SHOULD_WIPE = (state.run_counter >= 3);
+            const SHOULD_WIPE = (state.run_counter >= 6);
 
             if (SHOULD_WIPE) {
-              log("🗑️  RUN 3: WIPE GIST AND RESTART FRESH");
+              log("🗑️  RUN 6: WIPE GIST AND RESTART FRESH");
               await saveState(persist, { run_counter: 0 }, {}, 2, true);
               
               state.v = "bybit-hedge-7.0";
@@ -1635,49 +1585,43 @@ jobs:
             
             if(!todOK) reason="tod_gate";
 
-            // ========== DYNAMIC UNIVERSE FROM BYBIT (NO VALIDATION NEEDED) ==========
-            log("📡 Fetching Bybit universe...");
-            const bybitSymbols = await fetchBybitFuturesSymbols();
+            // ========== DYNAMIC UNIVERSE FROM BYBIT LINEAR (NO VALIDATION NEEDED) ==========
+            log("📡 Fetching Bybit Linear universe...");
+            const bybitSymbols = await fetchBybitLinearSymbols();
             
             if (!bybitSymbols || bybitSymbols.length === 0) {
-              log("❌ No Bybit symbols found - cannot proceed");
+              log("❌ No Bybit Linear symbols found - cannot proceed");
               reason = "no_bybit_symbols";
-              throw new Error("No Bybit symbols available");
+              throw new Error("No Bybit Linear symbols available");
             }
             
-            log(`✅ Bybit universe: ${bybitSymbols.length} USDT perpetuals`);
+            log(`✅ Bybit Linear universe: ${bybitSymbols.length} USDT perpetuals`);
 
             // DD/throttle
             const equityStats=(eq)=>{ const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of eq||[]){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd) }; };
             const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
             const throttle=(pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
 
-            // ========== FETCH GOLDEN METRICS FOR ALL BINANCE SYMBOLS ==========
+            // ========== FETCH GOLDEN METRICS FOR ALL BYBIT SYMBOLS ==========
             log("📊 Fetching golden metrics for all symbols...");
             
-            const BATCH_SIZE = 15;
-            const BATCH_DELAY = 300;
+            const BATCH_SIZE = 10;
+            const BATCH_DELAY = 500;
             const allMetrics = [];
             
-            // FIRST: Filter out cooldown symbols completely
-            const eligibleSymbols = bybitSymbols.filter(sym => {
-              const lastTs = state.cooldown?.[sym.base] || 0;
-              if (lastTs && (Date.now() - lastTs) < COOLDOWN_MS) {
-                return false; // Skip cooldown symbols
-              }
-              return true;
-            });
-            
-            log(`📋 Eligible symbols after cooldown filter: ${eligibleSymbols.length}/${bybitSymbols.length}`);
-
-            // NOW loop over eligibleSymbols instead of binanceSymbols
-            for (let i = 0; i < eligibleSymbols.length; i += BATCH_SIZE) {
-              const batch = eligibleSymbols.slice(i, i + BATCH_SIZE);
+            for (let i = 0; i < bybitSymbols.length; i += BATCH_SIZE) {
+              const batch = bybitSymbols.slice(i, i + BATCH_SIZE);
               
               const batchResults = await Promise.all(
                 batch.map(async (sym) => {
                   try {
-                    const metrics = await fetchGoldenMetricsWithSpread(sym.symbol);
+                    // Check cooldown first
+                    const lastTs = state.cooldown?.[sym.base] || 0;
+                    if (lastTs && (Date.now() - lastTs) < COOLDOWN_MS) {
+                      return null; // Skip cooldown symbols
+                    }
+                    
+                    const metrics = await fetchGoldenMetrics(sym.symbol);
                     if (!metrics) return null;
                     
                     return {
@@ -1698,130 +1642,274 @@ jobs:
               }
               
               // Rate limit pause between batches
-              if (i + BATCH_SIZE < eligibleSymbols.length) {
+              if (i + BATCH_SIZE < bybitSymbols.length) {
                 await sleep(BATCH_DELAY);
               }
             }
             
-            log(`📈 Fetched metrics for ${allMetrics.length}/${eligibleSymbols.length} symbols`);
+            log(`📈 Fetched metrics for ${allMetrics.length}/${bybitSymbols.length} symbols`);
 
             // ========== RANK BY HEDGE CONFIDENCE ==========
             // Sort by hedge confidence (highest first)
             allMetrics.sort((a, b) => b.hedge_confidence - a.hedge_confidence);
-
-            // ========== SIMPLE SELECTION: JUST TAKE TOP N FROM TOP 10 ==========
-            const TOP_10_COUNT = 10;
-            const topCandidates = allMetrics.slice(0, TOP_10_COUNT);
-
-            log("🏆 Top 10 by hedge confidence (momentum + spread 2x weight):");
-            for (let i = 0; i < topCandidates.length; i++) {
-              const m = topCandidates[i];
-              log(`   ${i+1}. ${m.symbol} conf=${m.hedge_confidence} mom5m=${(m.momentum_5m || 0).toFixed(3)}% spread=${m.spread_bps}bps vol5m=${(m.vol_5m_pct || 0).toFixed(2)}% fund=${(m.funding_rate*100).toFixed(4)}% oi=${m.oi_delta_pct.toFixed(1)}%`);
+            
+            // Log top 10 for debugging
+            log("🏆 Top 10 by hedge confidence:");
+            for (let i = 0; i < Math.min(10, allMetrics.length); i++) {
+              const m = allMetrics[i];
+              log(`   ${i+1}. ${m.symbol} conf=${m.hedge_confidence} vol1h=${m.vol_1h_pct.toFixed(2)}% fund=${(m.funding_rate*100).toFixed(4)}% oi_delta=${m.oi_delta_pct.toFixed(1)}% vol=$${Math.round(m.volume_1h_usd/1e6)}M`);
             }
 
-            // BTC regime for side selection
+            // ========== SELECT TOP CANDIDATES FOR DETAILED ANALYSIS ==========
+            const MAX_DETAILED = 30;
+            const topCandidates = allMetrics.slice(0, MAX_DETAILED);
+            
+            // BTC regime detection (using Bybit data)
             const btcMetrics = allMetrics.find(m => m.symbol === "BTCUSDT");
-            const btcUp5m = btcMetrics ? ((btcMetrics.momentum_5m || 0) > 0) : true;
-
-
-            // Simply take TOP_N from Top 10
-            const TARGET_TOP_N = Math.max(1, TOP_N || 3);
-            let selected = [];
-
+            const btcUp1h = btcMetrics ? (btcMetrics.price_change_1h > 0) : true;
+            
+            // ========== DETAILED REFINEMENT WITH BYBIT DATA ==========
+            const refined = [];
+            
             for (const cand of topCandidates) {
-              if (selected.length >= TARGET_TOP_N) break;
-              
-              // Diversity: don't pick same base twice
-              if (selected.some(s => s.base === cand.base)) continue;
-              
-              // No shadow analysis - removed
-              
-              // Determine side based on funding (short positive funding, long negative)
-              const side = cand.funding_rate_raw > 0 ? "short" : "long";
-              
-              // Simple TP/SL based on volatility
-              const atr_bps = Math.round(cand.vol_5m_pct * 100);
-              const tp_bps = Math.max(30, Math.round(atr_bps * 0.9));
-              const sl_bps = Math.min(80, Math.max(20, Math.round(atr_bps * 0.5)));
-              
-              // Estimate cost
-              const cost_bps = COST_BPS + Math.round(cand.spread_bps / 2);
-              
-              // Simple EV (must be positive)
-              const p_win = 0.50 + 0.15 * Math.tanh(cand.vol_5m_pct / 3);
-              const ev_bps = Math.round(p_win * tp_bps - (1 - p_win) * sl_bps - cost_bps);
-              
-              if (ev_bps < 0) {
-                log(`   ⏭️  Skip ${cand.symbol}: negative EV (${ev_bps}bps)`);
-                continue;
-              }
-              
-              // Direct confidence (no shadow multiplier)
-              const adjustedConfidence = cand.hedge_confidence;
-              
-              selected.push({
-                symbol: cand.symbol,
-                base: cand.base,
-                quote: cand.quote,
-                side,
+              try {
+                // Fetch BYBIT execution quality data (depth, spread)
+                const ticker = await fetchBybitLinearTicker(cand.symbol);
+                const depth = await fetchBybitLinearDepth(cand.symbol);
                 
-                mark_price: cand.mark_price,
-                spread_bps: cand.spread_bps,
+                let spreadBps = 5; // Default
+                let mid = cand.mark_price;
                 
-                tp_bps,
-                sl_bps,
-                cost_bps,
-                rrr: +(tp_bps / sl_bps).toFixed(2),
+                if (ticker?.bid && ticker?.ask) {
+                  const bid = ticker.bid;
+                  const ask = ticker.ask;
+                  mid = (bid + ask) / 2;
+                  spreadBps = Math.round(((ask - bid) / mid) * 10000);
+                }
                 
-                p_win: +p_win.toFixed(3),
-                p_lcb: +p_win.toFixed(3),
-                p_raw: +p_win.toFixed(3),
-                ev_bps,
-                exp_lcb_bps: ev_bps,
+                // Calculate OBI and slip estimation using Bybit depth
+                const obi = computeOBI(depth, OBI_TOPN);
                 
-                regime: "hedge",
-                style: "hedge",
+                const sideSlipL = slipFromDepth(depth, mid, "long", NOTIONAL);
+                const sideSlipS = slipFromDepth(depth, mid, "short", NOTIONAL);
+                const slipL = sideSlipL?.slip_bps ?? Math.round(spreadBps / 2);
+                const slipS = sideSlipS?.slip_bps ?? Math.round(spreadBps / 2);
                 
-                // Golden metrics (5m based)
-                vol_5m_pct: cand.vol_5m_pct,
-                momentum_5m: cand.momentum_5m,
-                prev_candle_change_pct: cand.prev_candle_change_pct,
-                last_candle_change_pct: cand.last_candle_change_pct,
-                funding_rate: cand.funding_rate,
-                funding_rate_raw: cand.funding_rate_raw,
-                oi_delta_pct: cand.oi_delta_pct,
-                volume_5m_usd: cand.volume_5m_usd,
-                basis_bps: cand.basis_bps,
-                current_oi_usd: cand.current_oi_usd,
-                spot_price: cand.spot_price,
+                const costLong = COST_BPS + slipL;
+                const costShort = COST_BPS + slipS;
                 
-                confidence: adjustedConfidence,
-                hedge_confidence: cand.hedge_confidence,
+                // Depth quality
+                const d1 = depthWithinPctUSD(depth, mid, 0.01);
+                const depth1pUSD = (d1.asksUSD || 0) + (d1.bidsUSD || 0);
                 
-                hold_sec: 3600,
+                // Determine regime based on volatility and funding
+                const regime = (cand.vol_1h_pct >= 1.5 && Math.abs(cand.funding_rate) >= 0.0003) ? "trend" : "meanrevert";
                 
-                reasons: reasonBuilder({
-                  vol_5m_pct: cand.vol_5m_pct,
-                  momentum_5m: cand.momentum_5m,
-                  spread_bps: cand.spread_bps,
+                // Get calibrated probabilities
+                const coeffL = getCoeffs(state, "long", regime);
+                const coeffS = getCoeffs(state, "short", regime);
+                const nL = Math.max(1, Math.min(500, coeffL?.n || 0));
+                const nS = Math.max(1, Math.min(500, coeffS?.n || 0));
+                
+                // Base probability from golden metrics
+                const pBase = 0.45 + 0.35 * Math.tanh(cand.vol_1h_pct / 3);
+                
+                // Direction bias from funding rate
+                const fundingBias = -Math.sign(cand.funding_rate_raw) * Math.min(0.15, Math.abs(cand.funding_rate_raw) * 100);
+                
+                const pLong0 = clamp(pBase + fundingBias, 0.30, 0.85);
+                const pShort0 = clamp(pBase - fundingBias, 0.30, 0.85);
+                
+                const pLong = calibrateP(state, "long", regime, pLong0);
+                const pShort = calibrateP(state, "short", regime, pShort0);
+                const pLong_lcb = wilsonLCB(pLong, nL, WILSON_Z);
+                const pShort_lcb = wilsonLCB(pShort, nS, WILSON_Z);
+                
+                // ATR estimation from 1h volatility
+                const atr_bps = Math.round(cand.vol_1h_pct * 100);
+                
+                // TP/SL based on volatility
+                const MAX_SL_BPS = 80;
+                let candLong = null, candShort = null;
+                
+                if (DIRECTION !== "short") {
+                  let tp = Math.round(atr_bps * LONG_BOUNCE_TP_ATR);
+                  let sl = Math.round(atr_bps * LONG_BOUNCE_SL_ATR);
+                  sl = Math.min(sl, MAX_SL_BPS);
+                  tp = Math.max(tp, Math.round(sl * 1.5));
+                  
+                  const evLCB = Math.round(pLong_lcb * tp - (1 - pLong_lcb) * sl - costLong);
+                  const edgeL = tp / Math.max(1, LONG_EDGE_MULT_MIN * costLong);
+                  const evScoreL = evLCB / Math.max(8, EXP_LCB_MIN_BPS_BASE);
+                  const viabMultL = clamp(0.5 * clamp(edgeL, 0.3, 1.4) + 0.5 * clamp(evScoreL, 0.3, 1.4), 0.3, 1.3);
+                  
+                  candLong = {
+                    side: "long",
+                    p_lcb: pLong_lcb,
+                    p_raw: pLong0,
+                    ev_bps: evLCB,
+                    exp_lcb_bps: evLCB,
+                    tp_bps: tp,
+                    sl_bps: sl,
+                    cost_bps: costLong,
+                    style: "hedge",
+                    regime,
+                    viab_mult: viabMultL
+                  };
+                }
+                
+                if (DIRECTION !== "long") {
+                  let tp = Math.round(atr_bps * 1.0);
+                  let sl = Math.round(atr_bps * 0.5);
+                  sl = Math.min(sl, MAX_SL_BPS);
+                  tp = Math.max(tp, Math.round(sl * 1.5));
+                  
+                  const evLCB = Math.round(pShort_lcb * tp - (1 - pShort_lcb) * sl - costShort);
+                  const edgeS = tp / Math.max(1, 4 * costShort);
+                  const evScoreS = evLCB / Math.max(8, EXP_LCB_MIN_BPS_BASE);
+                  const viabMultS = clamp(0.5 * clamp(edgeS, 0.3, 1.4) + 0.5 * clamp(evScoreS, 0.3, 1.4), 0.3, 1.3);
+                  
+                  candShort = {
+                    side: "short",
+                    p_lcb: pShort_lcb,
+                    p_raw: pShort0,
+                    ev_bps: evLCB,
+                    exp_lcb_bps: evLCB,
+                    tp_bps: tp,
+                    sl_bps: sl,
+                    cost_bps: costShort,
+                    style: "hedge",
+                    regime,
+                    viab_mult: viabMultS
+                  };
+                }
+                
+                // Choose better side
+                const chosen = candLong && candShort
+                  ? (candLong.exp_lcb_bps >= candShort.exp_lcb_bps ? candLong : candShort)
+                  : (candLong || candShort || null);
+                
+                if (!chosen) continue;
+                
+                // ========== FINAL CONFIDENCE CALCULATION ==========
+                // Base from golden 4 metrics (already 0-100)
+                const baseConf = cand.hedge_confidence;
+                
+                // Execution quality multipliers
+                const spreadMult = clamp(1 - Math.max(0, (spreadBps - 5)) / 30, 0.5, 1.1);
+                const depthMult = clamp(depth1pUSD / Math.max(1, DEPTH_1P_MIN_USD), 0.3, 1.2);
+                const slipMult = clamp(1 - Math.max(0, (chosen.cost_bps - COST_BPS)) / 25, 0.5, 1.1);
+                const oiMult = clamp(cand.current_oi_usd / 50_000_000, 0.4, 1.3);
+                
+                // EV multiplier
+                const evMult = clamp(chosen.viab_mult || 1, 0.3, 1.3);
+                
+                // Direction bias for BTC regime
+                const btcMult = (chosen.side === "long" && !btcUp1h) ? 0.85 : 1.0;
+                
+                // Funding alignment bonus
+                const fundingAlignBonus = (
+                  (chosen.side === "short" && cand.funding_rate_raw > 0) ||
+                  (chosen.side === "long" && cand.funding_rate_raw < 0)
+                ) ? 1.1 : 1.0;
+                
+                // Final confidence
+                const finalConf = Math.round(
+                  baseConf * spreadMult * depthMult * slipMult * oiMult * evMult * btcMult * fundingAlignBonus
+                );
+                
+                // Build reasons
+                const reasons = reasonBuilder({
+                  vol_1h_pct: cand.vol_1h_pct,
                   funding_rate: cand.funding_rate,
                   oi_delta_pct: cand.oi_delta_pct,
-                  volume_5m_usd: cand.volume_5m_usd,
-                  basis_bps: cand.basis_bps,
-                }),
+                  volume_1h_usd: cand.volume_1h_usd,
+                  basis_bps: cand.basis_bps
+                });
                 
-                ret5: []
-              });
-              
+                refined.push({
+                  symbol: cand.symbol,
+                  base: cand.base,
+                  quote: cand.quote,
+                  
+                  side: chosen.side,
+                  p_lcb: +chosen.p_lcb.toFixed(3),
+                  p_raw: +chosen.p_raw.toFixed(3),
+                  exp_bps: chosen.ev_bps,
+                  exp_lcb_bps: chosen.exp_lcb_bps,
+                  tp_bps: chosen.tp_bps,
+                  sl_bps: chosen.sl_bps,
+                  rrr: +(chosen.tp_bps / Math.max(1, chosen.sl_bps)).toFixed(2),
+                  spread_bps: spreadBps,
+                  cost_bps: chosen.cost_bps,
+                  atr_bps,
+                  regime: chosen.regime,
+                  style: chosen.style,
+                  
+                  // Golden metrics
+                  vol_1h_pct: cand.vol_1h_pct,
+                  funding_rate: cand.funding_rate,
+                  funding_rate_raw: cand.funding_rate_raw,
+                  oi_delta_pct: cand.oi_delta_pct,
+                  volume_1h_usd: cand.volume_1h_usd,
+                  basis_bps: cand.basis_bps,
+                  current_oi_usd: cand.current_oi_usd,
+                  
+                  // Prices
+                  mark_price: cand.mark_price,
+                  spot_price: cand.spot_price,
+                  
+                  // Execution quality
+                  depth1p_usd: depth1pUSD,
+                  obi,
+                  slip_est: chosen.side === "long" ? slipL : slipS,
+                  
+                  // TTL (max 2 hours for hedge trades)
+                  hold_sec: clamp(3600, TTL_MIN, TTL_MAX), // Default 1 hour
+                  
+                  confidence: clamp(finalConf, 0, 100),
+                  hedge_confidence: cand.hedge_confidence,
+                  reasons,
+                  
+                  ret5: [] // Simplified
+                });
+                
+              } catch (e) {
+                log(`Refine error for ${cand.symbol}:`, e?.message || e);
+              }
             }
+            
+            log(`🔍 Refined ${refined.length} candidates with execution quality analysis`);
 
-            log(`✅ Selected ${selected.length} ideas (TOP ${TARGET_TOP_N} from Top 10)`);
-
-            // Log momentum stats for selected
-            const momentumStats = selected.map(s => 
-              `${s.symbol}: mom5m=${(s.momentum_5m || 0).toFixed(3)}% spread=${s.spread_bps}bps`
-            );
-            log(`📊 Momentum + Spread: ${momentumStats.join(" | ")}`);
+            // ========== FINAL SELECTION ==========
+            refined.sort((a, b) => b.confidence - a.confidence);
+            
+            const TARGET_TOP_N = Math.max(1, TOP_N || 3);
+            
+            const selected = [];
+            for (const cand of refined) {
+              if (selected.length >= TARGET_TOP_N) break;
+              
+              // Simple diversity: don't pick same base twice
+              const alreadyHaveBase = selected.some(s => s.base === cand.base);
+              if (!alreadyHaveBase) {
+                selected.push(cand);
+              }
+            }
+            
+            // Fill remaining slots if needed
+            if (selected.length < TARGET_TOP_N) {
+              const haveSyms = new Set(selected.map(s => s.symbol));
+              for (const c of refined) {
+                if (selected.length >= TARGET_TOP_N) break;
+                if (!haveSyms.has(c.symbol)) {
+                  selected.push(c);
+                  haveSyms.add(c.symbol);
+                }
+              }
+            }
+            
+            log(`✅ Selected ${selected.length} ideas for pushing`);
 
             // ========== GENERATE FLIPPED IDEAS ==========
             const flipped = selected.map(orig => ({
@@ -1855,7 +1943,7 @@ jobs:
               }
 
               const idea_id = uuidv4();
-              const client_order_id = mkClientOrderId("byh");  // Bybit Hedge
+              const client_order_id = mkClientOrderId("byh");  // ← CHANGED prefix for Bybit Hedge
 
               const ttl = clamp(Math.round((x.hold_sec || 3600) + i * 12), TTL_MIN, TTL_MAX);
               const size_bps = (Number(process.env.FORCE_SIZE_BPS || "0") > 0)
@@ -1873,7 +1961,7 @@ jobs:
                 rank: i + 1,
 
                 // v2/futures intent
-                target_exchange: TARGET_EXCHANGE,
+                target_exchange: TARGET_EXCHANGE,  // "bybit_linear"
                 market_type: MARKET_TYPE,
                 margin_mode: MARGIN_MODE,
                 leverage: LEVERAGE,
@@ -1892,7 +1980,7 @@ jobs:
                 sl_bps: x.sl_bps,
                 rrr: x.rrr,
                 exp_lcb_bps: x.exp_lcb_bps,
-                ev_bps: x.ev_bps,
+                ev_bps: x.exp_bps,
                 cost_bps: x.cost_bps,
 
                 p_win: x.p_lcb,
@@ -1911,17 +1999,13 @@ jobs:
                   confidence_score: x.confidence,
                   flipped: x.flipped || false,
                   
-                  // Hedge-specific metadata (5m based)
-                  vol_5m_pct: x.vol_5m_pct,
-                  momentum_5m: x.momentum_5m,
-                  prev_candle_change_pct: x.prev_candle_change_pct,
-                  last_candle_change_pct: x.last_candle_change_pct,
+                  // Hedge-specific metadata
+                  vol_1h_pct: x.vol_1h_pct,
                   funding_rate: x.funding_rate,
                   oi_delta_pct: x.oi_delta_pct,
-                  volume_5m_usd: x.volume_5m_usd,
+                  volume_1h_usd: x.volume_1h_usd,
                   basis_bps: x.basis_bps,
-                  hedge_confidence: x.hedge_confidence,
-                  spread_bps: x.spread_bps
+                  hedge_confidence: x.hedge_confidence
                 },
 
                 confidence: x.confidence,
@@ -1930,14 +2014,10 @@ jobs:
 
                 // Keep hedge metrics for state/debug
                 hedge_metrics: {
-                  vol_5m_pct: x.vol_5m_pct,
-                  momentum_5m: x.momentum_5m,
-                  prev_candle_change_pct: x.prev_candle_change_pct,
-                  last_candle_change_pct: x.last_candle_change_pct,
-                  spread_bps: x.spread_bps,
+                  vol_1h_pct: x.vol_1h_pct,
                   funding_rate_raw: x.funding_rate_raw,
                   oi_delta_pct: x.oi_delta_pct,
-                  volume_5m_usd: x.volume_5m_usd,
+                  volume_1h_usd: x.volume_1h_usd,
                   basis_bps: x.basis_bps,
                   mark_price: x.mark_price,
                   spot_price: x.spot_price,
@@ -2013,7 +2093,7 @@ jobs:
             // Portfolio VaR/ES throttle on sizes
             try {
               // For hedge trades, simplified size allocation based on volatility
-              const maxVolPick = Math.max(...picks.map(p => p.predicted?.vol_5m_pct || 1));
+              const maxVolPick = Math.max(...picks.map(p => p.predicted?.vol_1h_pct || 1));
               if (maxVolPick > 5) {
                 const scale = clamp(5 / maxVolPick, 0.4, 1);
                 picks = picks.map(p => ({ ...p, size_bps: Math.max(4, Math.round(p.size_bps * scale)) }));
@@ -2089,7 +2169,7 @@ jobs:
 
             // Build meta and payload
             for (const p of picks) {
-              log(`idea ${p.symbol_full} ${p.side} conf=${p.confidence} mom5m=${(p.predicted?.momentum_5m || 0).toFixed(3)}% spread=${p.predicted?.spread_bps || 0}bps reasons=${(p.reasons_text || []).join("; ")}`);
+              log(`idea ${p.symbol_full} ${p.side} conf=${p.confidence} vol1h=${(p.predicted?.vol_1h_pct || 0).toFixed(2)}% fund=${((p.hedge_metrics?.funding_rate_raw || 0) * 100).toFixed(4)}% reasons=${(p.reasons_text || []).join("; ")}`);
             }
             
             const ideaLogs = picks.map(p => ({
@@ -2098,12 +2178,10 @@ jobs:
               flipped: p.predicted?.flipped || false,
               confidence: p.confidence,
               hedge_confidence: p.predicted?.hedge_confidence || 0,
-              momentum_5m: +(p.predicted?.momentum_5m || 0).toFixed(3),
-              spread_bps: p.predicted?.spread_bps || 0,
-              vol_5m_pct: +(p.predicted?.vol_5m_pct || 0).toFixed(2),
+              vol_1h_pct: +(p.predicted?.vol_1h_pct || 0).toFixed(2),
               funding_rate: +(p.predicted?.funding_rate || 0).toFixed(5),
               oi_delta_pct: +(p.predicted?.oi_delta_pct || 0).toFixed(1),
-              volume_5m_usd: Math.round((p.predicted?.volume_5m_usd || 0) / 1e6) + "M",
+              volume_1h_usd: Math.round((p.predicted?.volume_1h_usd || 0) / 1e6) + "M",
               reasons: p.reasons_text,
               p_cal: +p.p_lcb.toFixed(3),
               ev_bps: p.ev_bps,
@@ -2113,8 +2191,8 @@ jobs:
             const meta = {
               origin: "github_actions",
               reason,
-              exchange: "bybit_linear",
-              execution_exchange: "bybit_linear",
+              exchange: "bybit_linear",  // ← CHANGED
+              execution_exchange: "bybit_linear",  // ← CHANGED
               strategy: STRATEGY_NAME,
               model_version: MODEL_VERSION,
               schema_version: SCHEMA_VERSION,
@@ -2123,6 +2201,7 @@ jobs:
               counts: {
                 bybit_universe: bybitSymbols.length,
                 metrics_fetched: allMetrics.length,
+                refined: refined.length,
                 selected: picks.length
               },
               dd_gate: { pnl24_bps, peak_dd_bps, throttle },
@@ -2132,16 +2211,12 @@ jobs:
               idea_logs: ideaLogs,
               calibration_health: calibHealth,
               golden_metrics_config: {
-                ideal_momentum_5m: IDEAL_MOMENTUM_5M,
-                ideal_spread_bps: IDEAL_SPREAD_BPS,
-                ideal_vol_5m_pct: IDEAL_VOL_5M_PCT,
+                ideal_vol_1h_pct: IDEAL_VOL_1H_PCT,
                 ideal_funding_rate: IDEAL_FUNDING_RATE,
                 ideal_oi_delta_pct: IDEAL_OI_DELTA_PCT,
-                ideal_volume_5m_usd: IDEAL_VOLUME_5M_USD,
+                ideal_volume_1h_usd: IDEAL_VOLUME_1H_USD,
                 weights: {
-                  momentum_5m: WEIGHT_MOMENTUM_5M + " (2x)",
-                  spread: WEIGHT_SPREAD + " (2x)",
-                  vol_5m: WEIGHT_VOL_5M,
+                  vol_1h: WEIGHT_VOL_1H,
                   funding: WEIGHT_FUNDING,
                   oi_delta: WEIGHT_OI_DELTA,
                   volume: WEIGHT_VOLUME
@@ -2217,7 +2292,7 @@ jobs:
                 origin: "github_actions",
                 reason,
                 error: (e?.message || String(e)).slice(0, 220),
-                exchange: "bybit_linear"
+                exchange: "bybit_linear"  // ← CHANGED
               },
               top_n: 0,
               ideas: []
