@@ -17,7 +17,7 @@ jobs:
       - name: 🚀 A3 Work
         run: |
           echo "⏳ A3 started at $(date)"
-          sleep 180  # Sleeps 8 minutes
+          sleep 60  # Sleeps 8 minutes
           echo "✅ A3 done at $(date)"
 
       # This step triggers the Ideas Pusher (Code B)
