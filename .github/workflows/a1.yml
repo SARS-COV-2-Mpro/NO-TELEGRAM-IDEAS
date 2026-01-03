@@ -19,7 +19,7 @@ jobs:
       - name: 🚀 A1 Work
         run: |
           echo "⏳ A1 started at $(date)"
-          sleep 180  # 5 minutes - replace with your actual work
+          sleep 60  # 5 minutes - replace with your actual work
           echo "✅ A1 done at $(date)"
 
       - name: ➡️ Trigger A2
