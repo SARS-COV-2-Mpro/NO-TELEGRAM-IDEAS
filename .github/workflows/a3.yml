@@ -1,1 +1,25 @@
-u
+name: 🅱️ Ideas Pusher
+
+on:
+  repository_dispatch:
+    types: [run_B]
+
+permissions:
+  contents: write
+
+jobs:
+  pusher:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🚀 Push Ideas
+        run: |
+          echo "🎯 Ideas Pusher running at $(date)"
+          
+          # YOUR ACTUAL WORK HERE
+          
+          echo "✅ Done"
+
