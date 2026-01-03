@@ -1,5 +1,4 @@
 
-0
 name: 🔄 A3 (8 min)
 
 on:
@@ -13,13 +12,13 @@ permissions:
 jobs:
   a3:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
 
     steps:
       - name: 🚀 A3 Work
         run: |
           echo "⏳ A3 started at $(date)"
-          sleep 480  # 8 minutes
+          sleep 60  # 8 minutes
           echo "✅ A3 done at $(date)"
 
       - name: 🔁 Trigger Ideas Pusher (run_B)
