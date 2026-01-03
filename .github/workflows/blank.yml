@@ -1,9 +1,6 @@
-m
 name: Ideas Pusher (Bybit Ultimate 1.0.0)
 
 on:
-  schedule:
-    - cron: "*/30 * * * *"
   repository_dispatch:
     types: [run_B]
   workflow_dispatch: {}
@@ -218,7 +215,7 @@ jobs:
           const microprice=(bid,ask,qb,qa)=>{ const d=(qb||1)+(qa||1); return (ask*qb + bid*qa)/d; };
           const ofiProxy=(d0,d1)=>{ const lev=(side,d)=>d?.[side]?.slice(0,3).map(x=>+x[1]||0)||[]; const sum=a=>a.reduce((x,y)=>x+y,0); if(!d0||!d1) return 0; return (sum(lev("bids",d1))-sum(lev("bids",d0))) - (sum(lev("asks",d1))-sum(lev("asks",d0))); };
           const bookSlope=(depth, mid)=>{ const toPts=(levels)=>{ let cum=0; const pts=[]; for(const [ps,qs] of (levels||[])){ const p=+ps,q=+qs; if(!(p>0&&q>0)) continue; cum+=p*q; const x=Math.log(Math.abs(p-mid)/mid + 1e-6), y=Math.log(cum+1); pts.push([x,y]); if(pts.length>=10) break; } return pts; }; if(!depth?.asks?.length||!depth?.bids?.length||!(mid>0)) return { slope:0, r2:0 }; const pts=toPts(depth.asks).concat(toPts(depth.bids)); if(pts.length<6) return { slope:0, r2:0 }; const xs=pts.map(p=>p[0]), ys=pts.map(p=>p[1]), mx=mean(xs), my=mean(ys); let num=0,den=0,vy=0; for(let i=0;i<xs.length;i++){ const dx=xs[i]-mx, dy=ys[i]-my; num+=dx*dy; den+=dx*dx; vy+=dy*dy; } return { slope: den>1e-9? num/den : 0, r2: den>1e-9 && vy>1e-9? (num*num)/(den*vy):0 }; };
-          const reasonBuilder=(ctx)=>{ const out=[]; if((ctx.vol_1h_pct||0)>=1.5) out.push({ factor:"Vol_1h_pct", value:+(ctx.vol_1h_pct||0).toFixed(2), contribution:+Math.min(20,(ctx.vol_1h_pct)*5).toFixed(1) }); if((ctx.funding_rate||0)>=0.0003) out.push({ factor:"Funding", value:+(ctx.funding_rate*100||0).toFixed(3), contribution:+Math.min(15, ctx.funding_rate*10000).toFixed(1) }); if((ctx.oi_delta_pct||0)>=5) out.push({ factor:"OI_delta_pct", value:+(ctx.oi_delta_pct||0).toFixed(1), contribution:+Math.min(12,(ctx.oi_delta_pct)*0.8).toFixed(1) }); if((ctx.volume_1h_usd||0)>=30000000) out.push({ factor:"Volume_1h", value:Math.round((ctx.volume_1h_usd||0)/1000000)+"M", contribution:+Math.min(10, (ctx.volume_1h_usd||0)/10000000).toFixed(1) }); if((ctx.basis_bps||0)>5) out.push({ factor:"Basis_bps", value:+(ctx.basis_bps||0).toFixed(1), contribution:+Math.min(8, ctx.basis_bps*0.5).toFixed(1) }); return out.sort((a,b)=>Math.abs(b.contribution)-Math.abs(a.contribution)).slice(0,5); };
+          const reasonBuilder=(ctx)=>{ const out=[]; const price_24h_pct = ctx.price_24h_pct || 0; const turnover_24h = ctx.turnover_24h || 0; if(Math.abs(price_24h_pct) >= 5) out.push({ factor:"Price_24h_pct", value:+(price_24h_pct).toFixed(2), contribution:+Math.min(40,Math.abs(price_24h_pct)*3).toFixed(1) }); if(turnover_24h >= 50000000) out.push({ factor:"Volume_24h", value:Math.round(turnover_24h/1000000)+"M", contribution:+Math.min(30, turnover_24h/20000000).toFixed(1) }); return out.sort((a,b)=>Math.abs(b.contribution)-Math.abs(a.contribution)).slice(0,5); };
           const cholesky=(A)=>{ const n=A.length; const L=Array.from({length:n},()=>Array(n).fill(0)); for(let i=0;i<n;i++){ for(let j=0;j<=i;j++){ let s=0; for(let k=0;k<j;k++) s+=L[i][k]*L[j][k]; const v=A[i][j]-s; if(i===j){ if(v<=1e-12) return null; L[i][j]=Math.sqrt(Math.max(v,1e-12)); } else L[i][j]=v/(L[j][j]||1e-12); } } return L; };
           const choleskySafe=(S)=>{ const L=cholesky(S); if(L) return L; const n=S.length; const Sc=S.map((r,i)=> r.map((v,j)=> v + (i===j?1e-6:0))); return cholesky(Sc); };
           const sampleMultiT=(muVec,Sigma,df=6,M=1000)=>{ const n=muVec.length; const L=choleskySafe(Sigma); if(!L) return []; const out=[]; for(let m=0;m<M;m++){ const z=Array(n).fill(0).map(()=>randn()); const y=Array(n).fill(0); for(let i=0;i<n;i++){ let s=0; for(let k=0;k<i;k++) s+=L[i][k]*z[k]; y[i]=s; } let chi=0; for(let i=0;i<df;i++){ const zc=randn(); chi+=zc*zc; } const scale=Math.sqrt(df/Math.max(1e-9,chi)); out.push(y.map((yi,i)=> (muVec[i]||0) + yi*scale)); } return out; };
@@ -488,155 +485,27 @@ jobs:
             return true;
           }
 
-          async function fetchBybitLinearSymbols() {
-            const cacheKey = "bybit_linear_symbols";
-            const cached = getCached(cache.bybit, cacheKey, 300_000);
+          async function fetchBybitAllTickers() {
+            const cacheKey = "bybit_all_tickers";
+            const cached = getCached(cache.bybit, cacheKey, 30_000); // 30 sec TTL
             if (cached) return cached;
+            
+            const url = `${BYBIT_API}/v5/market/tickers?category=linear`;
+            try {
+              const timeout = 60000;
+              log(`📡 Fetching all Bybit tickers from: ${url}`);
+              const data = await getJSON(url, timeout);
 
-            const url = `${BYBIT_API}/v5/market/instruments-info?category=linear&limit=1000`;
-            for (let attempt = 0; attempt < 3; attempt++) {
-              try {
-                const timeout = 60000;
-                log(`📡 Fetching Bybit instruments-info (attempt ${attempt + 1}/3, timeout ${timeout/1000}s) from: ${url}`);
-                const data = await getJSON(url, timeout);
-
-                if (!await checkBybitResponse(data, "fetchBybitLinearSymbols")) continue;
-
-                const getPrecision = (step) => {
-                  const s = String(step);
-                  if (!s.includes('.')) return 0;
-                  return s.split('.')[1].replace(/0+$/, '').length;
-                };
-
-                const symbols = data.result.list
-                  .filter(s => s.contractType === "LinearPerpetual" && s.quoteCoin === "USDT" && s.status === "Trading")
-                  .map(s => ({
-                    symbol: s.symbol,
-                    base: s.baseCoin,
-                    quote: s.quoteCoin,
-                    pricePrecision: getPrecision(s.priceFilter?.tickSize || "0.01"),
-                    quantityPrecision: getPrecision(s.lotSizeFilter?.qtyStep || "0.001")
-                  }));
-                
-                setCached(cache.bybit, cacheKey, symbols);
-                log(`✅ Bybit Linear: ${symbols.length} USDT perpetuals found`);
-                return symbols;
-              } catch (e) {
-                log(`❌ Attempt ${attempt + 1}/3 failed:`, e?.message || e);
-                if (attempt < 2) await sleep(3000 + attempt * 2000);
-              }
+              if (!await checkBybitResponse(data, "fetchBybitAllTickers")) return [];
+              
+              const tickers = data.result.list;
+              setCached(cache.bybit, cacheKey, tickers);
+              log(`✅ Bybit: ${tickers.length} total linear tickers found`);
+              return tickers;
+            } catch (e) {
+              log(`❌ Tickers fetch failed:`, e?.message || e);
+              return [];
             }
-            log("💥 All 3 attempts exhausted for Bybit instruments-info");
-            return [];
-          }
-
-          async function fetchBybit1hKline(symbol) {
-            const cacheKey = `bybit_1h_${symbol}`;
-            const cached = getCached(cache.bybit, cacheKey, TTL.bybit);
-            if (cached) return cached;
-            
-            try {
-              const url = `${BYBIT_API}/v5/market/kline?category=linear&symbol=${symbol}&interval=60&limit=2`;
-              const data = await getJSON(url, 10000, 2);
-
-              if (!await checkBybitResponse(data, "fetchBybit1hKline")) return null;
-              const list = data.result.list;
-              if (!Array.isArray(list) || list.length < 2) return null;
-
-              // Bybit returns newest first: [0] is current, [1] is previous
-              const prevClose = +list[1][4];
-              const currClose = +list[0][4];
-              const currVolume = +list[0][6]; // Quote asset volume is at index 6
-              const currHigh = +list[0][2];
-              const currLow = +list[0][3];
-              
-              const priceChange1h = prevClose > 0 ? ((currClose - prevClose) / prevClose) : 0;
-              const vol1hPct = Math.abs(priceChange1h) * 100;
-              
-              const result = {
-                symbol, prevClose, currClose, currHigh, currLow,
-                volume1hUSD: currVolume, priceChange1h, vol1hPct, ts: Date.now()
-              };
-              
-              setCached(cache.bybit, cacheKey, result);
-              return result;
-            } catch (e) { return null; }
-          }
-          
-          async function fetchBybitTicker(symbol) {
-            const cacheKey = `bybit_ticker_${symbol}`;
-            const cached = getCached(cache.bybit, cacheKey, TTL.bybit);
-            if (cached) return cached;
-            
-            try {
-              const url = `${BYBIT_API}/v5/market/tickers?category=linear&symbol=${symbol}`;
-              const data = await getJSON(url, 10000, 2);
-
-              if (!await checkBybitResponse(data, "fetchBybitTicker")) return null;
-              const ticker = data.result.list?.[0];
-              if (!ticker) return null;
-              
-              const result = {
-                symbol,
-                markPrice: +ticker.markPrice || 0,
-                indexPrice: +ticker.indexPrice || 0,
-                lastFundingRate: +ticker.fundingRate || 0,
-                nextFundingTime: +ticker.nextFundingTime || 0,
-                openInterestValue: +ticker.openInterestValue || 0,
-                bid: +ticker.bid1Price,
-                ask: +ticker.ask1Price,
-                ts: Date.now()
-              };
-              
-              setCached(cache.bybit, cacheKey, result);
-              return result;
-            } catch (e) { return null; }
-          }
-
-          async function fetchBybitOIHist(symbol) {
-            const cacheKey = `bybit_oi_hist_${symbol}`;
-            const cached = getCached(cache.bybit, cacheKey, TTL.bybit);
-            if (cached) return cached;
-            
-            try {
-              const url = `${BYBIT_API}/v5/market/open-interest?category=linear&symbol=${symbol}&intervalTime=1h&limit=3`;
-              const data = await getJSON(url, 10000, 2);
-
-              if (!await checkBybitResponse(data, "fetchBybitOIHist")) return null;
-              const list = data.result.list;
-              if (!Array.isArray(list) || list.length < 2) return null;
-              
-              // Newest first, returns contract count, not USD value
-              const currentContracts = +list[0]?.openInterest || 0;
-              const prev1hContracts = +list[1]?.openInterest || 0;
-              const prev2hContracts = list[2] ? +list[2]?.openInterest : prev1hContracts;
-
-              const result = {
-                symbol, currentContracts, prev1hContracts, prev2hContracts, ts: Date.now()
-              };
-              
-              setCached(cache.bybit, cacheKey, result);
-              return result;
-            } catch (e) { return null; }
-          }
-
-          async function fetchBybitSpotPrice(symbol) {
-            const cacheKey = `bybit_spot_${symbol}`;
-            const cached = getCached(cache.bybit, cacheKey, TTL.bybit);
-            if (cached) return cached;
-            
-            try {
-              const url = `${BYBIT_SPOT}/v5/market/tickers?category=spot&symbol=${symbol}`;
-              const data = await getJSON(url, 8000, 2);
-
-              if (!await checkBybitResponse(data, "fetchBybitSpotPrice")) return null;
-              const ticker = data.result.list?.[0];
-              if (!ticker?.lastPrice) return null;
-
-              const result = { symbol, spotPrice: +ticker.lastPrice, ts: Date.now() };
-              setCached(cache.bybit, cacheKey, result);
-              return result;
-            } catch (e) { return null; }
           }
           
           async function fetchBybitOrderbook(symbol) {
@@ -657,82 +526,6 @@ jobs:
               setCached(cache.bybit, cacheKey, normalized);
               return normalized;
             } catch (e) { return null; }
-          }
-
-          function calculateBasis(futuresPrice, spotPrice) {
-            if (!futuresPrice || !spotPrice || spotPrice <= 0) return { basis: 0, basis_bps: 0 };
-            const basis = (futuresPrice - spotPrice) / spotPrice;
-            return { basis, basis_bps: Math.round(basis * 10000) };
-          }
-          
-          async function fetchGoldenMetricsWithSpread(symbol) {
-            try {
-              const [kline, ticker, oiHist] = await Promise.all([
-                fetchBybit1hKline(symbol),
-                fetchBybitTicker(symbol),
-                fetchBybitOIHist(symbol),
-           
-              ]);
-              const spot = null;
-              
-              if (!kline || !ticker) return null;
-              
-              const basisInfo = calculateBasis(ticker.markPrice, spot?.spotPrice);
-              
-              let spread_bps = 999;
-              let mid = ticker.markPrice || kline.currClose || 0;
-              if (ticker.bid && ticker.ask && ticker.bid > 0) {
-                mid = (ticker.bid + ticker.ask) / 2;
-                spread_bps = Math.round(((ticker.ask - ticker.bid) / mid) * 10000);
-              }
-              
-              let oi_delta_pct = 0, oi_delta_1h_pct = 0, oi_delta_2h_pct = 0;
-              let current_oi_usd = ticker.openInterestValue;
-              if (oiHist && mid > 0) {
-                  const currentOI = oiHist.currentContracts * mid;
-                  const prev1hOI = oiHist.prev1hContracts * mid;
-                  const prev2hOI = oiHist.prev2hContracts * mid;
-                  
-                  const oiDelta1h = prev1hOI > 0 ? ((currentOI - prev1hOI) / prev1hOI) : 0;
-                  const oiDelta2h = prev2hOI > 0 ? ((currentOI - prev2hOI) / prev2hOI) : 0;
-                  
-                  oi_delta_1h_pct = Math.abs(oiDelta1h) * 100;
-                  oi_delta_2h_pct = Math.abs(oiDelta2h) * 100;
-                  oi_delta_pct = Math.max(oi_delta_1h_pct, oi_delta_2h_pct);
-                  current_oi_usd = currentOI;
-              }
-
-              return {
-                symbol,
-                vol_1h_pct: kline.vol1hPct || 0,
-                price_change_1h: kline.priceChange1h || 0,
-                funding_rate: Math.abs(ticker.lastFundingRate || 0),
-                funding_rate_raw: ticker.lastFundingRate || 0,
-                oi_delta_pct, oi_delta_1h_pct, oi_delta_2h_pct,
-                current_oi_usd,
-                volume_1h_usd: kline.volume1hUSD || 0,
-                mark_price: mid,
-                spot_price: spot?.spotPrice || 0,
-                basis_bps: basisInfo.basis_bps,
-                spread_bps,
-                bid: ticker.bid || 0,
-                ask: ticker.ask || 0,
-                ts: Date.now()
-              };
-            } catch (e) {
-              return null;
-            }
-          }
-
-          function calculateHedgeConfidence(metrics) {
-            if (!metrics) return 0;
-            const volNorm = Math.tanh((metrics.vol_1h_pct || 0) / IDEAL_VOL_1H_PCT);
-            const fundingNorm = Math.tanh((metrics.funding_rate || 0) / IDEAL_FUNDING_RATE);
-            const oiNorm = Math.tanh((metrics.oi_delta_pct || 0) / IDEAL_OI_DELTA_PCT);
-            const volUsdNorm = Math.tanh((metrics.volume_1h_usd || 0) / IDEAL_VOLUME_1H_USD);
-            const spreadScore = metrics.spread_bps != null ? Math.max(0, 1 - (metrics.spread_bps - IDEAL_SPREAD_BPS) / 12) : 0.5;
-            const rawScore = WEIGHT_VOL_1H * volNorm + WEIGHT_FUNDING * fundingNorm + WEIGHT_OI_DELTA * oiNorm + WEIGHT_VOLUME * volUsdNorm + WEIGHT_SPREAD * spreadScore;
-            return clamp(Math.round(rawScore * 100), 0, 100);
           }
           
           // ---------- Secondary store stub (no-op) ----------
@@ -858,95 +651,99 @@ jobs:
             const calibHealth = validateCalibration(state);
             if(!todOK) reason="tod_gate";
 
-            // ========== DYNAMIC UNIVERSE FROM BYBIT LINEAR (NO VALIDATION NEEDED) ==========
-            log("📡 Fetching Bybit Linear universe...");
-            const bybitSymbols = await fetchBybitLinearSymbols();
-            if (!bybitSymbols || bybitSymbols.length === 0) {
-              log("❌ No Bybit Linear symbols found - cannot proceed");
-              reason = "no_bybit_symbols";
-              throw new Error("No Bybit Linear symbols available");
+            // ========== DYNAMIC UNIVERSE FROM BYBIT GAINERS/LOSERS ==========
+            log("📡 Fetching all Bybit Linear tickers to find gainers/losers...");
+            const allTickers = await fetchBybitAllTickers();
+            if (!allTickers || allTickers.length === 0) {
+                throw new Error("Failed to fetch Bybit tickers.");
             }
-            log(`✅ Bybit Linear universe: ${bybitSymbols.length} USDT perpetuals`);
+            const bybitUniverseCount = allTickers.length;
+            
+            const minVol24h = MIN_QV_ENV > 0 ? MIN_QV_ENV : 20000000; // Default to $20M 24h volume
+            
+            const filteredTickers = allTickers.filter(t => 
+                t.symbol.endsWith("USDT") &&
+                parseFloat(t.turnover24h) > minVol24h &&
+                !STABLES.has(t.symbol.replace("USDT", "")) &&
+                !(state.cooldown?.[t.symbol.replace("USDT", "")] && (Date.now() - (state.cooldown[t.symbol.replace("USDT", "")]||0) < COOLDOWN_MS))
+            );
+            log(`📈 Filtered to ${filteredTickers.length} liquid, non-stable, non-cooldown symbols (min vol ${minVol24h / 1e6}M)`);
+            
+            const gainers = filteredTickers.filter(t => parseFloat(t.price24hPcnt) > 0).sort((a, b) => parseFloat(b.price24hPcnt) - parseFloat(a.price24hPcnt));
+            const losers = filteredTickers.filter(t => parseFloat(t.price24hPcnt) < 0).sort((a, b) => parseFloat(a.price24hPcnt) - parseFloat(b.price24hPcnt));
+            
+            const takeEach = Math.max(1, Math.floor((TOP_N || 4) / 2));
+            log(`🏆 Selecting top ${takeEach} gainers and ${takeEach} losers.`);
+            
+            const topCandidates = [
+                ...gainers.slice(0, takeEach),
+                ...losers.slice(0, takeEach)
+            ];
+            
+            log(`📋 Top candidates: ${topCandidates.map(t => `${t.symbol} (${(parseFloat(t.price24hPcnt)*100).toFixed(2)}%)`).join(', ')}`);
 
             const equityStats=(eq)=>{ const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of eq||[]){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd) }; };
             const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
             const throttle=(pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
 
-            // ========== FETCH GOLDEN METRICS FOR ALL BYBIT SYMBOLS ==========
-            log("📊 Fetching golden metrics for all symbols...");
-            const BATCH_SIZE = 10;
-            const BATCH_DELAY = 500;
-            const allMetrics = [];
-            
-            const eligibleSymbols = bybitSymbols.filter(sym => {
-              const lastTs = state.cooldown?.[sym.base] || 0;
-              return !(lastTs && (Date.now() - lastTs) < COOLDOWN_MS);
-            });
-            log(`📋 Eligible symbols after cooldown filter: ${eligibleSymbols.length}/${bybitSymbols.length}`);
-
-            for (let i = 0; i < eligibleSymbols.length; i += BATCH_SIZE) {
-              const batch = eligibleSymbols.slice(i, i + BATCH_SIZE);
-              const batchResults = await Promise.all(
-                batch.map(async (sym) => {
-                  try {
-                    const metrics = await fetchGoldenMetricsWithSpread(sym.symbol);
-                    if (!metrics) return null;
-                    return { ...sym, ...metrics, hedge_confidence: calculateHedgeConfidence(metrics) };
-                  } catch (e) { return null; }
-                })
-              );
-              for (const r of batchResults) if (r && r.mark_price > 0) allMetrics.push(r);
-              if (i + BATCH_SIZE < eligibleSymbols.length) await sleep(BATCH_DELAY);
-            }
-            log(`📈 Fetched metrics for ${allMetrics.length}/${eligibleSymbols.length} symbols`);
-
-            allMetrics.sort((a, b) => b.hedge_confidence - a.hedge_confidence);
-
-            const TOP_10_COUNT = 10;
-            const topCandidates = allMetrics.slice(0, TOP_10_COUNT);
-            log("🏆 Top 10 by hedge confidence (includes spread):");
-            topCandidates.forEach((m, i) => log(`   ${i+1}. ${m.symbol} conf=${m.hedge_confidence} vol1h=${m.vol_1h_pct.toFixed(2)}% fund=${(m.funding_rate*100).toFixed(4)}% oi_delta=${m.oi_delta_pct.toFixed(1)}% vol=$${Math.round(m.volume_1h_usd/1e6)}M spread=${m.spread_bps}bps`));
-
-            const btcMetrics = allMetrics.find(m => m.symbol === "BTCUSDT");
-            const btcUp1h = btcMetrics ? (btcMetrics.price_change_1h > 0) : true;
-            const TARGET_TOP_N = Math.max(1, TOP_N || 3);
+            // ========== SELECT AND PREPARE IDEAS ==========
             let selected = [];
-
             for (const cand of topCandidates) {
-              if (selected.length >= TARGET_TOP_N) break;
-              if (selected.some(s => s.base === cand.base)) continue;
-              
-              const side = cand.funding_rate_raw > 0 ? "short" : "long";
-              const atr_bps = Math.round(cand.vol_1h_pct * 100);
-              const tp_bps = Math.max(30, Math.round(atr_bps * 0.9));
-              const sl_bps = Math.min(80, Math.max(20, Math.round(atr_bps * 0.5)));
-              const cost_bps = COST_BPS + Math.round(cand.spread_bps / 2);
-              const p_win = 0.50 + 0.15 * Math.tanh(cand.vol_1h_pct / 3);
-              const ev_bps = Math.round(p_win * tp_bps - (1 - p_win) * sl_bps - cost_bps);
-              
-              if (ev_bps < 0) {
-                log(`   ⏭️  Skip ${cand.symbol}: negative EV (${ev_bps}bps)`);
-                continue;
-              }
-              
-              selected.push({
-                symbol: cand.symbol, base: cand.base, quote: cand.quote, side,
-                mark_price: cand.mark_price, spread_bps: cand.spread_bps,
-                tp_bps, sl_bps, cost_bps, rrr: +(tp_bps / sl_bps).toFixed(2),
-                p_win: +p_win.toFixed(3), p_lcb: +p_win.toFixed(3), p_raw: +p_win.toFixed(3),
-                ev_bps, exp_lcb_bps: ev_bps, regime: "hedge", style: "hedge",
-                vol_1h_pct: cand.vol_1h_pct, funding_rate: cand.funding_rate, funding_rate_raw: cand.funding_rate_raw,
-                oi_delta_pct: cand.oi_delta_pct, volume_1h_usd: cand.volume_1h_usd, basis_bps: cand.basis_bps,
-                current_oi_usd: cand.current_oi_usd, confidence: cand.hedge_confidence, hedge_confidence: cand.hedge_confidence,
-                hold_sec: 3600,
-                reasons: reasonBuilder({
-                  vol_1h_pct: cand.vol_1h_pct, funding_rate: cand.funding_rate, oi_delta_pct: cand.oi_delta_pct,
-                  volume_1h_usd: cand.volume_1h_usd, basis_bps: cand.basis_bps
-                }),
-                ret5: []
-              });
+                const symbol = cand.symbol;
+                const base = symbol.replace("USDT", "");
+                
+                const depth = await fetchBybitOrderbook(symbol);
+                if (!depth || !depth.bids?.[0] || !depth.asks?.[0]) {
+                    log(`   ⏭️  Skip ${symbol}: No orderbook data`);
+                    continue;
+                }
+
+                const bid = parseFloat(depth.bids[0][0]);
+                const ask = parseFloat(depth.asks[0][0]);
+                const mid = (bid + ask) / 2;
+                const spread_bps = Math.round((ask - bid) / mid * 10000);
+                
+                if (spread_bps > MAX_SPREAD_BPS) {
+                    log(`   ⏭️  Skip ${symbol}: Spread too high (${spread_bps}bps > ${MAX_SPREAD_BPS}bps)`);
+                    continue;
+                }
+
+                const side = parseFloat(cand.price24hPcnt) > 0 ? "short" : "long";
+                const atr_bps_proxy = Math.abs(parseFloat(cand.price24hPcnt) * 100);
+                const tp_bps = Math.max(40, Math.round(atr_bps_proxy * 0.15));
+                const sl_bps = Math.min(100, Math.max(25, Math.round(atr_bps_proxy * 0.10)));
+                const cost_bps = COST_BPS + Math.round(spread_bps / 2);
+                
+                const p_win = 0.55; // Base probability for mean reversion trades
+                const ev_bps = Math.round(p_win * tp_bps - (1 - p_win) * sl_bps - cost_bps);
+
+                if (ev_bps < (EXP_LCB_MIN_BPS_BASE || 10)) {
+                    log(`   ⏭️  Skip ${symbol}: Low EV (${ev_bps}bps < ${EXP_LCB_MIN_BPS_BASE || 10}bps)`);
+                    continue;
+                }
+                
+                const changeNorm = Math.tanh(Math.abs(parseFloat(cand.price24hPcnt)) / 0.15);
+                const volNorm = Math.tanh(parseFloat(cand.turnover24h) / 200e6);
+                const fundingNorm = Math.tanh(Math.abs(parseFloat(cand.fundingRate)) / 0.0005);
+                const confidence = clamp(Math.round((0.5 * changeNorm + 0.3 * volNorm + 0.2 * fundingNorm) * 100), 10, 95);
+
+                selected.push({
+                    symbol: symbol, base: base, quote: "USDT", side: side,
+                    mark_price: mid, spread_bps: spread_bps,
+                    tp_bps: tp_bps, sl_bps: sl_bps, cost_bps: cost_bps, rrr: +(tp_bps / sl_bps).toFixed(2),
+                    p_win: +p_win.toFixed(3), p_lcb: +p_win.toFixed(3), p_raw: +p_win.toFixed(3),
+                    ev_bps: ev_bps, exp_lcb_bps: ev_bps, regime: "meanrevert", style: "hedge",
+                    price_24h_pct: parseFloat(cand.price24hPcnt) * 100,
+                    funding_rate_raw: parseFloat(cand.fundingRate),
+                    volume_24h_usd: parseFloat(cand.turnover24h),
+                    confidence: confidence,
+                    hold_sec: 2 * 3600,
+                    reasons: reasonBuilder({ price_24h_pct: parseFloat(cand.price24hPcnt) * 100, turnover_24h: parseFloat(cand.turnover24h) }),
+                    ret5: []
+                });
             }
-            log(`✅ Selected ${selected.length} ideas (TOP ${TARGET_TOP_N} from Top 10)`);
+            
+            log(`✅ Selected ${selected.length} ideas (Gainers to Short, Losers to Long)`);
             const flipped = selected.map(orig => ({ ...orig, side: orig.side === "long" ? "short" : "long", flipped: true, original_idea_id: orig.symbol + "_" + orig.side }));
             const selectedWithFlipped = [...selected, ...flipped];
 
@@ -981,16 +778,15 @@ jobs:
                 p_raw: x.p_raw, calib_key: `side:${x.side}|regime:${x.regime}`, regime: x.regime, ttl_sec: ttl, size_bps,
                 predicted: {
                   ts_ms: Date.now(), p_cal: x.p_lcb, ev_bps: x.exp_lcb_bps ?? x.exp_bps, confidence_score: x.confidence,
-                  flipped: x.flipped || false, vol_1h_pct: x.vol_1h_pct, funding_rate: x.funding_rate,
-                  oi_delta_pct: x.oi_delta_pct, volume_1h_usd: x.volume_1h_usd, basis_bps: x.basis_bps,
-                  hedge_confidence: x.hedge_confidence
+                  flipped: x.flipped || false, vol_1h_pct: x.price_24h_pct, funding_rate: Math.abs(x.funding_rate_raw),
+                  oi_delta_pct: 0, volume_1h_usd: x.volume_24h_usd, basis_bps: 0,
+                  hedge_confidence: x.confidence
                 },
                 confidence: x.confidence, reasons: x.reasons,
                 reasons_text: (x.reasons || []).slice(0, 3).map(r => `${r.factor}:${r.value}(${r.contribution >= 0 ? "+" : ""}${r.contribution})`),
                 hedge_metrics: {
-                  vol_1h_pct: x.vol_1h_pct, funding_rate_raw: x.funding_rate_raw, oi_delta_pct: x.oi_delta_pct,
-                  volume_1h_usd: x.volume_1h_usd, basis_bps: x.basis_bps, mark_price: x.mark_price,
-                  spot_price: x.spot_price, current_oi_usd: x.current_oi_usd
+                  price_24h_pct: x.price_24h_pct, funding_rate_raw: x.funding_rate_raw,
+                  volume_24h_usd: x.volume_24h_usd, mark_price: x.mark_price,
                 }
               };
             });
@@ -1013,11 +809,11 @@ jobs:
             let picks = picksV2.map(toV1Compat);
 
             try {
-              const maxVolPick = Math.max(...picks.map(p => p.predicted?.vol_1h_pct || 1));
-              if (maxVolPick > 5) {
-                const scale = clamp(5 / maxVolPick, 0.4, 1);
+              const maxVolPick = Math.max(...picks.map(p => Math.abs(p.predicted?.vol_1h_pct || 1))); // Using 24h pct as vol proxy
+              if (maxVolPick > 15) { // Adjusted threshold for 24h change
+                const scale = clamp(15 / maxVolPick, 0.4, 1);
                 picks = picks.map(p => ({ ...p, size_bps: Math.max(4, Math.round(p.size_bps * scale)) }));
-                log("[gha] High volatility detected, scaling sizes by", scale.toFixed(2));
+                log("[gha] High 24h volatility detected, scaling sizes by", scale.toFixed(2));
               }
             } catch (e) { log("[gha] Portfolio risk adjustment warn", e?.message || e); }
 
@@ -1031,7 +827,7 @@ jobs:
                   symbolFull: p.symbol_full, flipped: p.predicted?.flipped || false, base: p.symbol, quote: p.quote, side: p.side,
                   entry_limit: p.entry_limit, tp_abs: p.tp_abs, sl_abs: p.sl_abs, hold_sec: p.ttl_sec, tp_bps: p.tp_bps, sl_bps: p.sl_bps,
                   cost_bps: p.cost_bps, tier: p.tier || "confidence", p_lcb: p.p_lcb, p_raw: p.p_raw, calib_key: p.calib_key,
-                  predicted: p.predicted, regime: p.regime, decision_context: { source: "bybit_linear", golden_metrics: p.hedge_metrics },
+                  predicted: p.predicted, regime: p.regime, decision_context: { source: "bybit_linear_gainers_losers", hedge_metrics: p.hedge_metrics },
                   notional_usd: NOTIONAL, size_bps: p.size_bps, idea_id: p.idea_id, client_order_id: p.client_order_id,
                   hedge_metrics: p.hedge_metrics, status: "planned", entry_ts_ms: null, entry_price: null, qty: null
                 });
@@ -1043,12 +839,12 @@ jobs:
             const auditOut = buildAuditOutputs(state);
             await saveState(persist, state, auditOut, 2, true);
 
-            for (const p of picks) log(`idea ${p.symbol_full} ${p.side} conf=${p.confidence} vol1h=${(p.predicted?.vol_1h_pct || 0).toFixed(2)}% fund=${((p.hedge_metrics?.funding_rate_raw || 0) * 100).toFixed(4)}% reasons=${(p.reasons_text || []).join("; ")}`);
+            for (const p of picks) log(`idea ${p.symbol_full} ${p.side} conf=${p.confidence} 24h_chg=${(p.hedge_metrics?.price_24h_pct || 0).toFixed(2)}% fund=${((p.hedge_metrics?.funding_rate_raw || 0) * 100).toFixed(4)}% reasons=${(p.reasons_text || []).join("; ")}`);
             const ideaLogs = picks.map(p => ({
               symbol: p.symbol_full, side: p.side, flipped: p.predicted?.flipped || false, confidence: p.confidence,
-              hedge_confidence: p.predicted?.hedge_confidence || 0, vol_1h_pct: +(p.predicted?.vol_1h_pct || 0).toFixed(2),
-              funding_rate: +(p.predicted?.funding_rate || 0).toFixed(5), oi_delta_pct: +(p.predicted?.oi_delta_pct || 0).toFixed(1),
-              volume_1h_usd: Math.round((p.predicted?.volume_1h_usd || 0) / 1e6) + "M", reasons: p.reasons_text,
+              price_24h_pct: +(p.hedge_metrics?.price_24h_pct || 0).toFixed(2),
+              funding_rate: +(p.hedge_metrics?.funding_rate_raw || 0).toFixed(5),
+              volume_24h_usd: Math.round((p.hedge_metrics?.volume_24h_usd || 0) / 1e6) + "M", reasons: p.reasons_text,
               p_cal: +p.p_lcb.toFixed(3), ev_bps: p.ev_bps, idea_id: p.idea_id
             }));
 
@@ -1056,14 +852,11 @@ jobs:
               origin: "github_actions", reason, exchange: "bybit_linear", execution_exchange: "bybit_linear",
               strategy: STRATEGY_NAME, model_version: MODEL_VERSION, schema_version: SCHEMA_VERSION, git_sha: GIT_SHA,
               config_hash: CONFIG_HASH,
-              counts: { bybit_universe: bybitSymbols.length, metrics_fetched: allMetrics.length, selected: picks.length },
+              counts: { bybit_universe: bybitUniverseCount, metrics_fetched: filteredTickers.length, selected: picks.length },
               dd_gate: { pnl24_bps, peak_dd_bps, throttle },
               tod: { active: S_H != null && E_H != null, start: S_H, end: E_H },
               heartbeat: { mismatches: 0, zombies: 0 }, tier: selectionTier, idea_logs: ideaLogs,
               calibration_health: calibHealth,
-              golden_metrics_config: { ideal_vol_1h_pct: IDEAL_VOL_1H_PCT, ideal_funding_rate: IDEAL_FUNDING_RATE,
-                ideal_oi_delta_pct: IDEAL_OI_DELTA_PCT, ideal_volume_1h_usd: IDEAL_VOLUME_1H_USD,
-                weights: { vol_1h: WEIGHT_VOL_1H, funding: WEIGHT_FUNDING, oi_delta: WEIGHT_OI_DELTA, volume: WEIGHT_VOLUME }},
               extras: { v2_ideas: picksV2, features_requested: ["maker_join", "post_only", "linear", "hedge_trading", "bybit_execution"] }
             };
             const payload = { ts: new Date().toISOString(), mode: "normal", source: "external_pusher", meta, top_n: picks.length || 0, ideas: picks || [] };
@@ -1077,7 +870,7 @@ jobs:
 
             if (PUSH_URL_V2) {
               const payloadV2 = { ts: new Date().toISOString(), mode: "normal", source: "external_pusher",
-                meta: { origin: "github_actions_v2_bybit", strategy: "bybit-hedge-ultimate", data_source: "bybit_linear", golden_metrics: true, execution: "bybit_linear" },
+                meta: { origin: "github_actions_v2_bybit", strategy: "bybit-hedge-ultimate", data_source: "bybit_linear_gainers_losers", execution: "bybit_linear" },
                 top_n: picksV2.length, ideas: picksV2 };
               log(`pushing ${picksV2.length} v2 ideas to ${PUSH_URL_V2}`);
               try {
