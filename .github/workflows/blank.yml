@@ -703,24 +703,15 @@ jobs:
                 const mid = (bid + ask) / 2;
                 const spread_bps = Math.round((ask - bid) / mid * 10000);
                 
-                if (spread_bps > MAX_SPREAD_BPS) {
-                    log(`   ⏭️  Skip ${symbol}: Spread too high (${spread_bps}bps > ${MAX_SPREAD_BPS}bps)`);
-                    continue;
-                }
-
+                
                 const side = parseFloat(cand.price24hPcnt) > 0 ? "short" : "long";
-                const atr_bps_proxy = Math.abs(parseFloat(cand.price24hPcnt) * 100);
-                const tp_bps = Math.max(40, Math.round(atr_bps_proxy * 0.15));
-                const sl_bps = Math.min(100, Math.max(25, Math.round(atr_bps_proxy * 0.10)));
+                const tp_bps = 80;
+                const sl_bps = 50;
                 const cost_bps = COST_BPS + Math.round(spread_bps / 2);
                 
                 const p_win = 0.55; // Base probability for mean reversion trades
                 const ev_bps = Math.round(p_win * tp_bps - (1 - p_win) * sl_bps - cost_bps);
 
-                if (ev_bps < (EXP_LCB_MIN_BPS_BASE || 10)) {
-                    log(`   ⏭️  Skip ${symbol}: Low EV (${ev_bps}bps < ${EXP_LCB_MIN_BPS_BASE || 10}bps)`);
-                    continue;
-                }
                 
                 const changeNorm = Math.tanh(Math.abs(parseFloat(cand.price24hPcnt)) / 0.15);
                 const volNorm = Math.tanh(parseFloat(cand.turnover24h) / 200e6);
