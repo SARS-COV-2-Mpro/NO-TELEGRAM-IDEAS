@@ -17,7 +17,7 @@ jobs:
       - name: 🚀 A3 Work
         run: |
           echo "⏳ A3 started at $(date)"
-          sleep 150  # 8 minutes - replace with your actual work
+          sleep 240  # 8 minutes - replace with your actual work
           echo "✅ A3 done at $(date)"
 
       - name: 🔁 Trigger A1 + B (Restart Cycle)
