@@ -1,42 +1,24 @@
-name: 🔄 A3 (8 min)
+name: 🅱️ Ideas Pusher
 
 on:
   repository_dispatch:
-    types: [run_A3]
+    types: [run_B]
 
 permissions:
-  actions: write
   contents: write
 
 jobs:
-  a3:
+  pusher:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
 
     steps:
-      - name: 🚀 A3 Work
-        run: |
-          echo "⏳ A3 started at $(date)"
-          sleep 60  # 8 minutes - replace with your actual work
-          echo "✅ A3 done at $(date)"
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
 
-      - name: 🔁 Trigger A1 + B (Restart Cycle)
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            // Trigger A1 (restart cycle)
-            await github.rest.repos.createDispatchEvent({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              event_type: 'run_A1'
-            });
-            console.log('🔄 Triggered A1 (cycle restart)');
-            
-            // Trigger B (your Ideas Pusher)
-            await github.rest.repos.createDispatchEvent({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              event_type: 'run_B'
-            });
-            console.log('🅱️ Triggered B (Ideas Pusher)');
+      - name: 🚀 Push Ideas
+        run: |
+          echo "🎯 Ideas Pusher running at $(date)"
+          
+          # YOUR ACTUAL WORK HERE
+          
+          echo "✅ Done"
