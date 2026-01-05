@@ -1,6 +1,7 @@
 name: Ideas Pusher (BYBIT Ultimate 7.7.7)
 
 on:
+
   repository_dispatch:
     types: [run_B]
   workflow_dispatch: {}
@@ -215,7 +216,17 @@ jobs:
           const microprice=(bid,ask,qb,qa)=>{ const d=(qb||1)+(qa||1); return (ask*qb + bid*qa)/d; };
           const ofiProxy=(d0,d1)=>{ const lev=(side,d)=>d?.[side]?.slice(0,3).map(x=>+x[1]||0)||[]; const sum=a=>a.reduce((x,y)=>x+y,0); if(!d0||!d1) return 0; return (sum(lev("bids",d1))-sum(lev("bids",d0))) - (sum(lev("asks",d1))-sum(lev("asks",d0))); };
           const bookSlope=(depth, mid)=>{ const toPts=(levels)=>{ let cum=0; const pts=[]; for(const [ps,qs] of (levels||[])){ const p=+ps,q=+qs; if(!(p>0&&q>0)) continue; cum+=p*q; const x=Math.log(Math.abs(p-mid)/mid + 1e-6), y=Math.log(cum+1); pts.push([x,y]); if(pts.length>=10) break; } return pts; }; if(!depth?.asks?.length||!depth?.bids?.length||!(mid>0)) return { slope:0, r2:0 }; const pts=toPts(depth.asks).concat(toPts(depth.bids)); if(pts.length<6) return { slope:0, r2:0 }; const xs=pts.map(p=>p[0]), ys=pts.map(p=>p[1]), mx=mean(xs), my=mean(ys); let num=0,den=0,vy=0; for(let i=0;i<xs.length;i++){ const dx=xs[i]-mx, dy=ys[i]-my; num+=dx*dy; den+=dx*dx; vy+=dy*dy; } return { slope: den>1e-9? num/den : 0, r2: den>1e-9 && vy>1e-9? (num*num)/(den*vy):0 }; };
-          const reasonBuilder=(ctx)=>{ const out=[]; if((ctx.vol_1h_pct||0)>=1.5) out.push({ factor:"Vol_1h_pct", value:+(ctx.vol_1h_pct||0).toFixed(2), contribution:+Math.min(20,(ctx.vol_1h_pct)*5).toFixed(1) }); if((ctx.funding_rate||0)>=0.0003) out.push({ factor:"Funding", value:+(ctx.funding_rate*100||0).toFixed(3), contribution:+Math.min(15, ctx.funding_rate*10000).toFixed(1) }); if((ctx.oi_delta_pct||0)>=5) out.push({ factor:"OI_delta_pct", value:+(ctx.oi_delta_pct||0).toFixed(1), contribution:+Math.min(12,(ctx.oi_delta_pct)*0.8).toFixed(1) }); if((ctx.volume_1h_usd||0)>=30000000) out.push({ factor:"Volume_1h", value:Math.round((ctx.volume_1h_usd||0)/1000000)+"M", contribution:+Math.min(10, (ctx.volume_1h_usd||0)/10000000).toFixed(1) }); if((ctx.basis_bps||0)>5) out.push({ factor:"Basis_bps", value:+(ctx.basis_bps||0).toFixed(1), contribution:+Math.min(8, ctx.basis_bps*0.5).toFixed(1) }); if((ctx.clean_candle_pct||0)>=0.6) out.push({ factor:"CleanCandles", value:+((ctx.clean_candle_pct||0)*100).toFixed(0)+"%", contribution:+Math.min(10, (ctx.clean_candle_pct-0.5)*20).toFixed(1) }); return out.sort((a,b)=>Math.abs(b.contribution)-Math.abs(a.contribution)).slice(0,5); };
+          const reasonBuilder=(ctx)=>{ 
+            const out=[]; 
+            
+            // NEW: Clear Direction reason
+            if((ctx.clear_dir_score||0)>=60) out.push({ 
+              factor:"ClearDir", 
+              value:`${ctx.clear_dir_consistency||"?"}(r²=${ctx.clear_dir_r2||0})`, 
+              contribution:+Math.min(25,(ctx.clear_dir_score-50)*0.5).toFixed(1) 
+            });
+            
+            if((ctx.vol_1h_pct||0)>=1.5) out.push({ factor:"Vol_1h_pct", value:+(ctx.vol_1h_pct||0).toFixed(2), contribution:+Math.min(20,(ctx.vol_1h_pct)*5).toFixed(1) }); if((ctx.funding_rate||0)>=0.0003) out.push({ factor:"Funding", value:+(ctx.funding_rate*100||0).toFixed(3), contribution:+Math.min(15, ctx.funding_rate*10000).toFixed(1) }); if((ctx.oi_delta_pct||0)>=5) out.push({ factor:"OI_delta_pct", value:+(ctx.oi_delta_pct||0).toFixed(1), contribution:+Math.min(12,(ctx.oi_delta_pct)*0.8).toFixed(1) }); if((ctx.volume_1h_usd||0)>=30000000) out.push({ factor:"Volume_1h", value:Math.round((ctx.volume_1h_usd||0)/1000000)+"M", contribution:+Math.min(10, (ctx.volume_1h_usd||0)/10000000).toFixed(1) }); if((ctx.basis_bps||0)>5) out.push({ factor:"Basis_bps", value:+(ctx.basis_bps||0).toFixed(1), contribution:+Math.min(8, ctx.basis_bps*0.5).toFixed(1) }); if((ctx.clean_candle_pct||0)>=0.6) out.push({ factor:"CleanCandles", value:+((ctx.clean_candle_pct||0)*100).toFixed(0)+"%", contribution:+Math.min(10, (ctx.clean_candle_pct-0.5)*20).toFixed(1) }); return out.sort((a,b)=>Math.abs(b.contribution)-Math.abs(a.contribution)).slice(0,5); };
           const cholesky=(A)=>{ const n=A.length; const L=Array.from({length:n},()=>Array(n).fill(0)); for(let i=0;i<n;i++){ for(let j=0;j<=i;j++){ let s=0; for(let k=0;k<j;k++) s+=L[i][k]*L[j][k]; const v=A[i][j]-s; if(i===j){ if(v<=1e-12) return null; L[i][j]=Math.sqrt(Math.max(v,1e-12)); } else L[i][j]=v/(L[j][j]||1e-12); } } return L; };
           const choleskySafe=(S)=>{ const L=cholesky(S); if(L) return L; const n=S.length; const Sc=S.map((r,i)=> r.map((v,j)=> v + (i===j?1e-6:0))); return cholesky(Sc); };
           const sampleMultiT=(muVec,Sigma,df=6,M=1000)=>{ const n=muVec.length; const L=choleskySafe(Sigma); if(!L) return []; const out=[]; for(let m=0;m<M;m++){ const z=Array(n).fill(0).map(()=>randn()); const y=Array(n).fill(0); for(let i=0;i<n;i++){ let s=0; for(let k=0;k<i;k++) s+=L[i][k]*z[k]; y[i]=s; } let chi=0; for(let i=0;i<df;i++){ const zc=randn(); chi+=zc*zc; } const scale=Math.sqrt(df/Math.max(1e-9,chi)); out.push(y.map((yi,i)=> (muVec[i]||0) + yi*scale)); } return out; };
@@ -311,13 +322,19 @@ jobs:
           const IDEAL_OI_DELTA_PCT = 10.0;    // |ΔOI 1-2h| >= 10%
           const IDEAL_VOLUME_1H_USD = 60_000_000; // 1h volume >= $60M
           const IDEAL_SPREAD_BPS = 3;      // Ideal spread <= 3 bps
-
+          
+          // Clear Direction metric
+          const IDEAL_DIR_CONSISTENCY = 13;  // 13/15 candles in same direction = ideal
+          const IDEAL_DIR_R2 = 0.85;         // R² = 0.85 = strong linear trend
+          const IDEAL_DIR_AVG_MOVE_BPS = 8;  // 8bps average move per candle = meaningful
+          
           // Confidence weights for hedge trading (sum = 1.0)
-          const WEIGHT_VOL_1H = 0.35;      // Reduced from 0.40
-          const WEIGHT_FUNDING = 0.20;     // Reduced from 0.25
-          const WEIGHT_OI_DELTA = 0.15;    // Reduced from 0.20
-          const WEIGHT_VOLUME = 0.15;      // Same
-          const WEIGHT_SPREAD = 0.15;      // Weight for spread
+          const WEIGHT_CLEAR_DIR = 0.25;   // NEW: Highest weight - direction clarity
+          const WEIGHT_VOL_1H = 0.25;      // Reduced from 0.35
+          const WEIGHT_FUNDING = 0.15;     // Reduced from 0.20
+          const WEIGHT_OI_DELTA = 0.10;    // Reduced from 0.15
+          const WEIGHT_VOLUME = 0.10;      // Reduced from 0.15
+          const WEIGHT_SPREAD = 0.15;      // Same
 
 
           const CONFIG_HASH=(()=>{ try{
@@ -874,6 +891,101 @@ jobs:
             };
           }
 
+          // Calculate Clear Direction from 15 x 1-minute candles
+          function calculateClearDirection(candles_1m) {
+            if (!candles_1m || candles_1m.length < 15) {
+              return { 
+                score: 0, 
+                direction: null, 
+                consistency: 0, 
+                consistencyStr: "0/15",
+                avgMoveBps: 0,
+                r2: 0,
+                totalMoveBps: 0
+              };
+            }
+            
+            const last15 = candles_1m.slice(-15);
+            const closes = last15.map(c => +c.close);
+            const opens = last15.map(c => +c.open);
+            
+            // 1. Overall direction
+            const startPrice = closes[0];
+            const endPrice = closes[14];
+            const overallChange = (endPrice - startPrice) / startPrice;
+            const direction = overallChange > 0 ? "up" : "down";
+            
+            // 2. Consistency: How many candles moved in dominant direction?
+            let upMoves = 0, downMoves = 0;
+            for (let i = 1; i < 15; i++) {
+              if (closes[i] > closes[i-1]) upMoves++;
+              else if (closes[i] < closes[i-1]) downMoves++;
+            }
+            const consistency = direction === "up" ? upMoves : downMoves;
+            const consistencyStr = `${consistency}/14`;
+            
+            // 3. Average move per candle (body size in bps)
+            let totalBodyBps = 0;
+            for (let i = 0; i < 15; i++) {
+              const body = Math.abs(closes[i] - opens[i]);
+              const mid = (closes[i] + opens[i]) / 2 || 1;
+              totalBodyBps += (body / mid) * 10000;
+            }
+            const avgMoveBps = Math.round(totalBodyBps / 15);
+            
+            // 4. Total move over 15 candles
+            const totalMoveBps = Math.round(Math.abs(overallChange) * 10000);
+            
+            // 5. R² (Linear Regression) - How "straight" is the line?
+            const n = 15;
+            const xMean = 7; // (0+14)/2
+            const yMean = closes.reduce((a,b) => a+b, 0) / n;
+            let ssxy = 0, ssxx = 0, ssyy = 0;
+            for (let i = 0; i < n; i++) {
+              const dx = i - xMean;
+              const dy = closes[i] - yMean;
+              ssxy += dx * dy;
+              ssxx += dx * dx;
+              ssyy += dy * dy;
+            }
+            const r2 = ssyy > 0 ? (ssxy * ssxy) / (ssxx * ssyy) : 0;
+            
+            // 6. Composite score (0-100)
+            const consistencyNorm = Math.min(1, consistency / IDEAL_DIR_CONSISTENCY);
+            const r2Norm = Math.min(1, r2 / IDEAL_DIR_R2);
+            const moveNorm = Math.min(1, avgMoveBps / IDEAL_DIR_AVG_MOVE_BPS);
+            
+            const score = Math.round(100 * (
+              0.40 * consistencyNorm +  // 40%: X/14 candles same direction
+              0.40 * r2Norm +           // 40%: Straight line
+              0.20 * moveNorm           // 20%: Meaningful candle bodies
+            ));
+            
+            return {
+              score,
+              direction,
+              consistency,
+              consistencyStr,
+              avgMoveBps,
+              r2: +r2.toFixed(3),
+              totalMoveBps
+            };
+          }
+
+          // Fetch 1m candles and calculate clear direction
+          async function getSymbolClearDirection(symbol) {
+            try {
+              const candles = await fetchBybit1mKlines(symbol);
+              if (!candles || candles.length < 15) {
+                return { score: 0, direction: null, consistencyStr: "0/15", avgMoveBps: 0, r2: 0, source: "fallback" };
+              }
+              const result = calculateClearDirection(candles);
+              return { ...result, source: "bybit" };
+            } catch (e) {
+              return { score: 0, direction: null, consistencyStr: "0/15", avgMoveBps: 0, r2: 0, source: "error" };
+            }
+          }
+
           // Fetch and analyze shadows for a symbol
           async function getSymbolShadowAnalysis(symbol) {
             try {
@@ -888,8 +1000,8 @@ jobs:
             }
           }
           
-          // Calculate hedge confidence score based on 4 golden metrics
-          function calculateHedgeConfidence(metrics) {
+          // Calculate hedge confidence score based on golden metrics + clear direction
+          function calculateHedgeConfidence(metrics, clearDir) {
             if (!metrics) return 0;
             
             const volNorm = Math.tanh((metrics.vol_1h_pct || 0) / IDEAL_VOL_1H_PCT);
@@ -897,18 +1009,21 @@ jobs:
             const oiNorm = Math.tanh((metrics.oi_delta_pct || 0) / IDEAL_OI_DELTA_PCT);
             const volUsdNorm = Math.tanh((metrics.volume_1h_usd || 0) / IDEAL_VOLUME_1H_USD);
             
-            // NEW: Spread score (lower spread = higher score)
-            // spread_bps of 3 or less = 1.0, spread of 15+ = ~0
+            // Spread score (lower spread = higher score)
             const spreadScore = metrics.spread_bps != null 
               ? Math.max(0, 1 - (metrics.spread_bps - IDEAL_SPREAD_BPS) / 12)
               : 0.5;
             
+            // NEW: Clear Direction score (0-1)
+            const clearDirScore = (clearDir?.score || 0) / 100;
+            
             const rawScore = 
+              WEIGHT_CLEAR_DIR * clearDirScore +   // NEW: 25%
               WEIGHT_VOL_1H * volNorm +
               WEIGHT_FUNDING * fundingNorm +
               WEIGHT_OI_DELTA * oiNorm +
               WEIGHT_VOLUME * volUsdNorm +
-              WEIGHT_SPREAD * spreadScore;  // NEW
+              WEIGHT_SPREAD * spreadScore;
             
             const confidence = Math.round(rawScore * 100);
             
@@ -1755,10 +1870,14 @@ jobs:
                     const metrics = await fetchGoldenMetricsWithSpread(sym.symbol);
                     if (!metrics) return null;
                     
+                    // NEW: Fetch clear direction
+                    const clearDir = await getSymbolClearDirection(sym.symbol);
+                    
                     return {
                       ...sym,
                       ...metrics,
-                      hedge_confidence: calculateHedgeConfidence(metrics)
+                      clear_direction: clearDir,
+                      hedge_confidence: calculateHedgeConfidence(metrics, clearDir)
                     };
                   } catch (e) {
                     return null;
@@ -1788,10 +1907,11 @@ jobs:
             const TOP_10_COUNT = 10;
             const topCandidates = allMetrics.slice(0, TOP_10_COUNT);
 
-            log("🏆 Top 10 by hedge confidence (includes spread):");
+            log("🏆 Top 10 by hedge confidence (includes spread + direction):");
             for (let i = 0; i < topCandidates.length; i++) {
               const m = topCandidates[i];
-              log(`   ${i+1}. ${m.symbol} conf=${m.hedge_confidence} vol1h=${m.vol_1h_pct.toFixed(2)}% fund=${(m.funding_rate*100).toFixed(4)}% oi_delta=${m.oi_delta_pct.toFixed(1)}% vol=$${Math.round(m.volume_1h_usd/1e6)}M spread=${m.spread_bps}bps`);
+              const cd = m.clear_direction || {};
+              log(`   ${i+1}. ${m.symbol} conf=${m.hedge_confidence} dir=${cd.direction || "?"}(${cd.consistencyStr || "?"},r²=${cd.r2 || 0},avg=${cd.avgMoveBps || 0}bps) vol1h=${m.vol_1h_pct.toFixed(2)}% spread=${m.spread_bps}bps`);
             }
 
             // BTC regime for side selection
@@ -1871,6 +1991,9 @@ jobs:
                 // Shadow analysis
                 shadow_analysis: shadowAnalysis,
                 shadow_mult: shadowMult,
+
+                // NEW: Clear Direction
+                clear_direction: cand.clear_direction,
                 
                 confidence: adjustedConfidence,
                 hedge_confidence: cand.hedge_confidence,
@@ -1883,7 +2006,11 @@ jobs:
                   oi_delta_pct: cand.oi_delta_pct,
                   volume_1h_usd: cand.volume_1h_usd,
                   basis_bps: cand.basis_bps,
-                  clean_candle_pct: shadowAnalysis.cleanCandlePct
+                  clean_candle_pct: shadowAnalysis.cleanCandlePct,
+                  // NEW:
+                  clear_dir_score: cand.clear_direction?.score || 0,
+                  clear_dir_consistency: cand.clear_direction?.consistencyStr || "0/15",
+                  clear_dir_r2: cand.clear_direction?.r2 || 0
                 }),
                 
                 ret5: []
@@ -2001,7 +2128,14 @@ jobs:
                   shadow_avg_ratio: x.shadow_analysis?.avgShadowRatio,
                   shadow_clean_pct: x.shadow_analysis?.cleanCandlePct,
                   shadow_mult: x.shadow_mult,
-                  shadow_source: x.shadow_analysis?.source
+                  shadow_source: x.shadow_analysis?.source,
+
+                  // NEW: Clear Direction
+                  clear_dir_score: x.clear_direction?.score,
+                  clear_dir_direction: x.clear_direction?.direction,
+                  clear_dir_consistency: x.clear_direction?.consistencyStr,
+                  clear_dir_r2: x.clear_direction?.r2,
+                  clear_dir_avg_move_bps: x.clear_direction?.avgMoveBps
                 },
 
                 confidence: x.confidence,
@@ -2338,7 +2472,7 @@ jobs:
             mkdir -p /tmp
             : > /tmp/push_resp.txt
             http_code=$(curl -g -sS -o /tmp/push_resp.txt -w "%{http_code}" -X POST \
-              -H "Content-Type: application/json" \
+              -H "Content-Type": "application/json" \
               -H "Authorization: Bearer ${PUSH_TOKEN}" \
               --data-raw "${payload}" \
               --max-time 12 \
