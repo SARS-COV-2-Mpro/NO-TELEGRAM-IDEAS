@@ -1,7 +1,8 @@
-0
 name: Ideas Pusher (Bybit Ultimate 1.0.0)
 
 on:
+  schedule:
+    - cron: "*/30 * * * *"
   repository_dispatch:
     types: [run_B]
   workflow_dispatch: {}
@@ -42,7 +43,6 @@ jobs:
       NOTIONAL_USD: ${{ vars.NOTIONAL_USD }}
       BYBIT_DEPTH_LIMIT: ${{ vars.BYBIT_DEPTH_LIMIT }}
       OBI_TOPN: ${{ vars.OBI_TOPN }}
-      MAX_1M_FLUCTUATION_PCT: ${{ vars.MAX_1M_FLUCTUATION_PCT }}
       ACTIVE_UTC_START: ${{ vars.ACTIVE_UTC_START }}
       ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
       BYBIT_BASE: ${{ vars.BYBIT_BASE }}
@@ -276,7 +276,6 @@ jobs:
           const VWAP_5M_WIN=36, COST_BPS=Number(process.env.FEES_BPS||"10"), NOTIONAL=Number(process.env.NOTIONAL_USD||"300");
           const DEPTH_LIMIT=Number(process.env.BYBIT_DEPTH_LIMIT||"25");
           const OBI_TOPN=Number(process.env.OBI_TOPN||"12");
-          const MAX_1M_FLUCTUATION_PCT=Number(process.env.MAX_1M_FLUCTUATION_PCT||"0.5");
           const COOLDOWN_MS=3*60*60*1000, FLIP_GUARD_MS=30*60*1000;
           const DD_24H_LIMIT_BPS=-150, DD_PEAK_LIMIT_BPS=-300;
           const WILSON_Z=1.34, TARGET_PORT_RISK_BPS=52;
@@ -659,41 +658,6 @@ jobs:
             } catch (e) { return null; }
           }
 
-          async function fetchBybit1mKlines(symbol, limit = 5) {
-            const cacheKey = `bybit_1m_${symbol}`;
-            const cached = getCached(cache.bybit, cacheKey, 15000);
-            if (cached) return cached;
-            
-            try {
-              const url = `${BYBIT_API}/v5/market/kline?category=linear&symbol=${symbol}&interval=1&limit=${limit}`;
-              const data = await getJSON(url, 10000, 2);
-              
-              if (!await checkBybitResponse(data, "fetchBybit1mKlines")) return null;
-              const list = data.result.list;
-              if (!Array.isArray(list) || list.length < limit) return null;
-              
-              setCached(cache.bybit, cacheKey, list);
-              return list;
-            } catch (e) { return null; }
-          }
-
-          function checkRecentStability(klines, maxPct) {
-            if (!klines || !Array.isArray(klines) || klines.length === 0) return false;
-            
-            for (const candle of klines) {
-              const high = +candle[2];
-              const low = +candle[3];
-              const close = +candle[4];
-              if (close <= 0) continue;
-              
-              const fluctuation = ((high - low) / close) * 100;
-              if (fluctuation > maxPct) {
-                return false;
-              }
-            }
-            return true;
-          }
-
           function calculateBasis(futuresPrice, spotPrice) {
             if (!futuresPrice || !spotPrice || spotPrice <= 0) return { basis: 0, basis_bps: 0 };
             const basis = (futuresPrice - spotPrice) / spotPrice;
@@ -951,16 +915,7 @@ jobs:
               if (selected.length >= TARGET_TOP_N) break;
               if (selected.some(s => s.base === cand.base)) continue;
               
-              // Check 1m stability filter
-              const klines1m = await fetchBybit1mKlines(cand.symbol, 5);
-              const isStable = checkRecentStability(klines1m, MAX_1M_FLUCTUATION_PCT);
-              if (!isStable) {
-                log(`   ⏭️  Skip ${cand.symbol}: 1m fluctuation exceeds ${MAX_1M_FLUCTUATION_PCT}%`);
-                continue;
-              }
-              
               const side = cand.funding_rate_raw > 0 ? "short" : "long";
-              
               const atr_bps = Math.round(cand.vol_1h_pct * 100);
               const tp_bps = Math.max(30, Math.round(atr_bps * 0.9));
               const sl_bps = Math.min(80, Math.max(20, Math.round(atr_bps * 0.5)));
