@@ -1,10 +1,3 @@
-The code you provided had several syntax and formatting errors caused by copy-pasting from a rich-text source. Specifically, it contained HTML entities (like `&lt;` for `<`), auto-generated hyperlinks on variable names (like `[vars.TOP](http://...)`), and stray markdown formatting marks (`*`).
-
-I have cleaned all these artifacts, restored the missing parentheses in function calls, and fixed the indentation to make the YAML and JavaScript valid.
-
-### Corrected Code
-
-```yaml
 name: Ideas Pusher (BYBIT Ultimate 7.7.7)  
   
 on:  
@@ -2354,4 +2347,3 @@ jobs:
             echo "[gha] push status ${http_code} ${body}"  
             exit 0  
           fi
-```
