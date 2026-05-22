@@ -1,6 +1,8 @@
 name: Ideas Pusher (BYBIT Ultimate 7.7.7)
 
 on:
+  schedule:
+    - cron: "*/25 * * * *"
   repository_dispatch:
     types: [run_B]
   workflow_dispatch: {}
@@ -308,7 +310,7 @@ jobs:
           // Golden 4 metrics ideal thresholds (for confidence scoring, NOT gates)
           const IDEAL_VOL_1H_PCT = 2.0;       // |1h price change| >= 2%
           const IDEAL_FUNDING_RATE = 0.0004;  // |funding| >= 0.04%
-          const IDEAL_OI_DELTA_PCT = 10.0;    // |Î”OI 1-2h| >= 10%
+          const IDEAL_OI_DELTA_PCT = 10.0;    // |ΔOI 1-2h| >= 10%
           const IDEAL_VOLUME_1H_USD = 60_000_000; // 1h volume >= $60M
           const IDEAL_SPREAD_BPS = 3;      // Ideal spread <= 3 bps
 
@@ -341,19 +343,19 @@ jobs:
           try{ const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`,"User-Agent":UA }},5000); let t=""; try{ t=await r.text(); }catch{} log("health status", r?.status||"ERR", (t||"").slice(0,160)); }catch(e){ log("health error", e?.message||e); }
 
           // Pre-warm Bybit API
-          log("ðŸ”¥ Pre-warming Bybit API...");
+          log("🔥 Pre-warming Bybit API...");
           try { 
             const warmResp = await fetchWithTimeout(`${BYBIT_BASE}/v5/market/time`, {}, 30000); 
             let warmText = "";
             try { warmText = await warmResp.text(); } catch {}
-            log("âœ… Bybit pre-warm status:", warmResp?.status || "timeout", warmText.slice(0, 100));
+            log("✅ Bybit pre-warm status:", warmResp?.status || "timeout", warmText.slice(0, 100));
           } catch (e) { 
-            log("âš ï¸ Bybit pre-warm timeout:", e?.message || e); 
+            log("⚠️ Bybit pre-warm timeout:", e?.message || e); 
           }
           await sleep(2000);
 
           // ========== FAKE FLUSH START ==========
-          log("ðŸš€ FAKE FLUSH: Sending 2 fake ideas immediately...");
+          log("🚀 FAKE FLUSH: Sending 2 fake ideas immediately...");
           try {
             const fakeIdeas = [
               {
@@ -442,7 +444,7 @@ jobs:
               ideas: fakeIdeas
             };
 
-            log("ðŸ“¤ Pushing FAKE ideas to", PUSH_URL);
+            log("📤 Pushing FAKE ideas to", PUSH_URL);
             const fakeResp = await fetchWithTimeout(PUSH_URL, {
               method: "POST",
               headers: {
@@ -454,12 +456,12 @@ jobs:
 
             let fakeText = "";
             try { fakeText = await fakeResp.text(); } catch {}
-            log("âœ… FAKE FLUSH push status:", fakeResp?.status || "ERR", (fakeText || "").slice(0, 200));
-            log("ðŸŽ¯ FAKE ideas sent: nabodgarekhashayar (long), khashayarnabodgar (short)");
+            log("✅ FAKE FLUSH push status:", fakeResp?.status || "ERR", (fakeText || "").slice(0, 200));
+            log("🎯 FAKE ideas sent: nabodgarekhashayar (long), khashayarnabodgar (short)");
           } catch (e) {
-            log("âš ï¸ FAKE FLUSH failed:", e?.message || e);
+            log("⚠️ FAKE FLUSH failed:", e?.message || e);
           }
-          log("ðŸ FAKE FLUSH complete. Starting REAL processing...");
+          log("🏁 FAKE FLUSH complete. Starting REAL processing...");
           // ========== FAKE FLUSH END ==========
 
           // ---------- MEXC Adapter (REMOVED - NOT NEEDED FOR BINANCE) ----------
@@ -493,7 +495,7 @@ jobs:
             
             for (let attempt = 0; attempt < 3; attempt++) {
               try {
-                log(`ðŸ“¡ Fetching Bybit instruments (attempt ${attempt + 1}/3)`);
+                log(`📡 Fetching Bybit instruments (attempt ${attempt + 1}/3)`);
                 const response = await fetchWithTimeout(url, {}, 60000);
                 
                 if (!response.ok) {
@@ -519,11 +521,11 @@ jobs:
                   }));
                 
                 setCached(cache.bybit, cacheKey, symbols);
-                log(`âœ… Bybit: ${symbols.length} USDT perpetuals found`);
+                log(`✅ Bybit: ${symbols.length} USDT perpetuals found`);
                 return symbols;
                 
               } catch (e) {
-                log(`âŒ Attempt ${attempt + 1}/3 failed:`, e?.message || e);
+                log(`❌ Attempt ${attempt + 1}/3 failed:`, e?.message || e);
                 if (attempt < 2) await sleep(3000 + attempt * 2000);
               }
             }
@@ -860,9 +862,9 @@ jobs:
             const cleanCandlePct = cleanCount / ratios.length;
             
             // Calculate multiplier
-            // avgShadowRatio = 0.0 â†’ mult = 1.20 (cleanest, best)
-            // avgShadowRatio = 0.5 â†’ mult = 1.00 (neutral)
-            // avgShadowRatio = 1.0 â†’ mult = 0.80 (worst)
+            // avgShadowRatio = 0.0 → mult = 1.20 (cleanest, best)
+            // avgShadowRatio = 0.5 → mult = 1.00 (neutral)
+            // avgShadowRatio = 1.0 → mult = 0.80 (worst)
             const shadowMult = clamp(1.2 - (avgShadowRatio * 0.4), 0.80, 1.20);
             
             return {
@@ -930,7 +932,7 @@ jobs:
           }
 
           // ---------- State (Gist) + Calibration + Audit ----------
-          // âš ï¸ THIS SECTION IS 100% UNCHANGED FROM ORIGINAL
+          // ⚠️ THIS SECTION IS 100% UNCHANGED FROM ORIGINAL
           async function loadState(){
             const token=process.env.GIST_TOKEN, id=process.env.GIST_ID;
             const init={ v:"bybit-hedge-7.0",
@@ -969,7 +971,7 @@ jobs:
               if (s.run_counter == null) s.run_counter = 0;
 
               if (s.calib_last_version !== CALIB_VERSION) {
-                log(`ðŸ”„ Calibration version change: ${s.calib_last_version} â†’ ${CALIB_VERSION}`);
+                log(`🔄 Calibration version change: ${s.calib_last_version} → ${CALIB_VERSION}`);
                 s.calibCoeffs = {};
                 s.calib_last_version = CALIB_VERSION;
               }
@@ -1068,7 +1070,7 @@ jobs:
           }
 
           async function saveState(persist, state, auditOut, retries=2, blindFallback=true) {
-            if (!persist) { log("WARN: No persistâ€”skipping Gist save."); return; }
+            if (!persist) { log("WARN: No persist—skipping Gist save."); return; }
 
             const gistUrl = `https://api.github.com/gists/${persist.id}`;
             const mkFiles = (s) => ({ "state.json": { content: JSON.stringify(s) } });
@@ -1169,7 +1171,7 @@ jobs:
                 }
               } else {
                 toSave = { run_counter: 0 };
-                log("DEBUG: WipeToEmpty=true â†’ skipping pre-merge, forcing {run_counter:0}");
+                log("DEBUG: WipeToEmpty=true → skipping pre-merge, forcing {run_counter:0}");
               }
               
               const r3 = await patch(mkFiles(toSave), null);
@@ -1213,7 +1215,7 @@ jobs:
               }
             }
             
-            log(`ðŸ§¹ Cleaned cooldowns: ${Object.keys(state.cooldown || {}).length} base, ${Object.keys(state.cooldown_side || {}).length} side, ${Object.keys(state.mr_lockout || {}).length} mr_lockout`);
+            log(`🧹 Cleaned cooldowns: ${Object.keys(state.cooldown || {}).length} base, ${Object.keys(state.cooldown_side || {}).length} side, ${Object.keys(state.mr_lockout || {}).length} mr_lockout`);
           }
 
           function cleanExpiredClosedTrades(state) {
@@ -1227,7 +1229,7 @@ jobs:
             const before = state.closed.length;
             
             if (before <= MAX_CLOSED_TRADES) {
-              log(`ðŸ“¦ Closed trades: ${before}/${MAX_CLOSED_TRADES} (no cleanup needed)`);
+              log(`📦 Closed trades: ${before}/${MAX_CLOSED_TRADES} (no cleanup needed)`);
               return;
             }
             
@@ -1240,7 +1242,7 @@ jobs:
             state.closed = state.closed.slice(0, MAX_CLOSED_TRADES);
             
             const removed = before - state.closed.length;
-            log(`ðŸ—‘ï¸  Kept ${MAX_CLOSED_TRADES} most recent closed trades, removed ${removed} old ones`);
+            log(`🗑️  Kept ${MAX_CLOSED_TRADES} most recent closed trades, removed ${removed} old ones`);
           }
 
           const getCoeffs = (state, side, regime) => {
@@ -1254,7 +1256,7 @@ jobs:
             const existing = state.calibCoeffs[key];
             
             if (existing.version !== CALIB_VERSION) {
-              log(`ðŸ“¦ Resetting ${key} (version ${existing.version} â†’ ${CALIB_VERSION})`);
+              log(`📦 Resetting ${key} (version ${existing.version} → ${CALIB_VERSION})`);
               const def = {
                 version: CALIB_VERSION,
                 a: 0,
@@ -1292,11 +1294,11 @@ jobs:
             );
             
             if (learnable.length === 0) {
-              log("ðŸ“š No new fills to learn from this cycle.");
+              log("📚 No new fills to learn from this cycle.");
               return;
             }
 
-            log(`ðŸ“š Learning from ${learnable.length} real fills...`);
+            log(`📚 Learning from ${learnable.length} real fills...`);
             
             const pRawValues = learnable.map(c => c.p_raw).filter(p => p != null);
             const pMean = mean(pRawValues);
@@ -1313,7 +1315,7 @@ jobs:
               }
 
               if (useOutlierFilter && Math.abs((c.p_raw - pMean) / pStd) > OUTLIER_ZSCORE) {
-                log(`âš ï¸  Outlier p_raw=${c.p_raw.toFixed(4)} z=${((c.p_raw - pMean) / pStd).toFixed(2)}`);
+                log(`⚠️  Outlier p_raw=${c.p_raw.toFixed(4)} z=${((c.p_raw - pMean) / pStd).toFixed(2)}`);
                 stats.skipped_outlier++;
                 continue;
               }
@@ -1343,7 +1345,7 @@ jobs:
               const futureSymCount = currentSymCount + 1;
               
               if (futureTotal > 20 && futureSymCount / futureTotal > MAX_SYMBOL_CONTRIBUTION) {
-                log(`âš ï¸  ${sym} would be ${(futureSymCount / futureTotal * 100).toFixed(1)}% of ${side}_${reg} (limit ${(MAX_SYMBOL_CONTRIBUTION * 100).toFixed(0)}%)`);
+                log(`⚠️  ${sym} would be ${(futureSymCount / futureTotal * 100).toFixed(1)}% of ${side}_${reg} (limit ${(MAX_SYMBOL_CONTRIBUTION * 100).toFixed(0)}%)`);
                 stats.skipped_poison++;
                 continue;
               }
@@ -1359,7 +1361,7 @@ jobs:
               
               const pnl = c.pnl_bps || 0;
               if ((tp_hit && pnl < -10) || (sl_hit && pnl > 10)) {
-                log(`âš ï¸  Anomaly: ${sym} ${side} exit=${exit} pnl=${pnl}bps - skipping`);
+                log(`⚠️  Anomaly: ${sym} ${side} exit=${exit} pnl=${pnl}bps - skipping`);
                 stats.skipped_invalid++;
                 continue;
               }
@@ -1373,9 +1375,9 @@ jobs:
                 c.learned = true;
                 c.learned_at_ts = Date.now();
                 stats.learned++;
-                log(`  âœ“ ${sym} ${side} ${exit.toUpperCase()} pnl=${pnl}bps p=${c.p_raw.toFixed(3)} reg=${reg}`);
+                log(`  ✓ ${sym} ${side} ${exit.toUpperCase()} pnl=${pnl}bps p=${c.p_raw.toFixed(3)} reg=${reg}`);
               } catch(e) {
-                log(`  âœ— Learn error: ${e?.message || e}`);
+                log(`  ✗ Learn error: ${e?.message || e}`);
                 stats.skipped_invalid++;
               }
             }
@@ -1389,7 +1391,7 @@ jobs:
             
             state.learned_trade_keys = Array.from(learnedSet).slice(-2000);
             
-            log(`âœ… Learned=${stats.learned} | Skipped: TTL=${stats.skipped_ttl} Dup=${stats.skipped_dup} Invalid=${stats.skipped_invalid} Poison=${stats.skipped_poison} Outlier=${stats.skipped_outlier}`);
+            log(`✅ Learned=${stats.learned} | Skipped: TTL=${stats.skipped_ttl} Dup=${stats.skipped_dup} Invalid=${stats.skipped_invalid} Poison=${stats.skipped_poison} Outlier=${stats.skipped_outlier}`);
           }
           
           function validateCalibration(state) {
@@ -1448,7 +1450,7 @@ jobs:
             }
             
             if (Object.keys(report).length > 0) {
-              log("ðŸ“Š Calibration Health:");
+              log("📊 Calibration Health:");
               for (const [k, v] of Object.entries(report)) {
                 log(`   ${k}: ${v.status} | n=${v.n} wr=${v.win_rate} brier=${v.brier_cal} (${v.improvement} better) a=${v.a} b=${v.b}`);
               }
@@ -1463,7 +1465,7 @@ jobs:
             const coeff = getCoeffs(state, side, regime);
             
             if (!coeff) {
-              log(`â­ï¸  Skip learning [${side}_${regime}]: no existing calibration`);
+              log(`⏭️  Skip learning [${side}_${regime}]: no existing calibration`);
               return;
             }
             
@@ -1509,7 +1511,7 @@ jobs:
             const hit_b = (b_next < -COEFF_BOUND_B || b_next > COEFF_BOUND_B);
 
             if (b_next < 0.05) {
-              log(`âš ï¸  Negative slope [${side}_${regime}]: b=${b_next.toFixed(3)} â†’ reset to 1.0`);
+              log(`⚠️  Negative slope [${side}_${regime}]: b=${b_next.toFixed(3)} → reset to 1.0`);
               coeff.b = 1.0;
               coeff.momentum_b = 0;
               coeff.a = clamp(coeff.a, -1.0, 1.0);
@@ -1539,7 +1541,7 @@ jobs:
             );
             
             if (should_reset) {
-              log(`ðŸ”„ RESET [${side}_${regime}] n=${coeff.n} weighted_err=${weighted_error.toFixed(3)} > ${CALIBRATION_RESET_THRESHOLD}`);
+              log(`🔄 RESET [${side}_${regime}] n=${coeff.n} weighted_err=${weighted_error.toFixed(3)} > ${CALIBRATION_RESET_THRESHOLD}`);
               coeff.a = 0;
               coeff.b = 1;
               coeff.momentum_a = 0;
@@ -1554,9 +1556,9 @@ jobs:
             coeff.last_updated = Date.now();
 
             const mag = Math.sqrt(grad_a * grad_a + grad_b * grad_b);
-            log(`ðŸ“š [${side}_${regime}] n=${coeff.n} (${coeff.n_tp}tp/${coeff.n_sl}sl) lr=${lr.toFixed(5)} |âˆ‡|=${mag.toFixed(4)}`);
-            log(`   p_raw=${pRaw.toFixed(4)} â†’ pÌ‚=${pHat.toFixed(4)} vs y=${outcome} (err=${error.toFixed(4)})`);
-            log(`   a: ${before_a.toFixed(4)}â†’${coeff.a.toFixed(4)} | b: ${before_b.toFixed(4)}â†’${coeff.b.toFixed(4)}${(hit_a || hit_b) ? ' [CLIP]' : ''}`);
+            log(`📚 [${side}_${regime}] n=${coeff.n} (${coeff.n_tp}tp/${coeff.n_sl}sl) lr=${lr.toFixed(5)} |∇|=${mag.toFixed(4)}`);
+            log(`   p_raw=${pRaw.toFixed(4)} → p̂=${pHat.toFixed(4)} vs y=${outcome} (err=${error.toFixed(4)})`);
+            log(`   a: ${before_a.toFixed(4)}→${coeff.a.toFixed(4)} | b: ${before_b.toFixed(4)}→${coeff.b.toFixed(4)}${(hit_a || hit_b) ? ' [CLIP]' : ''}`);
             log(`   Quality: weighted_err=${weighted_error.toFixed(3)} window=${coeff.recent_errors.length}`);
 
             state.calibCoeffs[`${side}_${regime}`] = coeff;
@@ -1642,12 +1644,12 @@ jobs:
 
             // Increment run counter and check for wipe
             state.run_counter = (state.run_counter || 0) + 1;
-            log(`ðŸ”„ Run ${state.run_counter}/6`);
+            log(`🔄 Run ${state.run_counter}/6`);
 
             const SHOULD_WIPE = (state.run_counter >= 6);
 
             if (SHOULD_WIPE) {
-              log("ðŸ—‘ï¸  RUN 6: WIPE GIST AND RESTART FRESH");
+              log("🗑️  RUN 6: WIPE GIST AND RESTART FRESH");
               await saveState(persist, { run_counter: 0 }, {}, 2, true);
               
               state.v = "bybit-hedge-7.0";
@@ -1667,16 +1669,16 @@ jobs:
               state.calib_symbol_counts = {};
               state.calib_last_version = CALIB_VERSION;
               
-              log("â™»ï¸  State reset to fresh. Continuing with idea generation...");
+              log("♻️  State reset to fresh. Continuing with idea generation...");
             }
 
-            // ðŸ“š Learn from ALL closed trades FIRST
+            // 📚 Learn from ALL closed trades FIRST
             learnFromGistRealFills(state);
 
-            // ðŸ§¹ Clean expired cooldowns
+            // 🧹 Clean expired cooldowns
             cleanExpiredCooldowns(state);
 
-            // ðŸ—‘ï¸  Keep only last 10 closed trades AFTER learning
+            // 🗑️  Keep only last 10 closed trades AFTER learning
             cleanExpiredClosedTrades(state);
 
             // Preserve cleaned state
@@ -1704,23 +1706,23 @@ jobs:
             };
 
             Object.assign(state, preserved);
-            log(`â™»ï¸  Fresh cycle: ${Object.keys(state.cooldown).length} cooldowns, ${(state.closed||[]).length} closed trades, ${Object.keys(state.calibCoeffs || {}).length} calib models`);
+            log(`♻️  Fresh cycle: ${Object.keys(state.cooldown).length} cooldowns, ${(state.closed||[]).length} closed trades, ${Object.keys(state.calibCoeffs || {}).length} calib models`);
             
             const calibHealth = validateCalibration(state);
             
             if(!todOK) reason="tod_gate";
 
             // ========== DYNAMIC UNIVERSE FROM BYBIT (NO VALIDATION NEEDED) ==========
-            log("ðŸ“¡ Fetching Bybit universe...");
+            log("📡 Fetching Bybit universe...");
             const bybitSymbols = await fetchBybitFuturesSymbols();
             
             if (!bybitSymbols || bybitSymbols.length === 0) {
-              log("âŒ No Bybit symbols found - cannot proceed");
+              log("❌ No Bybit symbols found - cannot proceed");
               reason = "no_bybit_symbols";
               throw new Error("No Bybit symbols available");
             }
             
-            log(`âœ… Bybit universe: ${bybitSymbols.length} USDT perpetuals`);
+            log(`✅ Bybit universe: ${bybitSymbols.length} USDT perpetuals`);
 
             // DD/throttle
             const equityStats=(eq)=>{ const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of eq||[]){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd) }; };
@@ -1728,7 +1730,7 @@ jobs:
             const throttle=(pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
 
             // ========== FETCH GOLDEN METRICS FOR ALL BINANCE SYMBOLS ==========
-            log("ðŸ“Š Fetching golden metrics for all symbols...");
+            log("📊 Fetching golden metrics for all symbols...");
             
             const BATCH_SIZE = 15;
             const BATCH_DELAY = 300;
@@ -1743,7 +1745,7 @@ jobs:
               return true;
             });
             
-            log(`ðŸ“‹ Eligible symbols after cooldown filter: ${eligibleSymbols.length}/${bybitSymbols.length}`);
+            log(`📋 Eligible symbols after cooldown filter: ${eligibleSymbols.length}/${bybitSymbols.length}`);
 
             // NOW loop over eligibleSymbols instead of binanceSymbols
             for (let i = 0; i < eligibleSymbols.length; i += BATCH_SIZE) {
@@ -1778,7 +1780,7 @@ jobs:
               }
             }
             
-            log(`ðŸ“ˆ Fetched metrics for ${allMetrics.length}/${eligibleSymbols.length} symbols`);
+            log(`📈 Fetched metrics for ${allMetrics.length}/${eligibleSymbols.length} symbols`);
 
             // ========== RANK BY HEDGE CONFIDENCE ==========
             // Sort by hedge confidence (highest first)
@@ -1788,7 +1790,7 @@ jobs:
             const TOP_10_COUNT = 10;
             const topCandidates = allMetrics.slice(0, TOP_10_COUNT);
 
-            log("ðŸ† Top 10 by hedge confidence (includes spread):");
+            log("🏆 Top 10 by hedge confidence (includes spread):");
             for (let i = 0; i < topCandidates.length; i++) {
               const m = topCandidates[i];
               log(`   ${i+1}. ${m.symbol} conf=${m.hedge_confidence} vol1h=${m.vol_1h_pct.toFixed(2)}% fund=${(m.funding_rate*100).toFixed(4)}% oi_delta=${m.oi_delta_pct.toFixed(1)}% vol=$${Math.round(m.volume_1h_usd/1e6)}M spread=${m.spread_bps}bps`);
@@ -1828,7 +1830,7 @@ jobs:
               const ev_bps = Math.round(p_win * tp_bps - (1 - p_win) * sl_bps - cost_bps);
               
               if (ev_bps < 0) {
-                log(`   â­ï¸  Skip ${cand.symbol}: negative EV (${ev_bps}bps)`);
+                log(`   ⏭️  Skip ${cand.symbol}: negative EV (${ev_bps}bps)`);
                 continue;
               }
               
@@ -1893,13 +1895,13 @@ jobs:
               await sleep(100);
             }
 
-            log(`âœ… Selected ${selected.length} ideas (TOP ${TARGET_TOP_N} from Top 10)`);
+            log(`✅ Selected ${selected.length} ideas (TOP ${TARGET_TOP_N} from Top 10)`);
 
             // Log shadow stats for selected
             const shadowStats = selected.map(s => 
               `${s.symbol}: shadow=${(s.shadow_analysis?.avgShadowRatio || 0.5).toFixed(2)} mult=${(s.shadow_mult || 1).toFixed(2)} clean=${((s.shadow_analysis?.cleanCandlePct || 0.5) * 100).toFixed(0)}%`
             );
-            log(`ðŸ“Š Shadow analysis: ${shadowStats.join(" | ")}`);
+            log(`📊 Shadow analysis: ${shadowStats.join(" | ")}`);
 
             // ========== GENERATE FLIPPED IDEAS ==========
             const flipped = selected.map(orig => ({
@@ -2317,7 +2319,7 @@ jobs:
           # Shell-level fallback (in case node crashed before posting)
           set -e
           if [[ $EXIT_CODE -ne 0 ]]; then
-            echo "[gha] pusher exited with code $EXIT_CODE â€” sending minimal payload so tail shows a [push] line"
+            echo "[gha] pusher exited with code $EXIT_CODE — sending minimal payload so tail shows a [push] line"
 
             # Sanitize and derive URLs
             raw_push_url="$(printf '%s' "${WORKER_PUSH_URL}" | tr -d '\r\n')"
