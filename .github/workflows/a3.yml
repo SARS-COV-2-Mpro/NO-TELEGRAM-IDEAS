@@ -1,24 +1,24 @@
-name: 🔄 A4 (8 min)
+name: 🔄 A3 (8 min)
 
 on:
   repository_dispatch:
-    types: [run_A4]   # <— must match what Worker sends
+    types: [run_A3]   # <— must match what Worker sends
 
 permissions:
   actions: write
   contents: write
 
 jobs:
-  a4:
+  a3:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
-      - name: 🚀 A4 Work
+      - name: 🚀 A3 Work
         run: |
-          echo "⏳ A4 started at $(date)"
+          echo "⏳ A3 started at $(date)"
           sleep 60  # 8 minutes
-          echo "✅ A4 done at $(date)"
+          echo "✅ A3 done at $(date)"
 
       - name: 🔁 Trigger Ideas Pusher (run_B)
         uses: actions/github-script@v7
