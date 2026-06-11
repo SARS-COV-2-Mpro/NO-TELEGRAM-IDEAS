@@ -853,7 +853,7 @@ jobs:
           }
 
           async function fetchBybit1mKlines(symbol, limit = 5) {
-            const cacheKey = `bybit_1m_${symbol}`;
+            const cacheKey = `bybit_1m_${symbol}_${limit}`;
             const cached = getCached(cache.bybit, cacheKey, 15000);
             if (cached) return cached;
             try {
@@ -869,7 +869,8 @@ jobs:
 
           function checkRecentStability(klines, maxPct) {
             if (!klines || !Array.isArray(klines) || klines.length === 0) return false;
-            for (const candle of klines) {
+            const recentOnly = klines.slice(0, 5);
+            for (const candle of recentOnly) {
               const high = +candle[2], low = +candle[3], close = +candle[4];
               if (close <= 0) continue;
               const fluctuation = ((high - low) / close) * 100;
@@ -1428,11 +1429,22 @@ jobs:
                 continue;
               }
 
-              const klines1m = await fetchBybit1mKlines(cand.symbol, 5);
+              const klines1m = await fetchBybit1mKlines(cand.symbol, 25); // Fetch 25 to get 20 candles
               const isStable = checkRecentStability(klines1m, MAX_1M_FLUCTUATION_PCT);
               if (!isStable) {
                 log(`   ⏭️  ${cand.symbol}: 1m fluctuation > ${MAX_1M_FLUCTUATION_PCT}%`);
                 continue;
+              }
+
+              // Calculate max fluctuation in last 20 one-minute candles
+              let max_fluctuation_20m_pct = 0;
+              if (klines1m && klines1m.length >= 20) {
+                const last20 = klines1m.slice(0, 20); // Bybit returns newest first
+                const highs = last20.map(k => +k[2]);
+                const lows = last20.map(k => +k[3]);
+                const maxHigh = Math.max(...highs);
+                const minLow = Math.min(...lows);
+                max_fluctuation_20m_pct = minLow > 0 ? +((maxHigh - minLow) / minLow * 100).toFixed(2) : 0;
               }
 
               const atr_bps  = Math.round(cand.vol_1h_pct * 100);
@@ -1463,7 +1475,7 @@ jobs:
               if (!side) continue;
 
               const sideIcon = side === "long" ? "🟢" : "🔴";
-              log(`   ✅ ${sideIcon} ${cand.symbol}: selected EV=${ev_bps}bps CTS=${(cand.cts_score||0).toFixed(3)} N=${cand.cts?.N?.toFixed(2)||"?"}`);
+              log(`   ✅ ${sideIcon} ${cand.symbol}: selected EV=${ev_bps}bps CTS=${(cand.cts_score||0).toFixed(3)} N=${cand.cts?.N?.toFixed(2)||"?"} 20mFluc=${max_fluctuation_20m_pct}%`);
 
               selected.push({
                 symbol: cand.symbol, base: cand.base, quote: cand.quote, side,
@@ -1484,6 +1496,7 @@ jobs:
                   HH: cand.cts.HH, HL: cand.cts.HL, LH: cand.cts.LH, LL: cand.cts.LL
                 } : null,
                 combined_score: +combinedScore(cand).toFixed(4),
+                max_fluctuation_20m_pct,
                 reasons: reasonBuilder({
                   vol_1h_pct: cand.vol_1h_pct, funding_rate: cand.funding_rate,
                   oi_delta_pct: cand.oi_delta_pct, volume_1h_usd: cand.volume_1h_usd,
@@ -1569,6 +1582,7 @@ jobs:
                   cts_signal:   x.cts_signal  || "neutral",
                   cts_detail:   x.cts_detail  || null,
                   combined_score: x.combined_score || 0,
+                  max_fluctuation_20m_pct: x.max_fluctuation_20m_pct || 0,
                   dominant_side_source: fallbackUsed ? `fallback_${CTS_FALLBACK}` : "cts_consensus"
                 },
                 confidence: x.confidence, reasons: x.reasons,
