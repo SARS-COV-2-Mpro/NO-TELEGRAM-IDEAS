@@ -48,6 +48,7 @@ jobs:
       BYBIT_BASE: ${{ vars.BYBIT_BASE }}
       FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}
       HEDGE: ${{ vars.HEDGE }}
+      REVERSE: ${{ vars.REVERSE }} # <--- NEW FEATURE ADDED HERE
 
       # New Confidence Model Knobs
       DIRECTION: ${{ vars.DIRECTION }}
@@ -547,6 +548,8 @@ jobs:
 
           const HEDGE_MODE = (process.env.HEDGE || "on").toLowerCase() === "on";
           log(`🎲 HEDGE mode: ${HEDGE_MODE ? "ON (both sides, per-symbol CTS)" : "OFF (one side via CTS consensus)"}`);
+          const REVERSE_MODE = (process.env.REVERSE || "off").toLowerCase() === "on"; // <--- NEW FEATURE ADDED HERE
+          log(`🔄 REVERSE mode: ${REVERSE_MODE ? "ON (flipping final side)" : "OFF (original side)"}`); // <--- NEW FEATURE ADDED HERE
 
           // ── CTS Config — calibrated defaults for crypto perpetuals ─
           const CTS_CANDIDATES    = Number(process.env.CTS_CANDIDATES    || "50");
@@ -1303,6 +1306,13 @@ jobs:
             }
 
             logConsensusDecision(dominantSide, ctsLongs.length, ctsShorts.length, ctsNeutrals.length, fallbackUsed, fallbackReason);
+
+            // REVERSE mode: flip dominantSide if HEDGE=off // <--- NEW FEATURE ADDED HERE
+            if (!HEDGE_MODE && REVERSE_MODE && dominantSide) {
+              const originalSide = dominantSide;
+              dominantSide = dominantSide === "long" ? "short" : "long";
+              log(`🔄 REVERSE=on: ${originalSide} → ${dominantSide}`);
+            }
 
             candidatesForSide.sort((a, b) => combinedScore(b) - combinedScore(a));
             log(`📊 Top 10 after combined ranking:`);
