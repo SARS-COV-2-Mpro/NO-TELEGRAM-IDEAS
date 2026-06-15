@@ -1161,6 +1161,26 @@ jobs:
             };
           }
 
+          // ── Auto-Reverse: Per-Symbol Decision ─────────────────────
+          async function evaluateAutoReverseForSymbol(symbol, proposedSide) {
+            if (!AUTO_REVERSE_ENABLE || !proposedSide) {
+              return { finalSide: proposedSide, wasFlipped: false };
+            }
+            try {
+              const klines1m = await fetchBybit1mKlines(symbol, AUTO_REVERSE_WINDOW + AUTO_REVERSE_BASELINE + 2);
+              const bigMove = detectBigMove(klines1m);
+              if (bigMove && bigMove.shouldReverse) {
+                const originalSide = proposedSide;
+                const newSide = proposedSide === "long" ? "short" : "long";
+                log(`   🔀 AUTO-REVERSE [${symbol}]: ${originalSide.toUpperCase()} → ${newSide.toUpperCase()} (ratio=${bigMove.ratio}x)`);
+                return { finalSide: newSide, wasFlipped: true };
+              }
+            } catch (e) {
+              log(`   🔀 AUTO-REVERSE error [${symbol}]: ${e?.message || e}`);
+            }
+            return { finalSide: proposedSide, wasFlipped: false };
+          }
+
           // ---------- 3-Consequent Rule Helper ----------
           function decideSideWithRule(state) {
             if (!Array.isArray(state.direction_history)) state.direction_history = [];
@@ -1375,41 +1395,6 @@ jobs:
               log(`🔄 REVERSE=on: ${originalSide} → ${dominantSide}`);
             }
 
-            // AUTO-REVERSE: detect big one-side move on 1m candles
-            if (!HEDGE_MODE && !REVERSE_MODE && AUTO_REVERSE_ENABLE && dominantSide) {
-              try {
-                // Use the top candidate symbol for 1m check
-                const topSymbol = candidatesForSide[0]?.symbol;
-                if (topSymbol) {
-                  const klines1m = await fetchBybit1mKlines(topSymbol, AUTO_REVERSE_WINDOW + AUTO_REVERSE_BASELINE + 2);
-                  const bigMove = detectBigMove(klines1m);
-                  if (bigMove) {
-                    log(`┌─────────────────────────────────────────────────────┐`);
-                    log(`│  🔀 AUTO-REVERSE CHECK                              │`);
-                    log(`├─────────────────────────────────────────────────────┤`);
-                    log(`│  Symbol : ${topSymbol.padEnd(42)}│`);
-                    log(`│  Recent : avg=${bigMove.recentAvg.toFixed(4)}% (last ${AUTO_REVERSE_WINDOW} candles)          │`);
-                    log(`│  Baseline: avg=${bigMove.baselineAvg.toFixed(4)}% (prev ${AUTO_REVERSE_BASELINE} candles)       │`);
-                    log(`│  Ratio  : ${bigMove.ratio}x (threshold=${AUTO_REVERSE_MULTIPLIER}x)                  │`);
-                    log(`│  Dir    : UP=${bigMove.upCount} DOWN=${bigMove.downCount} → ${bigMove.direction.toUpperCase()}              │`);
-                    log(`│  BigMove: ${bigMove.isBigMove ? "YES ✅" : "NO ❌"} OneSided: ${bigMove.isOneSided ? "YES ✅" : "NO ❌"}          │`);
-                    if (bigMove.shouldReverse) {
-                      const originalSide = dominantSide;
-                      dominantSide = dominantSide === "long" ? "short" : "long";
-                      log(`│  🔀 BIG MOVE DETECTED → REVERSED: ${originalSide.toUpperCase()} → ${dominantSide.toUpperCase()}        │`);
-                    } else {
-                      log(`│  ✅ No big move → keeping original: ${dominantSide.toUpperCase()}             │`);
-                    }
-                    log(`└─────────────────────────────────────────────────────┘`);
-                  } else {
-                    log(`🔀 AUTO-REVERSE: insufficient klines for ${topSymbol} — skipping`);
-                  }
-                }
-              } catch (e) {
-                log(`🔀 AUTO-REVERSE error: ${e?.message || e} — keeping original side`);
-              }
-            }
-
             candidatesForSide.sort((a, b) => combinedScore(b) - combinedScore(a));
             log(`📊 Top 10 after combined ranking:`);
             candidatesForSide.slice(0, 10).forEach((c, i) => {
@@ -1474,6 +1459,14 @@ jobs:
               }
               if (!side) continue;
 
+              // Per-symbol auto-reverse
+              let wasAutoReversed = false;
+              if (!HEDGE_MODE && !REVERSE_MODE) {
+                const result = await evaluateAutoReverseForSymbol(cand.symbol, side);
+                side = result.finalSide;
+                wasAutoReversed = result.wasFlipped;
+              }
+
               const sideIcon = side === "long" ? "🟢" : "🔴";
               log(`   ✅ ${sideIcon} ${cand.symbol}: selected EV=${ev_bps}bps CTS=${(cand.cts_score||0).toFixed(3)} N=${cand.cts?.N?.toFixed(2)||"?"} 20mFluc=${max_fluctuation_20m_pct}%`);
 
@@ -1502,7 +1495,8 @@ jobs:
                   oi_delta_pct: cand.oi_delta_pct, volume_1h_usd: cand.volume_1h_usd,
                   basis_bps: cand.basis_bps
                 }),
-                ret5: []
+                ret5: [],
+                auto_reversed: wasAutoReversed
               });
             }
 
@@ -1514,6 +1508,10 @@ jobs:
             }
 
             log(`✅ Selected ${selected.length}/${TARGET_TOP_N} ideas`);
+            const autoReversedCount = selected.filter(p => p.auto_reversed).length;
+            if (AUTO_REVERSE_ENABLE && autoReversedCount > 0) {
+              log(`🔀 AUTO-REVERSE Summary: ${autoReversedCount} of the selected ideas had their side flipped individually.`);
+            }
             logFinalPicks(selected, dominantSide);
 
             // ========== HEDGE MODE ==========
@@ -1528,11 +1526,10 @@ jobs:
               selectedWithFlipped = [...selected, ...flipped];
               log(`📊 HEDGE=on: ${selected.length} symbols × 2 sides = ${selectedWithFlipped.length} total ideas`);
             } else {
-              // HEDGE=off: side already set by CTS in selection loop above
+              // HEDGE=off: side already set by selection loop, including auto-reverse
               selectedWithFlipped = selected.map(orig => ({
                 ...orig,
-                side: orig.side,
-                flipped: false,
+                flipped: orig.auto_reversed || false,
                 cts_signal: orig.cts_signal,
                 cts_score:  orig.cts_score,
                 cts_detail: orig.cts_detail
