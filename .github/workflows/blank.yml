@@ -1,4 +1,3 @@
-
 name: Ideas Pusher (Bybit Ultimate 1.0.0)
 
 on:
@@ -49,6 +48,11 @@ jobs:
       BYBIT_BASE: ${{ vars.BYBIT_BASE }}
       FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}
       HEDGE: ${{ vars.HEDGE }}
+      REVERSE: ${{ vars.REVERSE }}
+      AUTO_REVERSE_ENABLE: ${{ vars.AUTO_REVERSE_ENABLE }}
+      AUTO_REVERSE_WINDOW: ${{ vars.AUTO_REVERSE_WINDOW }}
+      AUTO_REVERSE_BASELINE: ${{ vars.AUTO_REVERSE_BASELINE }}
+      AUTO_REVERSE_MULTIPLIER: ${{ vars.AUTO_REVERSE_MULTIPLIER }}
 
       # New Confidence Model Knobs
       DIRECTION: ${{ vars.DIRECTION }}
@@ -548,6 +552,13 @@ jobs:
 
           const HEDGE_MODE = (process.env.HEDGE || "on").toLowerCase() === "on";
           log(`🎲 HEDGE mode: ${HEDGE_MODE ? "ON (both sides, per-symbol CTS)" : "OFF (one side via CTS consensus)"}`);
+          const REVERSE_MODE = (process.env.REVERSE || "off").toLowerCase() === "on";
+          log(`🔄 REVERSE mode: ${REVERSE_MODE ? "ON (flipping final side)" : "OFF (original side)"}`);
+          const AUTO_REVERSE_ENABLE = (process.env.AUTO_REVERSE_ENABLE || "true").toLowerCase() === "true";
+          const AUTO_REVERSE_WINDOW = Number(process.env.AUTO_REVERSE_WINDOW || "4");
+          const AUTO_REVERSE_BASELINE = Number(process.env.AUTO_REVERSE_BASELINE || "10");
+          const AUTO_REVERSE_MULTIPLIER = Number(process.env.AUTO_REVERSE_MULTIPLIER || "1.7");
+          log(`🔀 AUTO_REVERSE: ${AUTO_REVERSE_ENABLE ? `ON (window=${AUTO_REVERSE_WINDOW} baseline=${AUTO_REVERSE_BASELINE} mult=${AUTO_REVERSE_MULTIPLIER}x)` : "OFF"}`);
 
           // ── CTS Config — calibrated defaults for crypto perpetuals ─
           const CTS_CANDIDATES    = Number(process.env.CTS_CANDIDATES    || "50");
@@ -842,7 +853,7 @@ jobs:
           }
 
           async function fetchBybit1mKlines(symbol, limit = 5) {
-            const cacheKey = `bybit_1m_${symbol}`;
+            const cacheKey = `bybit_1m_${symbol}_${limit}`;
             const cached = getCached(cache.bybit, cacheKey, 15000);
             if (cached) return cached;
             try {
@@ -858,7 +869,8 @@ jobs:
 
           function checkRecentStability(klines, maxPct) {
             if (!klines || !Array.isArray(klines) || klines.length === 0) return false;
-            for (const candle of klines) {
+            const recentOnly = klines.slice(0, 5);
+            for (const candle of recentOnly) {
               const high = +candle[2], low = +candle[3], close = +candle[4];
               if (close <= 0) continue;
               const fluctuation = ((high - low) / close) * 100;
@@ -1098,6 +1110,57 @@ jobs:
           function buildAuditOutputs(state){ const lastNClosed=(state.closed||[]).slice(-5000); const closedAudit=lastNClosed.map(x=>JSON.stringify(x)).join("\n"); const lastHoldout=(state.calibration_holdout||[]).slice(-500); const disagreements=lastHoldout.map(x=>JSON.stringify(x)).join("\n"); const rows=[]; for(const c of lastNClosed){ const td=c.trade_details||{}; const row={ ts_close_iso: new Date(c.ts_exit_ms||c.predicted_snapshot?.ts_ms||Date.now()).toISOString(), idea_id: td.idea_id||"", client_order_id: td.client_order_id||"", symbol: c.symbolFull||"", side: c.side||"", pnl_bps: c.pnl_bps, entry_ts_ms: c.ts_entry_ms||"", exit_ts_ms: c.ts_exit_ms||"", entry_price: c.price_entry||"", exit_price: c.price_exit||"", qty: c.qty||"", commission_bps: td.commission_bps!=null?td.commission_bps:"", commission_quote_usdt: td.commission_quote_usdt!=null?td.commission_quote_usdt:"", commission_asset_entry: td.commission_asset_entry||"", commission_asset_exit: td.commission_asset_exit||"", maker_taker_entry: td.maker_taker_entry||"", maker_taker_exit: td.maker_taker_exit||"", slip_realized_bps: td.slip_realized_bps!=null?td.slip_realized_bps:"", reconciliation: c.reconciliation||"", fingerprint_entry: td.fingerprint_entry||"", fingerprint_exit: td.fingerprint_exit||"", calib_key: c.calib_key||"", p_raw: c.p_raw!=null?c.p_raw:"", p_pred: c.p_pred!=null?c.p_pred:"", regime: c.regime||"", source: c.reconciliation||"" }; rows.push(toCSVLine(row, TRADE_CSV_KEYS)); } const header=TRADE_CSV_KEYS.join(","); const tradesCsv=[header,...rows].join("\n"); return { closedAudit, disagreements, tradesCsv }; }
           async function candleSimForIdea(p){ return { status:"sim_disabled", closed:false }; }
 
+          // ── Auto-Reverse: Detect Big One-Side Move on 1m Candles ─────
+          function detectBigMove(klines1m, window = AUTO_REVERSE_WINDOW, baselineN = AUTO_REVERSE_BASELINE, multiplier = AUTO_REVERSE_MULTIPLIER) {
+            if (!klines1m || klines1m.length < window + baselineN) return null;
+
+            // Bybit returns newest first
+            const candles = [...klines1m].reverse();
+            const n = candles.length;
+
+            // Calculate baseline average candle size (previous 10 candles before recent window)
+            const baselineCandles = candles.slice(n - window - baselineN, n - window);
+            const baselineSizes = baselineCandles.map(k => {
+              const high = +k[2], low = +k[3], close = +k[4];
+              return close > 0 ? ((high - low) / close) * 100 : 0;
+            });
+            const baselineAvg = mean(baselineSizes);
+            if (!(baselineAvg > 0)) return null;
+
+            // Calculate recent window candles (last 3-5)
+            const recentCandles = candles.slice(n - window);
+            const recentSizes = recentCandles.map(k => {
+              const high = +k[2], low = +k[3], close = +k[4];
+              return close > 0 ? ((high - low) / close) * 100 : 0;
+            });
+            const recentAvg = mean(recentSizes);
+
+            // Check one-side direction of recent candles
+            let upCount = 0, downCount = 0;
+            for (const k of recentCandles) {
+              const open = +k[1], close = +k[4];
+              if (close > open) upCount++;
+              else if (close < open) downCount++;
+            }
+
+            const isBigMove = recentAvg >= baselineAvg * multiplier;
+            const isOneSided = upCount === recentCandles.length || downCount === recentCandles.length;
+            const direction = upCount > downCount ? "up" : "down";
+            const ratio = +(recentAvg / baselineAvg).toFixed(2);
+
+            return {
+              isBigMove,
+              isOneSided,
+              direction,
+              ratio,
+              baselineAvg: +baselineAvg.toFixed(4),
+              recentAvg: +recentAvg.toFixed(4),
+              upCount,
+              downCount,
+              shouldReverse: isBigMove && isOneSided
+            };
+          }
+
           // ---------- 3-Consequent Rule Helper ----------
           function decideSideWithRule(state) {
             if (!Array.isArray(state.direction_history)) state.direction_history = [];
@@ -1305,6 +1368,48 @@ jobs:
 
             logConsensusDecision(dominantSide, ctsLongs.length, ctsShorts.length, ctsNeutrals.length, fallbackUsed, fallbackReason);
 
+            // REVERSE mode: flip dominantSide if HEDGE=off
+            if (!HEDGE_MODE && REVERSE_MODE && dominantSide) {
+              const originalSide = dominantSide;
+              dominantSide = dominantSide === "long" ? "short" : "long";
+              log(`🔄 REVERSE=on: ${originalSide} → ${dominantSide}`);
+            }
+
+            // AUTO-REVERSE: detect big one-side move on 1m candles
+            if (!HEDGE_MODE && !REVERSE_MODE && AUTO_REVERSE_ENABLE && dominantSide) {
+              try {
+                // Use the top candidate symbol for 1m check
+                const topSymbol = candidatesForSide[0]?.symbol;
+                if (topSymbol) {
+                  const klines1m = await fetchBybit1mKlines(topSymbol, AUTO_REVERSE_WINDOW + AUTO_REVERSE_BASELINE + 2);
+                  const bigMove = detectBigMove(klines1m);
+                  if (bigMove) {
+                    log(`┌─────────────────────────────────────────────────────┐`);
+                    log(`│  🔀 AUTO-REVERSE CHECK                              │`);
+                    log(`├─────────────────────────────────────────────────────┤`);
+                    log(`│  Symbol : ${topSymbol.padEnd(42)}│`);
+                    log(`│  Recent : avg=${bigMove.recentAvg.toFixed(4)}% (last ${AUTO_REVERSE_WINDOW} candles)          │`);
+                    log(`│  Baseline: avg=${bigMove.baselineAvg.toFixed(4)}% (prev ${AUTO_REVERSE_BASELINE} candles)       │`);
+                    log(`│  Ratio  : ${bigMove.ratio}x (threshold=${AUTO_REVERSE_MULTIPLIER}x)                  │`);
+                    log(`│  Dir    : UP=${bigMove.upCount} DOWN=${bigMove.downCount} → ${bigMove.direction.toUpperCase()}              │`);
+                    log(`│  BigMove: ${bigMove.isBigMove ? "YES ✅" : "NO ❌"} OneSided: ${bigMove.isOneSided ? "YES ✅" : "NO ❌"}          │`);
+                    if (bigMove.shouldReverse) {
+                      const originalSide = dominantSide;
+                      dominantSide = dominantSide === "long" ? "short" : "long";
+                      log(`│  🔀 BIG MOVE DETECTED → REVERSED: ${originalSide.toUpperCase()} → ${dominantSide.toUpperCase()}        │`);
+                    } else {
+                      log(`│  ✅ No big move → keeping original: ${dominantSide.toUpperCase()}             │`);
+                    }
+                    log(`└─────────────────────────────────────────────────────┘`);
+                  } else {
+                    log(`🔀 AUTO-REVERSE: insufficient klines for ${topSymbol} — skipping`);
+                  }
+                }
+              } catch (e) {
+                log(`🔀 AUTO-REVERSE error: ${e?.message || e} — keeping original side`);
+              }
+            }
+
             candidatesForSide.sort((a, b) => combinedScore(b) - combinedScore(a));
             log(`📊 Top 10 after combined ranking:`);
             candidatesForSide.slice(0, 10).forEach((c, i) => {
@@ -1324,11 +1429,22 @@ jobs:
                 continue;
               }
 
-              const klines1m = await fetchBybit1mKlines(cand.symbol, 5);
+              const klines1m = await fetchBybit1mKlines(cand.symbol, 25); // Fetch 25 to get 20 candles
               const isStable = checkRecentStability(klines1m, MAX_1M_FLUCTUATION_PCT);
               if (!isStable) {
                 log(`   ⏭️  ${cand.symbol}: 1m fluctuation > ${MAX_1M_FLUCTUATION_PCT}%`);
                 continue;
+              }
+
+              // Calculate max fluctuation in last 20 one-minute candles
+              let max_fluctuation_20m_pct = 0;
+              if (klines1m && klines1m.length >= 20) {
+                const last20 = klines1m.slice(0, 20); // Bybit returns newest first
+                const highs = last20.map(k => +k[2]);
+                const lows = last20.map(k => +k[3]);
+                const maxHigh = Math.max(...highs);
+                const minLow = Math.min(...lows);
+                max_fluctuation_20m_pct = minLow > 0 ? +((maxHigh - minLow) / minLow * 100).toFixed(2) : 0;
               }
 
               const atr_bps  = Math.round(cand.vol_1h_pct * 100);
@@ -1359,7 +1475,7 @@ jobs:
               if (!side) continue;
 
               const sideIcon = side === "long" ? "🟢" : "🔴";
-              log(`   ✅ ${sideIcon} ${cand.symbol}: selected EV=${ev_bps}bps CTS=${(cand.cts_score||0).toFixed(3)} N=${cand.cts?.N?.toFixed(2)||"?"}`);
+              log(`   ✅ ${sideIcon} ${cand.symbol}: selected EV=${ev_bps}bps CTS=${(cand.cts_score||0).toFixed(3)} N=${cand.cts?.N?.toFixed(2)||"?"} 20mFluc=${max_fluctuation_20m_pct}%`);
 
               selected.push({
                 symbol: cand.symbol, base: cand.base, quote: cand.quote, side,
@@ -1380,6 +1496,7 @@ jobs:
                   HH: cand.cts.HH, HL: cand.cts.HL, LH: cand.cts.LH, LL: cand.cts.LL
                 } : null,
                 combined_score: +combinedScore(cand).toFixed(4),
+                max_fluctuation_20m_pct,
                 reasons: reasonBuilder({
                   vol_1h_pct: cand.vol_1h_pct, funding_rate: cand.funding_rate,
                   oi_delta_pct: cand.oi_delta_pct, volume_1h_usd: cand.volume_1h_usd,
@@ -1465,6 +1582,7 @@ jobs:
                   cts_signal:   x.cts_signal  || "neutral",
                   cts_detail:   x.cts_detail  || null,
                   combined_score: x.combined_score || 0,
+                  max_fluctuation_20m_pct: x.max_fluctuation_20m_pct || 0,
                   dominant_side_source: fallbackUsed ? `fallback_${CTS_FALLBACK}` : "cts_consensus"
                 },
                 confidence: x.confidence, reasons: x.reasons,
