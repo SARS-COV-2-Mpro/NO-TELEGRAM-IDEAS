@@ -18,20 +18,13 @@ jobs:
     timeout-minutes: 12
 
     env:
-      # Required secrets
       WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}
       PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
       WORKER_PUSH_URL_V2: ${{ secrets.WORKER_PUSH_URL_V2 }}
-
-      # Required for trade reconciliation (Now for Bybit)
       BYBIT_API_KEY: ${{ secrets.BYBIT_API_KEY }}
       BYBIT_SECRET_KEY: ${{ secrets.BYBIT_SECRET_KEY }}
-
-      # Optional (safe defaults inside the script)
       GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
       GIST_ID: ${{ secrets.GIST_ID }}
-
-      # Exchange + tuning knobs (via Repo/Org Variables)
       EXCHANGE: bybit
       MIN_QV_USD: ${{ vars.MIN_QV_USD }}
       TOP_N: ${{ vars.TOP_N }}
@@ -47,8 +40,6 @@ jobs:
       BYBIT_BASE: ${{ vars.BYBIT_BASE }}
       FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}
       HEDGE: ${{ vars.HEDGE }}
-
-      # New Confidence Model Knobs
       DIRECTION: ${{ vars.DIRECTION }}
       MR_SLOPE_MAX_ATR50: ${{ vars.MR_SLOPE_MAX_ATR50 }}
       MR_BREAKOUT_DC_N: ${{ vars.MR_BREAKOUT_DC_N }}
@@ -64,8 +55,6 @@ jobs:
       LONG_BOUNCE_SL_ATR: ${{ vars.LONG_BOUNCE_SL_ATR }}
       LONG_BOUNCE_TP_ATR: ${{ vars.LONG_BOUNCE_TP_ATR }}
       LONG_SIMILARITY_RHO: ${{ vars.LONG_SIMILARITY_RHO }}
-
-      # New (MTF + Provenance + Align)
       MIN_TF_ALIGN: ${{ vars.MIN_TF_ALIGN }}
       TF_WEIGHTS: ${{ vars.TF_WEIGHTS }}
       STRATEGY_NAME: ${{ vars.STRATEGY_NAME }}
@@ -297,9 +286,8 @@ jobs:
           const LONG_BOUNCE_SL_ATR=Number(process.env.LONG_BOUNCE_SL_ATR||"0.50"), LONG_BOUNCE_TP_ATR=Number(process.env.LONG_BOUNCE_TP_ATR||"0.90");
           const LONG_SIMILARITY_RHO=Number(process.env.LONG_SIMILARITY_RHO||"0.84");
 
-          // HEDGE MODE: "on" (default) = identical to original, "off" = 1 idea per symbol, random/controlled side
           const HEDGE_MODE = (process.env.HEDGE || "on").toLowerCase() === "on";
-          log(`🎲 HEDGE mode: ${HEDGE_MODE ? "ON (both sides, deterministic)" : "OFF (one idea per symbol, random side with 3-consequent rule)"}`);
+          log(`🎲 HEDGE mode: ${HEDGE_MODE ? "ON (both sides, deterministic)" : "OFF (per-symbol random side + 3-consequent rule)"}`);
 
           const IDEAL_VOL_1H_PCT = 2.0;
           const IDEAL_FUNDING_RATE = 0.0004;
@@ -714,7 +702,8 @@ jobs:
           // ---------- State (Gist) + Calibration + Audit ----------
           async function loadState(){
             const token=process.env.GIST_TOKEN, id=process.env.GIST_ID;
-            const init={ v:"bybit-hedge-1.0",
+            const init={
+              v:"bybit-hedge-1.0",
               run_counter: 0,
               cooldown:{}, cooldown_side:{}, pending:[], equity:[], closed:[],
               mr_lockout:{}, sym_stats:{}, sym_stats_real:{}, calibCoeffs:{}, lastReconcileTs:0,
@@ -722,7 +711,8 @@ jobs:
               learned_trade_keys: [],
               calib_symbol_counts: {},
               calib_last_version: CALIB_VERSION,
-              direction_history: []
+              direction_history: [],
+              direction_history_by_symbol: {}
             };
             if(!token||!id) return { state:init, persist:null };
             try{
@@ -749,6 +739,9 @@ jobs:
               if (!s.calib_symbol_counts) s.calib_symbol_counts = {};
               if (s.run_counter == null) s.run_counter = 0;
               if (!Array.isArray(s.direction_history)) s.direction_history = [];
+              if (!s.direction_history_by_symbol || typeof s.direction_history_by_symbol !== "object") {
+                s.direction_history_by_symbol = {};
+              }
               if (s.calib_last_version !== CALIB_VERSION) {
                 log(`🔄 Calibration version change: ${s.calib_last_version} → ${CALIB_VERSION}`);
                 s.calibCoeffs = {};
@@ -762,8 +755,66 @@ jobs:
 
           const TRADE_CSV_KEYS=["ts_close_iso","idea_id","client_order_id","symbol","side","pnl_bps","entry_ts_ms","exit_ts_ms","entry_price","exit_price","qty","commission_bps","commission_quote_usdt","commission_asset_entry","commission_asset_exit","maker_taker_entry","maker_taker_exit","slip_realized_bps","reconciliation","fingerprint_entry","fingerprint_exit","calib_key","p_raw","p_pred","regime","source"];
 
-          function mergeStates(remote, local) { const merged = { ...remote }; merged.run_counter = Math.max(local.run_counter || 0, remote.run_counter || 0); const remoteKeys = Array.isArray(remote.learned_trade_keys) ? remote.learned_trade_keys : []; const localKeys = Array.isArray(local.learned_trade_keys) ? local.learned_trade_keys : []; const localSet = new Set(localKeys); const uniqueRemote = remoteKeys.filter(k => !localSet.has(k)); merged.learned_trade_keys = [...uniqueRemote, ...localKeys].slice(-2000); const rCounts = remote.calib_symbol_counts || {}; const lCounts = local.calib_symbol_counts || {}; const allCountKeys = new Set([...Object.keys(rCounts), ...Object.keys(lCounts)]); const mergedCounts = {}; for (const k of allCountKeys) { mergedCounts[k] = (rCounts[k] || 0) + (lCounts[k] || 0); } merged.calib_symbol_counts = mergedCounts; const dropSet = new Set((local.__drop_pending_cids || []).map(x => String(x).trim()).filter(Boolean)); const id = (p) => String(p?.client_order_id || p?.clientOrderId || p?.idea_id || "").trim(); const remotePending = (remote.pending || []).filter(p => !dropSet.has(id(p))); const remoteIds = new Set(remotePending.map(id)); const newLocalPending = (local.pending || []).filter(p => { const k = id(p); return k && !remoteIds.has(k); }); merged.pending = [...remotePending, ...newLocalPending]; merged.equity = Array.isArray(remote.equity) ? remote.equity : []; merged.sym_stats_real = remote.sym_stats_real || {}; merged.sym_stats = remote.sym_stats || {}; merged.lastReconcileTs = remote.lastReconcileTs || 0; if ('fees' in remote) merged.fees = remote.fees; merged.cooldown = local.cooldown || {}; merged.cooldown_side = local.cooldown_side || {}; merged.mr_lockout = local.mr_lockout || {}; merged.direction_history = Array.isArray(remote.direction_history) ? remote.direction_history : []; merged.calibCoeffs = {}; const allKeys = new Set([ ...Object.keys(remote.calibCoeffs || {}), ...Object.keys(local.calibCoeffs || {}) ]); for (const key of allKeys) { const r = remote.calibCoeffs?.[key]; const l = local.calibCoeffs?.[key]; if (!r) merged.calibCoeffs[key] = l; else if (!l) merged.calibCoeffs[key] = r; else { const newer = ((r.n||0) >= (l.n||0)) ? r : l; const older = ((r.n||0) >= (l.n||0)) ? l : r; merged.calibCoeffs[key] = { ...newer, recent_errors: [...(newer.recent_errors || []), ...(older.recent_errors || [])].slice(-CALIB_ERROR_WINDOW), recent_predictions: [...(newer.recent_predictions || []), ...(older.recent_predictions || [])].slice(-100) }; } } const keyClosed = (c) => { const cid = c?.trade_details?.client_order_id || c.client_order_id || c.idea_id || ""; const tx = c?.ts_exit_ms || c?.exit_ts_ms || ""; return `${cid}|${tx}`; }; const localClosedMap = new Map((local.closed||[]).map(c => [keyClosed(c), c])); merged.closed = (remote.closed || []).map(rc => { const lc = localClosedMap.get(keyClosed(rc)); if (!lc) return rc; const learned = Boolean(rc.learned || lc.learned); const learned_at_ts = learned ? (rc.learned_at_ts || lc.learned_at_ts || Date.now()) : undefined; return { ...rc, learned, learned_at_ts }; }); merged.version_ts = Date.now(); log("[gha] mergeStates: remote_pending_after_drops", remotePending.length, "appended_new_local", newLocalPending.length, "merged_pending", merged.pending.length); return merged; }
+          function mergeStates(remote, local) {
+            const merged = { ...remote };
+            merged.run_counter = Math.max(local.run_counter || 0, remote.run_counter || 0);
+            const remoteKeys = Array.isArray(remote.learned_trade_keys) ? remote.learned_trade_keys : [];
+            const localKeys = Array.isArray(local.learned_trade_keys) ? local.learned_trade_keys : [];
+            const localSet = new Set(localKeys);
+            const uniqueRemote = remoteKeys.filter(k => !localSet.has(k));
+            merged.learned_trade_keys = [...uniqueRemote, ...localKeys].slice(-2000);
+            const rCounts = remote.calib_symbol_counts || {};
+            const lCounts = local.calib_symbol_counts || {};
+            const allCountKeys = new Set([...Object.keys(rCounts), ...Object.keys(lCounts)]);
+            const mergedCounts = {};
+            for (const k of allCountKeys) { mergedCounts[k] = (rCounts[k] || 0) + (lCounts[k] || 0); }
+            merged.calib_symbol_counts = mergedCounts;
+            const dropSet = new Set((local.__drop_pending_cids || []).map(x => String(x).trim()).filter(Boolean));
+            const id = (p) => String(p?.client_order_id || p?.clientOrderId || p?.idea_id || "").trim();
+            const remotePending = (remote.pending || []).filter(p => !dropSet.has(id(p)));
+            const remoteIds = new Set(remotePending.map(id));
+            const newLocalPending = (local.pending || []).filter(p => { const k = id(p); return k && !remoteIds.has(k); });
+            merged.pending = [...remotePending, ...newLocalPending];
+            merged.equity = Array.isArray(remote.equity) ? remote.equity : [];
+            merged.sym_stats_real = remote.sym_stats_real || {};
+            merged.sym_stats = remote.sym_stats || {};
+            merged.lastReconcileTs = remote.lastReconcileTs || 0;
+            if ('fees' in remote) merged.fees = remote.fees;
+            merged.cooldown = local.cooldown || {};
+            merged.cooldown_side = local.cooldown_side || {};
+            merged.mr_lockout = local.mr_lockout || {};
+            merged.direction_history = Array.isArray(remote.direction_history) ? remote.direction_history : [];
+            // Merge per-symbol direction history (prefer remote, fill missing from local)
+            const rSymHist = remote.direction_history_by_symbol || {};
+            const lSymHist = local.direction_history_by_symbol || {};
+            const allSyms = new Set([...Object.keys(rSymHist), ...Object.keys(lSymHist)]);
+            merged.direction_history_by_symbol = {};
+            for (const sym of allSyms) {
+              merged.direction_history_by_symbol[sym] = rSymHist[sym] || lSymHist[sym] || [];
+            }
+            merged.calibCoeffs = {};
+            const allKeys = new Set([ ...Object.keys(remote.calibCoeffs || {}), ...Object.keys(local.calibCoeffs || {}) ]);
+            for (const key of allKeys) {
+              const r = remote.calibCoeffs?.[key];
+              const l = local.calibCoeffs?.[key];
+              if (!r) merged.calibCoeffs[key] = l;
+              else if (!l) merged.calibCoeffs[key] = r;
+              else {
+                const newer = ((r.n||0) >= (l.n||0)) ? r : l;
+                const older = ((r.n||0) >= (l.n||0)) ? l : r;
+                merged.calibCoeffs[key] = { ...newer, recent_errors: [...(newer.recent_errors || []), ...(older.recent_errors || [])].slice(-CALIB_ERROR_WINDOW), recent_predictions: [...(newer.recent_predictions || []), ...(older.recent_predictions || [])].slice(-100) };
+              }
+            }
+            const keyClosed = (c) => { const cid = c?.trade_details?.client_order_id || c.client_order_id || c.idea_id || ""; const tx = c?.ts_exit_ms || c?.exit_ts_ms || ""; return `${cid}|${tx}`; };
+            const localClosedMap = new Map((local.closed||[]).map(c => [keyClosed(c), c]));
+            merged.closed = (remote.closed || []).map(rc => { const lc = localClosedMap.get(keyClosed(rc)); if (!lc) return rc; const learned = Boolean(rc.learned || lc.learned); const learned_at_ts = learned ? (rc.learned_at_ts || lc.learned_at_ts || Date.now()) : undefined; return { ...rc, learned, learned_at_ts }; });
+            merged.version_ts = Date.now();
+            log("[gha] mergeStates: remote_pending_after_drops", remotePending.length, "appended_new_local", newLocalPending.length, "merged_pending", merged.pending.length);
+            return merged;
+          }
+
           async function saveState(persist, state, auditOut, retries=2, blindFallback=true) { if (!persist) { log("WARN: No persist—skipping Gist save."); return; } const gistUrl = `https://api.github.com/gists/${persist.id}`; const mkFiles = (s) => ({ "state.json": { content: JSON.stringify(s) } }); const wipeToEmpty = state && Object.keys(state).length === 1 && state.run_counter === 0; async function patch(files, etag) { const headers = { Authorization: `Bearer ${persist.token}`, "Accept": "application/vnd.github+json", "Content-Type": "application/json", "User-Agent": UA }; if (etag) headers["If-Match"] = etag; return await fetchWithTimeout(gistUrl, { method: "PATCH", headers, body: JSON.stringify({ files }) }, 15000); } let toSave = state; let etag = persist.etag || null; for (let attempt = 0; attempt <= retries; attempt++) { log("DEBUG: saveState attempt", attempt, "etag?", !!etag, "pending=", (toSave.pending||[]).length); const r = await patch(mkFiles(toSave), etag); if (r.ok) { const newEtag = r.headers.get("etag"); persist.etag = newEtag || persist.etag; log("SUCCESS: Gist updated! Status=", r.status, "pending now=", (toSave.pending||[]).length); return; } const body = (await r.text().catch(()=> ""))?.slice(0, 300) || ""; log("WARN: saveState failed status=", r.status, "body=", body); if (r.status === 429) { const ra = Number(r.headers.get("retry-after") || 2); log("WARN: Rate limited. Backing off", ra, "s"); await sleep(ra * 1000); continue; } if (r.status === 412) { if (wipeToEmpty) { log("DEBUG: 412 during wipe - skipping merge"); break; } const r2 = await fetchWithTimeout(gistUrl, { headers: { Authorization: `Bearer ${persist.token}`, "Accept": "application/vnd.github+json", "User-Agent": UA } }, 12000); if (!r2.ok) { log("ERROR: Refetch for merge failed status=", r2.status); break; } const remoteEtag = r2.headers.get("etag"); const remoteGist = await r2.json(); const remoteContent = remoteGist.files?.["state.json"]?.content; const remoteState = remoteContent ? JSON.parse(remoteContent) : {}; toSave = mergeStates(remoteState, state); etag = remoteEtag || null; await sleep(250 + Math.floor(Math.random()*250)); continue; } break; } if (blindFallback) { log("WARN: Falling back to blind PATCH (no If-Match)."); if (!wipeToEmpty) { try { const r2 = await fetchWithTimeout(gistUrl, { headers: { Authorization: `Bearer ${persist.token}`, "Accept": "application/vnd.github+json", "User-Agent": UA } }, 12000); if (r2.ok) { const remoteGist = await r2.json(); const remoteContent = remoteGist.files?.["state.json"]?.content; const remoteState = remoteContent ? JSON.parse(remoteContent) : {}; toSave = mergeStates(remoteState, state); log("DEBUG: Pre-blind-patch merge successful."); } else { log("WARN: Pre-blind-patch re-fetch failed status=", r2.status, ". Will save local state."); } } catch (e) { log("ERROR: Exception during pre-blind-patch re-fetch:", e?.message || String(e)); } } else { toSave = { run_counter: 0 }; log("DEBUG: WipeToEmpty=true → skipping pre-merge, forcing {run_counter:0}"); } const r3 = await patch(mkFiles(toSave), null); if (r3.ok) { const newEtag = r3.headers.get("etag"); persist.etag = newEtag || persist.etag; log("SUCCESS: Blind Gist update ok. pending=", (toSave.pending||[]).length); } else { const body = (await r3.text().catch(()=> ""))?.slice(0, 300) || ""; log("ERROR: Blind save failed status=", r3.status, "body=", body); } } }
+
           function cleanExpiredCooldowns(state) { const now = Date.now(); if (state.cooldown) { for (const [base, ts] of Object.entries(state.cooldown)) { if (now - ts >= COOLDOWN_MS) { delete state.cooldown[base]; } } } if (state.cooldown_side) { for (const [base, obj] of Object.entries(state.cooldown_side)) { if (now - (obj.ts_ms || 0) >= COOLDOWN_MS) { delete state.cooldown_side[base]; } } } if (state.mr_lockout) { for (const [sym, expiry] of Object.entries(state.mr_lockout)) { if (now >= expiry) { delete state.mr_lockout[sym]; } } } log(`🧹 Cleaned cooldowns: ${Object.keys(state.cooldown || {}).length} base, ${Object.keys(state.cooldown_side || {}).length} side, ${Object.keys(state.mr_lockout || {}).length} mr_lockout`); }
           function cleanExpiredClosedTrades(state) { const MAX_CLOSED_TRADES = 10; if (!Array.isArray(state.closed)) { state.closed = []; return; } const before = state.closed.length; if (before <= MAX_CLOSED_TRADES) { log(`📦 Closed trades: ${before}/${MAX_CLOSED_TRADES} (no cleanup needed)`); return; } state.closed.sort((a, b) => { const aTime = a.ts_exit_ms || a.exit_ts_ms || 0; const bTime = b.ts_exit_ms || b.exit_ts_ms || 0; return bTime - aTime; }); state.closed = state.closed.slice(0, MAX_CLOSED_TRADES); const removed = before - state.closed.length; log(`🗑️  Kept ${MAX_CLOSED_TRADES} most recent closed trades, removed ${removed} old ones`); }
           const getCoeffs = (state, side, regime) => { const key = `${side}_${regime}`; if (!state.calibCoeffs) state.calibCoeffs = {}; if (!state.calibCoeffs[key]) { return null; } const existing = state.calibCoeffs[key]; if (existing.version !== CALIB_VERSION) { log(`📦 Resetting ${key} (version ${existing.version} → ${CALIB_VERSION})`); const def = { version: CALIB_VERSION, a: 0, b: 1, n: 0, n_tp: 0, n_sl: 0, momentum_a: 0, momentum_b: 0, recent_errors: [], recent_predictions: [], last_reset_n: 0, created_at: existing.created_at || Date.now(), last_updated: Date.now() }; state.calibCoeffs[key] = def; return def; } return existing; };
@@ -775,23 +826,6 @@ jobs:
           function getSymbolAdj(state, base) { const real = state.sym_stats_real?.[base]; const s = real || state.sym_stats?.[base]; if (!s || s.n < 6) return 1.0; const winRate = s.wins / s.n; const avgPnL = s.pnl_sum / s.n; let m = 1.0; if (winRate < 0.4) m *= 0.7; if (avgPnL < 0) m *= 0.8; return clamp(m, 0.5, 1.2); }
           function buildAuditOutputs(state){ const lastNClosed=(state.closed||[]).slice(-5000); const closedAudit=lastNClosed.map(x=>JSON.stringify(x)).join("\n"); const lastHoldout=(state.calibration_holdout||[]).slice(-500); const disagreements=lastHoldout.map(x=>JSON.stringify(x)).join("\n"); const rows=[]; for(const c of lastNClosed){ const td=c.trade_details||{}; const row={ ts_close_iso: new Date(c.ts_exit_ms||c.predicted_snapshot?.ts_ms||Date.now()).toISOString(), idea_id: td.idea_id||"", client_order_id: td.client_order_id||"", symbol: c.symbolFull||"", side: c.side||"", pnl_bps: c.pnl_bps, entry_ts_ms: c.ts_entry_ms||"", exit_ts_ms: c.ts_exit_ms||"", entry_price: c.price_entry||"", exit_price: c.price_exit||"", qty: c.qty||"", commission_bps: td.commission_bps!=null?td.commission_bps:"", commission_quote_usdt: td.commission_quote_usdt!=null?td.commission_quote_usdt:"", commission_asset_entry: td.commission_asset_entry||"", commission_asset_exit: td.commission_asset_exit||"", maker_taker_entry: td.maker_taker_entry||"", maker_taker_exit: td.maker_taker_exit||"", slip_realized_bps: td.slip_realized_bps!=null?td.slip_realized_bps:"", reconciliation: c.reconciliation||"", fingerprint_entry: td.fingerprint_entry||"", fingerprint_exit: td.fingerprint_exit||"", calib_key: c.calib_key||"", p_raw: c.p_raw!=null?c.p_raw:"", p_pred: c.p_pred!=null?c.p_pred:"", regime: c.regime||"", source: c.reconciliation||"" }; rows.push(toCSVLine(row, TRADE_CSV_KEYS)); } const header=TRADE_CSV_KEYS.join(","); const tradesCsv=[header,...rows].join("\n"); return { closedAudit, disagreements, tradesCsv }; }
           async function candleSimForIdea(p){ return { status:"sim_disabled", closed:false }; }
-
-          // ---------- 3-Consequent Rule Helper ----------
-          function decideSideWithRule(state) {
-            if (!Array.isArray(state.direction_history)) state.direction_history = [];
-            const last3 = state.direction_history.slice(-3);
-            if (last3.length === 3 && last3.every(d => d === "long")) {
-              log("🔁 3-consequent rule: last 3 were LONG → forcing SHORT");
-              return "short";
-            }
-            if (last3.length === 3 && last3.every(d => d === "short")) {
-              log("🔁 3-consequent rule: last 3 were SHORT → forcing LONG");
-              return "long";
-            }
-            const randomSide = Math.random() < 0.5 ? "long" : "short";
-            log(`🎲 Random side: ${randomSide.toUpperCase()}`);
-            return randomSide;
-          }
 
           // ---------- Main ----------
           let reason="ok", selectionTier="confidence";
@@ -814,6 +848,7 @@ jobs:
               state.learned_trade_keys = []; state.calib_symbol_counts = {};
               state.calib_last_version = CALIB_VERSION;
               state.direction_history = [];
+              state.direction_history_by_symbol = {};
               log("♻️  State reset to fresh. Continuing with idea generation...");
             }
 
@@ -829,6 +864,7 @@ jobs:
               calib_symbol_counts: state.calib_symbol_counts || {},
               calib_last_version: state.calib_last_version || CALIB_VERSION,
               direction_history: state.direction_history || [],
+              direction_history_by_symbol: state.direction_history_by_symbol || {},
               pending: [], closed: state.closed || [], equity: state.equity || [],
               sym_stats_real: state.sym_stats_real || {}, sym_stats: {},
               calibration_holdout: [], lastReconcileTs: 0
@@ -946,21 +982,52 @@ jobs:
               selectedWithFlipped = [...selected, ...flipped];
               log(`📊 HEDGE=on: ${selected.length} symbols × 2 sides = ${selectedWithFlipped.length} total ideas`);
             } else {
-              log(`📊 HEDGE=off: applying 3-consequent rule`);
-              log(`   Current history (last ${state.direction_history.length}): [${state.direction_history.join(", ")}]`);
-              
-              const chosenSide = decideSideWithRule(state);
-              
+              log(`📊 HEDGE=off: applying PER-SYMBOL random side + 3-consequent rule`);
+              log(`   Current per-symbol history: ${JSON.stringify(state.direction_history_by_symbol)}`);
+
+              // Ensure per-symbol history container exists
+              if (!state.direction_history_by_symbol || typeof state.direction_history_by_symbol !== "object") {
+                state.direction_history_by_symbol = {};
+              }
+
               selectedWithFlipped = selected.map(orig => {
-                log(`   🎯 ${orig.symbol}: selected side = ${chosenSide.toUpperCase()} (funding would have chosen: ${orig.side.toUpperCase()})`);
+                const symKey = orig.base; // e.g. "BTC"
+
+                // Initialize per-symbol history if missing
+                if (!Array.isArray(state.direction_history_by_symbol[symKey])) {
+                  state.direction_history_by_symbol[symKey] = [];
+                }
+
+                const hist = state.direction_history_by_symbol[symKey];
+                const last3 = hist.slice(-3);
+
+                let chosenSide;
+                if (last3.length === 3 && last3.every(d => d === "long")) {
+                  chosenSide = "short";
+                  log(`   🔁 ${symKey}: 3-consequent LONG rule → forcing SHORT (history: [${hist.join(", ")}])`);
+                } else if (last3.length === 3 && last3.every(d => d === "short")) {
+                  chosenSide = "long";
+                  log(`   🔁 ${symKey}: 3-consequent SHORT rule → forcing LONG (history: [${hist.join(", ")}])`);
+                } else {
+                  chosenSide = Math.random() < 0.5 ? "long" : "short";
+                  log(`   🎲 ${symKey}: random side = ${chosenSide.toUpperCase()} (history: [${hist.join(", ")}])`);
+                }
+
+                // Update per-symbol history
+                hist.push(chosenSide);
+                if (hist.length > 10) hist.shift();
+                state.direction_history_by_symbol[symKey] = hist;
+
+                // Also update global history for logging/compat
+                state.direction_history.push(chosenSide);
+                if (state.direction_history.length > 50) state.direction_history.shift();
+
+                log(`   🎯 ${symKey}: selected side = ${chosenSide.toUpperCase()} | updated history: [${hist.join(", ")}]`);
                 return { ...orig, side: chosenSide, flipped: false };
               });
 
-              state.direction_history.push(chosenSide);
-              if (state.direction_history.length > 10) state.direction_history.shift();
-              
-              log(`   Updated history: [${state.direction_history.join(", ")}]`);
-              log(`📊 HEDGE=off: ${selected.length} symbols × 1 side (${chosenSide}) = ${selectedWithFlipped.length} total ideas`);
+              log(`   Final per-symbol history: ${JSON.stringify(state.direction_history_by_symbol)}`);
+              log(`📊 HEDGE=off: ${selected.length} symbols × 1 side each = ${selectedWithFlipped.length} total ideas`);
             }
 
             const wEv = softmax(selectedWithFlipped.map(x => x.exp_lcb_bps), 20);
@@ -1076,6 +1143,7 @@ jobs:
               calibration_health: calibHealth,
               hedge_mode: HEDGE_MODE ? "on" : "off",
               direction_history: state.direction_history,
+              direction_history_by_symbol: state.direction_history_by_symbol,
               golden_metrics_config: {
                 ideal_vol_1h_pct: IDEAL_VOL_1H_PCT, ideal_funding_rate: IDEAL_FUNDING_RATE,
                 ideal_oi_delta_pct: IDEAL_OI_DELTA_PCT, ideal_volume_1h_usd: IDEAL_VOLUME_1H_USD,
@@ -1095,7 +1163,7 @@ jobs:
             if (PUSH_URL_V2) {
               const payloadV2 = {
                 ts: new Date().toISOString(), mode: "normal", source: "external_pusher",
-                meta: { origin: "github_actions_v2_bybit", strategy: "bybit-hedge-ultimate", data_source: "bybit_linear", golden_metrics: true, execution: "bybit_linear", hedge_mode: HEDGE_MODE ? "on" : "off", direction_history: state.direction_history },
+                meta: { origin: "github_actions_v2_bybit", strategy: "bybit-hedge-ultimate", data_source: "bybit_linear", golden_metrics: true, execution: "bybit_linear", hedge_mode: HEDGE_MODE ? "on" : "off", direction_history: state.direction_history, direction_history_by_symbol: state.direction_history_by_symbol },
                 top_n: picksV2.length, ideas: picksV2
               };
               log(`pushing ${picksV2.length} v2 ideas to ${PUSH_URL_V2}`);
