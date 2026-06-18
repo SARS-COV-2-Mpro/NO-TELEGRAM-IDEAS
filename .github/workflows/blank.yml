@@ -1,4 +1,3 @@
-m
 name: Ideas Pusher (Bybit Ultimate 1.0.0)
 
 on:
@@ -36,6 +35,7 @@ jobs:
       BYBIT_DEPTH_LIMIT: ${{ vars.BYBIT_DEPTH_LIMIT }}
       OBI_TOPN: ${{ vars.OBI_TOPN }}
       MAX_1M_FLUCTUATION_PCT: ${{ vars.MAX_1M_FLUCTUATION_PCT }}
+      FLUCTUATION_TARGET_PCT: ${{ vars.FLUCTUATION_TARGET_PCT }}
       ACTIVE_UTC_START: ${{ vars.ACTIVE_UTC_START }}
       ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
       BYBIT_BASE: ${{ vars.BYBIT_BASE }}
@@ -107,6 +107,59 @@ jobs:
           const logit=(p)=>{ const eps=1e-6; const pp=Math.min(1-eps,Math.max(eps,p)); return Math.log(pp/(1-pp)); };
           let bmSpare=null;
           const randn=()=>{ if(bmSpare!=null){ const v=bmSpare; bmSpare=null; return v; } let u=0,v=0; while(u===0) u=Math.random(); while(v===0) v=Math.random(); const r=Math.sqrt(-2*Math.log(u)); const th=2*Math.PI*v; bmSpare=r*Math.sin(th); return r*Math.cos(th); };
+          
+          // Student-t cumulative distribution function (approximation)
+          const tCDF = (x, df) => {
+            if (df <= 0) df = 5;
+            const a = df / (df + x * x);
+            const b = x / Math.sqrt(df);
+            const atan = Math.atan(b);
+            let p = 0.5 + atan / Math.PI;
+            
+            // More accurate for df < 30
+            if (df < 30) {
+              const terms = Math.floor(df / 2);
+              let sum = 0;
+              for (let i = 1; i <= terms; i++) {
+                const coef = (2 * i - 1) / (2 * i);
+                sum += coef * Math.pow(a, i);
+              }
+              p = 0.5 + (atan + b * a * sum) / Math.PI;
+            }
+            
+            return Math.max(0, Math.min(1, p));
+          };
+
+          // Compute realized volatility from 1m klines
+          const computeRealizedVol = (klines, windowSize = 30) => {
+            if (!klines || klines.length < windowSize) return null;
+            
+            const closes = klines.slice(-windowSize).map(k => +k[4]);
+            const logReturns = [];
+            
+            for (let i = 1; i < closes.length; i++) {
+              if (closes[i] > 0 && closes[i - 1] > 0) {
+                logReturns.push(Math.log(closes[i] / closes[i - 1]));
+              }
+            }
+            
+            if (logReturns.length < 10) return null;
+            
+            // Volatility per 1-minute
+            const vol1m = std(logReturns);
+            
+            // Kalman smoothing for noise reduction
+            const smoothed = kalman1D(logReturns.map(r => Math.abs(r)), {
+              q: 1e-5,
+              r: 1e-3,
+              p0: 1e-2
+            });
+            
+            const volSmoothed = smoothed.length > 0 ? mean(smoothed.slice(-5)) : vol1m;
+            
+            return Math.max(volSmoothed, vol1m * 0.5); // Don't over-smooth
+          };
+
           const randt=(df)=>{ if(df<=2) df=2.01; const z=randn(); let x2=0; for(let i=0;i<Math.floor(df);i++){ const z2=randn(); x2+=z2*z2; } const frac=df-Math.floor(df); if(frac>0){ const zf=randn(); x2+=frac*zf*zf; } const chi=x2||1e-6; return z / Math.sqrt(chi/df); };
           const kalman1D=(obs,{q=1e-5,r=1e-3,x0=null,p0=1e-2}={})=>{ if(!obs?.length) return []; let x=(x0==null?obs[0]:x0), p=p0; const out=[]; for(const z of obs){ p+=q; const K=p/(p+r); x=x+K*(z-x); p=(1-K)*p; out.push(x); } return out; };
           const pathEVHeavy=({entry,tp_bps,sl_bps,side,retSeries,mu,sigma,steps,N=192,cost_bps=10,t_df=5,boot_block=3})=>{ const up=(side==="long"), tpF=tp_bps/10000, slF=sl_bps/10000; let ev=0, wins=0; const rets=retSeries||[]; const boot1=()=>{ if(rets.length<8) return Array(steps).fill(0).map(()=> sigma*Math.sqrt(1/steps)*randn()); const out=[]; while(out.length<steps){ const start=Math.floor(Math.random()*(rets.length-boot_block)); for(let k=0;k<boot_block && out.length<steps;k++) out.push(rets[start+k]||0); } return out.slice(0,steps); }; for(let n=0;n<N;n++){ const mode=(n%2===0)?"t":"boot"; let S=entry, tp=up? entry*(1+tpF):entry*(1-tpF), sl=up? entry*(1-slF):entry*(1+slF); let pnl_bps=0,win=0; const rs=(mode==="t")? Array(steps).fill(0).map(()=> mu + sigma*randt(t_df)/Math.sqrt(steps)) : boot1(); for(let t=0;t<steps;t++){ S*=(1+rs[t]); if(up){ if(S>=tp){ pnl_bps=tp_bps-cost_bps; win=1; break;} if(S<=sl){ pnl_bps=-sl_bps-cost_bps; win=0; break;} } else { if(S<=tp){ pnl_bps=tp_bps-cost_bps; win=1; break;} if(S>=sl){ pnl_bps=-sl_bps-cost_bps; win=0; break;} } if(t===steps-1){ const ret=up? (S/entry-1):(entry/S-1); pnl_bps=Math.round(ret*10000)-cost_bps; win=pnl_bps>0?1:0; } } ev+=pnl_bps; wins+=win; } const p=wins/N, ev_mean=ev/N; return { p, ev_bps:Math.round(ev_mean) }; };
@@ -263,6 +316,8 @@ jobs:
           const DEPTH_LIMIT=Number(process.env.BYBIT_DEPTH_LIMIT||"25");
           const OBI_TOPN=Number(process.env.OBI_TOPN||"12");
           const MAX_1M_FLUCTUATION_PCT=Number(process.env.MAX_1M_FLUCTUATION_PCT||"0.5");
+          const FLUCTUATION_TARGET_PCT = Number(process.env.FLUCTUATION_TARGET_PCT || "2");
+          log(`🎯 Fluctuation target: ±${FLUCTUATION_TARGET_PCT}% containment probability`);
           const COOLDOWN_MS=3*60*60*1000, FLIP_GUARD_MS=30*60*1000;
           const DD_24H_LIMIT_BPS=-150, DD_PEAK_LIMIT_BPS=-300;
           const WILSON_Z=1.34, TARGET_PORT_RISK_BPS=52;
@@ -633,20 +688,47 @@ jobs:
 
           async function fetchGoldenMetricsWithSpread(symbol) {
             try {
-              const [kline, ticker, oiHist] = await Promise.all([
+              const [kline, ticker, oiHist, depth, klines1m] = await Promise.all([
                 fetchBybit1hKline(symbol),
                 fetchBybitTicker(symbol),
                 fetchBybitOIHist(symbol),
+                fetchBybitOrderbook(symbol),
+                fetchBybit1mKlines(symbol, 60) // Fetch 60 candles for vol calculation
               ]);
+              
               const spot = null;
               if (!kline || !ticker) return null;
+              
               const basisInfo = calculateBasis(ticker.markPrice, spot?.spotPrice);
+              
               let spread_bps = 999;
               let mid = ticker.markPrice || kline.currClose || 0;
               if (ticker.bid && ticker.ask && ticker.bid > 0) {
                 mid = (ticker.bid + ticker.ask) / 2;
                 spread_bps = Math.round(((ticker.ask - ticker.bid) / mid) * 10000);
               }
+              
+              // Calculate OBI
+              let obi = 0;
+              if (depth?.bids?.length && depth?.asks?.length) {
+                obi = computeOBI(depth, OBI_TOPN);
+              }
+              
+              // Calculate realized volatility
+              const vol1m = computeRealizedVol(klines1m, 30);
+              
+              // Max 1m fluctuation for stability
+              let max1mFluct = 0;
+              if (klines1m && klines1m.length >= 5) {
+                for (const k of klines1m.slice(-5)) {
+                  const h = +k[2], l = +k[3], c = +k[4];
+                  if (c > 0) {
+                    const fluct = ((h - l) / c) * 100;
+                    max1mFluct = Math.max(max1mFluct, fluct);
+                  }
+                }
+              }
+              
               let oi_delta_pct = 0, oi_delta_1h_pct = 0, oi_delta_2h_pct = 0;
               let current_oi_usd = ticker.openInterestValue;
               if (oiHist && mid > 0) {
@@ -660,6 +742,7 @@ jobs:
                 oi_delta_pct = Math.max(oi_delta_1h_pct, oi_delta_2h_pct);
                 current_oi_usd = currentOI;
               }
+              
               return {
                 symbol,
                 vol_1h_pct: kline.vol1hPct || 0,
@@ -675,20 +758,54 @@ jobs:
                 spread_bps,
                 bid: ticker.bid || 0,
                 ask: ticker.ask || 0,
+                obi,
+                vol_1m: vol1m,
+                max_1m_fluct: max1mFluct,
                 ts: Date.now()
               };
             } catch (e) { return null; }
           }
 
-          function calculateHedgeConfidence(metrics) {
-            if (!metrics) return 0;
-            const volNorm = Math.tanh((metrics.vol_1h_pct || 0) / IDEAL_VOL_1H_PCT);
-            const fundingNorm = Math.tanh((metrics.funding_rate || 0) / IDEAL_FUNDING_RATE);
-            const oiNorm = Math.tanh((metrics.oi_delta_pct || 0) / IDEAL_OI_DELTA_PCT);
-            const volUsdNorm = Math.tanh((metrics.volume_1h_usd || 0) / IDEAL_VOLUME_1H_USD);
-            const spreadScore = metrics.spread_bps != null ? Math.max(0, 1 - (metrics.spread_bps - IDEAL_SPREAD_BPS) / 12) : 0.5;
-            const rawScore = WEIGHT_VOL_1H * volNorm + WEIGHT_FUNDING * fundingNorm + WEIGHT_OI_DELTA * oiNorm + WEIGHT_VOLUME * volUsdNorm + WEIGHT_SPREAD * spreadScore;
-            return clamp(Math.round(rawScore * 100), 0, 100);
+          function calculateRangeProbability(metrics, vol1m, holdMinutes = 60) {
+            if (!metrics || vol1m == null || vol1m <= 0) return { prob: 0, details: {} };
+            
+            // Scale volatility to hold period
+            const volHold = vol1m * Math.sqrt(holdMinutes);
+            
+            // Student-t probability of staying within ±target range
+            const targetFrac = FLUCTUATION_TARGET_PCT / 100;
+            const zScore = targetFrac / Math.max(volHold, 1e-6);
+            
+            // t-distribution with df=5 (fat tails for crypto)
+            const pRaw = 2 * tCDF(zScore, 5) - 1;
+            
+            // Microstructure penalties
+            const obiPenalty = 1 - Math.min(0.3, Math.abs(metrics.obi || 0) * 0.3);
+            const fundingPenalty = 1 - Math.min(0.2, Math.abs(metrics.funding_rate || 0) * 2000);
+            const spreadPenalty = 1 - Math.min(0.5, (metrics.spread_bps || 0) / 200);
+            
+            // Stability from recent 1m fluctuation
+            const stabilityFactor = metrics.max_1m_fluct != null 
+              ? Math.max(0.7, 1 - metrics.max_1m_fluct / MAX_1M_FLUCTUATION_PCT)
+              : 1.0;
+            
+            // Final adjusted probability
+            const pAdj = pRaw * obiPenalty * fundingPenalty * spreadPenalty * stabilityFactor;
+            
+            const probPct = clamp(Math.round(pAdj * 100), 0, 100);
+            
+            return {
+              prob: probPct,
+              details: {
+                vol_1m_pct: +(vol1m * 100).toFixed(4),
+                vol_hold_pct: +(volHold * 100).toFixed(3),
+                p_raw: +(pRaw * 100).toFixed(1),
+                obi_pen: +obiPenalty.toFixed(3),
+                fund_pen: +fundingPenalty.toFixed(3),
+                spread_pen: +spreadPenalty.toFixed(3),
+                stab_factor: +stabilityFactor.toFixed(3)
+              }
+            };
           }
 
           async function pushAuditSecondary(path, payload){
@@ -859,7 +976,7 @@ jobs:
                   try {
                     const metrics = await fetchGoldenMetricsWithSpread(sym.symbol);
                     if (!metrics) return null;
-                    return { ...sym, ...metrics, hedge_confidence: calculateHedgeConfidence(metrics) };
+                    return { ...sym, ...metrics };
                   } catch (e) { return null; }
                 })
               );
@@ -868,12 +985,36 @@ jobs:
             }
             log(`📈 Fetched metrics for ${allMetrics.length}/${eligibleSymbols.length} symbols`);
 
-            allMetrics.sort((a, b) => b.hedge_confidence - a.hedge_confidence);
+            // Pre-calculate range probabilities for sorting
+            for (const m of allMetrics) {
+              if (m.vol_1m != null && m.vol_1m > 0) {
+                const calc = calculateRangeProbability(
+                  {
+                    obi: m.obi,
+                    funding_rate: m.funding_rate,
+                    spread_bps: m.spread_bps,
+                    max_1m_fluct: m.max_1m_fluct
+                  },
+                  m.vol_1m,
+                  60
+                );
+                m.range_prob = calc.prob;
+              } else {
+                m.range_prob = 0;
+              }
+            }
+            
+            allMetrics.sort((a, b) => b.range_prob - a.range_prob);
 
             const TOP_10_COUNT = 10;
             const topCandidates = allMetrics.slice(0, TOP_10_COUNT);
-            log("🏆 Top 10 by hedge confidence (includes spread):");
-            topCandidates.forEach((m, i) => log(`   ${i+1}. ${m.symbol} conf=${m.hedge_confidence} vol1h=${m.vol_1h_pct.toFixed(2)}% fund=${(m.funding_rate*100).toFixed(4)}% oi_delta=${m.oi_delta_pct.toFixed(1)}% vol=$${Math.round(m.volume_1h_usd/1e6)}M spread=${m.spread_bps}bps`));
+            log(`🏆 Top 10 by P(±${FLUCTUATION_TARGET_PCT}%) range probability:`);
+            topCandidates.forEach((m, i) => log(
+              `   ${i+1}. ${m.symbol} P=${m.range_prob}% ` +
+              `vol1m=${((m.vol_1m || 0) * 100).toFixed(3)}% ` +
+              `obi=${(m.obi || 0).toFixed(2)} ` +
+              `spread=${m.spread_bps}bps`
+            ));
 
             const TARGET_TOP_N = Math.max(1, TOP_N || 3);
             let selected = [];
@@ -881,43 +1022,82 @@ jobs:
             for (const cand of topCandidates) {
               if (selected.length >= TARGET_TOP_N) break;
               if (selected.some(s => s.base === cand.base)) continue;
-
+            
+              // Skip if vol_1m unavailable
+              if (cand.vol_1m == null || cand.vol_1m <= 0) {
+                log(`   ⏭️  Skip ${cand.symbol}: vol_1m unavailable`);
+                continue;
+              }
+            
+              // Skip if 1m stability check fails
               const klines1m = await fetchBybit1mKlines(cand.symbol, 5);
               const isStable = checkRecentStability(klines1m, MAX_1M_FLUCTUATION_PCT);
               if (!isStable) {
                 log(`   ⏭️  Skip ${cand.symbol}: 1m fluctuation exceeds ${MAX_1M_FLUCTUATION_PCT}%`);
                 continue;
               }
-
-              const fundingSide = cand.funding_rate_raw > 0 ? "short" : "long";
-
-              const atr_bps = Math.round(cand.vol_1h_pct * 100);
-              const tp_bps = Math.max(30, Math.round(atr_bps * 0.9));
-              const sl_bps = Math.min(80, Math.max(20, Math.round(atr_bps * 0.5)));
-              const cost_bps = COST_BPS + Math.round(cand.spread_bps / 2);
-              const p_win = 0.50 + 0.15 * Math.tanh(cand.vol_1h_pct / 3);
-              const ev_bps = Math.round(p_win * tp_bps - (1 - p_win) * sl_bps - cost_bps);
-
-              if (ev_bps < 0) {
-                log(`   ⏭️  Skip ${cand.symbol}: negative EV (${ev_bps}bps)`);
+            
+              // Dynamic TTL based on volatility
+              const volHoldTarget = (FLUCTUATION_TARGET_PCT / 100) / Math.max(cand.vol_1m, 1e-6);
+              const theoreticalMinutes = Math.pow(volHoldTarget, 2);
+              const holdMinutes = clamp(theoreticalMinutes * 0.6, 30, 180); // 0.5-3 hours
+              const hold_sec = Math.round(holdMinutes * 60);
+            
+              // Calculate range probability
+              const rangeCalc = calculateRangeProbability(
+                {
+                  obi: cand.obi,
+                  funding_rate: cand.funding_rate,
+                  spread_bps: cand.spread_bps,
+                  max_1m_fluct: cand.max_1m_fluct
+                },
+                cand.vol_1m,
+                holdMinutes
+              );
+            
+              const rangeProbPct = rangeCalc.prob;
+            
+              // Skip if probability too low
+              if (rangeProbPct < 50) {
+                log(`   ⏭️  Skip ${cand.symbol}: P(±${FLUCTUATION_TARGET_PCT}%)=${rangeProbPct}% < 50%`);
                 continue;
               }
-
+            
+              // Side selection based on OBI
+              const fundingSide = cand.funding_rate_raw > 0 ? "short" : "long";
+              const obiSide = (cand.obi || 0) > 0 ? "long" : "short";
+              const selectedSide = Math.abs(cand.obi || 0) > 0.1 ? obiSide : fundingSide;
+            
+              // TP/SL aligned with fluctuation target
+              const tp_bps = Math.round(FLUCTUATION_TARGET_PCT * 100 * 0.8); // 80% of target
+              const sl_bps = Math.round(FLUCTUATION_TARGET_PCT * 100 * 0.6); // 60% of target
+              const cost_bps = COST_BPS + Math.round(cand.spread_bps / 2);
+              
+              const p_win = rangeProbPct / 100;
+              const ev_bps = Math.round(p_win * tp_bps - (1 - p_win) * sl_bps - cost_bps);
+            
+              log(`   ✅ ${cand.symbol}: P(±${FLUCTUATION_TARGET_PCT}%)=${rangeProbPct}% vol=${(cand.vol_1m * 100).toFixed(3)}% TTL=${(hold_sec / 60).toFixed(0)}min side=${selectedSide.toUpperCase()}`);
+              log(`      Details: ${JSON.stringify(rangeCalc.details)}`);
+            
               selected.push({
                 symbol: cand.symbol, base: cand.base, quote: cand.quote,
-                side: fundingSide,
+                side: selectedSide,
                 mark_price: cand.mark_price, spread_bps: cand.spread_bps,
                 tp_bps, sl_bps, cost_bps, rrr: +(tp_bps / sl_bps).toFixed(2),
-                p_win: +p_win.toFixed(3), p_lcb: +p_win.toFixed(3), p_raw: +p_win.toFixed(3),
-                ev_bps, exp_lcb_bps: ev_bps, regime: "hedge", style: "hedge",
+                p_win, p_lcb: p_win, p_raw: p_win,
+                ev_bps, exp_lcb_bps: ev_bps, regime: "range", style: "range",
                 vol_1h_pct: cand.vol_1h_pct, funding_rate: cand.funding_rate, funding_rate_raw: cand.funding_rate_raw,
                 oi_delta_pct: cand.oi_delta_pct, volume_1h_usd: cand.volume_1h_usd, basis_bps: cand.basis_bps,
-                current_oi_usd: cand.current_oi_usd, confidence: cand.hedge_confidence, hedge_confidence: cand.hedge_confidence,
-                hold_sec: 3600,
-                reasons: reasonBuilder({
-                  vol_1h_pct: cand.vol_1h_pct, funding_rate: cand.funding_rate, oi_delta_pct: cand.oi_delta_pct,
-                  volume_1h_usd: cand.volume_1h_usd, basis_bps: cand.basis_bps
-                }),
+                current_oi_usd: cand.current_oi_usd, 
+                confidence: rangeProbPct,
+                range_prob: rangeProbPct,
+                range_details: rangeCalc.details,
+                hold_sec,
+                reasons: [
+                  { factor: `P(±${FLUCTUATION_TARGET_PCT}%)`, value: `${rangeProbPct}%`, contribution: rangeProbPct },
+                  { factor: "Vol_1m", value: (cand.vol_1m * 100).toFixed(3) + "%", contribution: 0 },
+                  { factor: "OBI", value: (cand.obi || 0).toFixed(3), contribution: 0 }
+                ],
                 ret5: []
               });
             }
@@ -990,7 +1170,7 @@ jobs:
                   ts_ms: Date.now(), p_cal: x.p_lcb, ev_bps: x.exp_lcb_bps ?? x.exp_bps, confidence_score: x.confidence,
                   flipped: x.flipped || false, vol_1h_pct: x.vol_1h_pct, funding_rate: x.funding_rate,
                   oi_delta_pct: x.oi_delta_pct, volume_1h_usd: x.volume_1h_usd, basis_bps: x.basis_bps,
-                  hedge_confidence: x.hedge_confidence
+                  range_prob: x.range_prob, range_details: x.range_details
                 },
                 confidence: x.confidence, reasons: x.reasons,
                 reasons_text: (x.reasons || []).slice(0, 3).map(r => `${r.factor}:${r.value}(${r.contribution >= 0 ? "+" : ""}${r.contribution})`),
@@ -1052,17 +1232,24 @@ jobs:
 
             for (const p of picks) log(`idea ${p.symbol_full} ${p.side} conf=${p.confidence} vol1h=${(p.predicted?.vol_1h_pct || 0).toFixed(2)}% fund=${((p.hedge_metrics?.funding_rate_raw || 0) * 100).toFixed(4)}% reasons=${(p.reasons_text || []).join("; ")}`);
             const ideaLogs = picks.map(p => ({
-              symbol: p.symbol_full, side: p.side, flipped: p.predicted?.flipped || false, confidence: p.confidence,
-              hedge_confidence: p.predicted?.hedge_confidence || 0, vol_1h_pct: +(p.predicted?.vol_1h_pct || 0).toFixed(2),
-              funding_rate: +(p.predicted?.funding_rate || 0).toFixed(5), oi_delta_pct: +(p.predicted?.oi_delta_pct || 0).toFixed(1),
-              volume_1h_usd: Math.round((p.predicted?.volume_1h_usd || 0) / 1e6) + "M", reasons: p.reasons_text,
-              p_cal: +p.p_lcb.toFixed(3), ev_bps: p.ev_bps, idea_id: p.idea_id
+              symbol: p.symbol_full,
+              side: p.side,
+              range_prob_pct: p.predicted?.range_prob || p.confidence,
+              vol_1m_pct: p.predicted?.range_details?.vol_1m_pct || 0,
+              ttl_min: Math.round((p.ttl_sec || 3600) / 60),
+              confidence: p.confidence,
+              idea_id: p.idea_id
             }));
 
             const meta = {
               origin: "github_actions", reason, exchange: "bybit_linear", execution_exchange: "bybit_linear",
               strategy: STRATEGY_NAME, model_version: MODEL_VERSION, schema_version: SCHEMA_VERSION, git_sha: GIT_SHA,
               config_hash: CONFIG_HASH,
+              fluctuation_config: {
+                target_pct: FLUCTUATION_TARGET_PCT,
+                max_1m_filter: MAX_1M_FLUCTUATION_PCT,
+                distribution: "student_t_df5"
+              },
               counts: { bybit_universe: bybitSymbols.length, metrics_fetched: allMetrics.length, selected: picks.length },
               dd_gate: { pnl24_bps, peak_dd_bps, throttle },
               tod: { active: S_H != null && E_H != null, start: S_H, end: E_H },
