@@ -36,6 +36,7 @@ jobs:
       OBI_TOPN: ${{ vars.OBI_TOPN }}
       MAX_1M_FLUCTUATION_PCT: ${{ vars.MAX_1M_FLUCTUATION_PCT }}
       FLUCTUATION_TARGET_PCT: ${{ vars.FLUCTUATION_TARGET_PCT }}
+      MIN_VOL_1M_PCT: ${{ vars.MIN_VOL_1M_PCT }}
       ACTIVE_UTC_START: ${{ vars.ACTIVE_UTC_START }}
       ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
       BYBIT_BASE: ${{ vars.BYBIT_BASE }}
@@ -107,7 +108,7 @@ jobs:
           const logit=(p)=>{ const eps=1e-6; const pp=Math.min(1-eps,Math.max(eps,p)); return Math.log(pp/(1-pp)); };
           let bmSpare=null;
           const randn=()=>{ if(bmSpare!=null){ const v=bmSpare; bmSpare=null; return v; } let u=0,v=0; while(u===0) u=Math.random(); while(v===0) v=Math.random(); const r=Math.sqrt(-2*Math.log(u)); const th=2*Math.PI*v; bmSpare=r*Math.sin(th); return r*Math.cos(th); };
-          
+
           // Student-t cumulative distribution function (approximation)
           const tCDF = (x, df) => {
             if (df <= 0) df = 5;
@@ -115,7 +116,7 @@ jobs:
             const b = x / Math.sqrt(df);
             const atan = Math.atan(b);
             let p = 0.5 + atan / Math.PI;
-            
+
             // More accurate for df < 30
             if (df < 30) {
               const terms = Math.floor(df / 2);
@@ -126,37 +127,37 @@ jobs:
               }
               p = 0.5 + (atan + b * a * sum) / Math.PI;
             }
-            
+
             return Math.max(0, Math.min(1, p));
           };
 
           // Compute realized volatility from 1m klines
           const computeRealizedVol = (klines, windowSize = 30) => {
             if (!klines || klines.length < windowSize) return null;
-            
+
             const closes = klines.slice(-windowSize).map(k => +k[4]);
             const logReturns = [];
-            
+
             for (let i = 1; i < closes.length; i++) {
               if (closes[i] > 0 && closes[i - 1] > 0) {
                 logReturns.push(Math.log(closes[i] / closes[i - 1]));
               }
             }
-            
+
             if (logReturns.length < 10) return null;
-            
+
             // Volatility per 1-minute
             const vol1m = std(logReturns);
-            
+
             // Kalman smoothing for noise reduction
             const smoothed = kalman1D(logReturns.map(r => Math.abs(r)), {
               q: 1e-5,
               r: 1e-3,
               p0: 1e-2
             });
-            
+
             const volSmoothed = smoothed.length > 0 ? mean(smoothed.slice(-5)) : vol1m;
-            
+
             return Math.max(volSmoothed, vol1m * 0.5); // Don't over-smooth
           };
 
@@ -317,6 +318,7 @@ jobs:
           const OBI_TOPN=Number(process.env.OBI_TOPN||"12");
           const MAX_1M_FLUCTUATION_PCT=Number(process.env.MAX_1M_FLUCTUATION_PCT||"0.5");
           const FLUCTUATION_TARGET_PCT = Number(process.env.FLUCTUATION_TARGET_PCT || "2");
+          const MIN_VOL_1M_PCT = Number(process.env.MIN_VOL_1M_PCT || "0.02");
           log(`🎯 Fluctuation target: ±${FLUCTUATION_TARGET_PCT}% containment probability`);
           const COOLDOWN_MS=3*60*60*1000, FLIP_GUARD_MS=30*60*1000;
           const DD_24H_LIMIT_BPS=-150, DD_PEAK_LIMIT_BPS=-300;
@@ -695,28 +697,28 @@ jobs:
                 fetchBybitOrderbook(symbol),
                 fetchBybit1mKlines(symbol, 60) // Fetch 60 candles for vol calculation
               ]);
-              
+
               const spot = null;
               if (!kline || !ticker) return null;
-              
+
               const basisInfo = calculateBasis(ticker.markPrice, spot?.spotPrice);
-              
+
               let spread_bps = 999;
               let mid = ticker.markPrice || kline.currClose || 0;
               if (ticker.bid && ticker.ask && ticker.bid > 0) {
                 mid = (ticker.bid + ticker.ask) / 2;
                 spread_bps = Math.round(((ticker.ask - ticker.bid) / mid) * 10000);
               }
-              
+
               // Calculate OBI
               let obi = 0;
               if (depth?.bids?.length && depth?.asks?.length) {
                 obi = computeOBI(depth, OBI_TOPN);
               }
-              
+
               // Calculate realized volatility
               const vol1m = computeRealizedVol(klines1m, 30);
-              
+
               // Max 1m fluctuation for stability
               let max1mFluct = 0;
               if (klines1m && klines1m.length >= 5) {
@@ -728,7 +730,7 @@ jobs:
                   }
                 }
               }
-              
+
               let oi_delta_pct = 0, oi_delta_1h_pct = 0, oi_delta_2h_pct = 0;
               let current_oi_usd = ticker.openInterestValue;
               if (oiHist && mid > 0) {
@@ -742,7 +744,7 @@ jobs:
                 oi_delta_pct = Math.max(oi_delta_1h_pct, oi_delta_2h_pct);
                 current_oi_usd = currentOI;
               }
-              
+
               return {
                 symbol,
                 vol_1h_pct: kline.vol1hPct || 0,
@@ -768,32 +770,32 @@ jobs:
 
           function calculateRangeProbability(metrics, vol1m, holdMinutes = 60) {
             if (!metrics || vol1m == null || vol1m <= 0) return { prob: 0, details: {} };
-            
+
             // Scale volatility to hold period
             const volHold = vol1m * Math.sqrt(holdMinutes);
-            
+
             // Student-t probability of staying within ±target range
             const targetFrac = FLUCTUATION_TARGET_PCT / 100;
             const zScore = targetFrac / Math.max(volHold, 1e-6);
-            
+
             // t-distribution with df=5 (fat tails for crypto)
             const pRaw = 2 * tCDF(zScore, 5) - 1;
-            
+
             // Microstructure penalties
             const obiPenalty = 1 - Math.min(0.3, Math.abs(metrics.obi || 0) * 0.3);
             const fundingPenalty = 1 - Math.min(0.2, Math.abs(metrics.funding_rate || 0) * 2000);
             const spreadPenalty = 1 - Math.min(0.5, (metrics.spread_bps || 0) / 200);
-            
+
             // Stability from recent 1m fluctuation
-            const stabilityFactor = metrics.max_1m_fluct != null 
+            const stabilityFactor = metrics.max_1m_fluct != null
               ? Math.max(0.7, 1 - metrics.max_1m_fluct / MAX_1M_FLUCTUATION_PCT)
               : 1.0;
-            
+
             // Final adjusted probability
             const pAdj = pRaw * obiPenalty * fundingPenalty * spreadPenalty * stabilityFactor;
-            
+
             const probPct = clamp(Math.round(pAdj * 100), 0, 100);
-            
+
             return {
               prob: probPct,
               details: {
@@ -969,8 +971,23 @@ jobs:
             });
             log(`📋 Eligible symbols after cooldown filter: ${eligibleSymbols.length}/${bybitSymbols.length}`);
 
-            for (let i = 0; i < eligibleSymbols.length; i += BATCH_SIZE) {
-              const batch = eligibleSymbols.slice(i, i + BATCH_SIZE);
+            const STABLECOINS_SET = new Set([
+              "USDT", "USDC", "BUSD", "DAI", "TUSD", "USDP", "USDD", "GUSD",
+              "USDJ", "USDN", "FEI", "FRAX", "LUSD", "sUSD", "USDK", "EURS",
+              "USD1", "EURT", "XAUT", "PAXG", "USDE", "DRKUSD", "FDUSD", "PAX", "USTC"
+            ]);
+
+            const nonStableSymbols = eligibleSymbols.filter(sym => {
+              const base = sym.base.toUpperCase();
+              if (STABLECOINS_SET.has(base)) return false;
+              if (sym.symbol.match(/^(USDT|USDC|BUSD|DAI)(USDT|USDC|BUSD)$/i)) return false;
+              if (base.includes("USD") && base.length <= 5 && !["USDR","USDY"].includes(base)) return false;
+              return true;
+            });
+            log(`🚫 Filtered out ${eligibleSymbols.length - nonStableSymbols.length} stablecoins/fiat pairs`);
+
+            for (let i = 0; i < nonStableSymbols.length; i += BATCH_SIZE) {
+              const batch = nonStableSymbols.slice(i, i + BATCH_SIZE);
               const batchResults = await Promise.all(
                 batch.map(async (sym) => {
                   try {
@@ -981,9 +998,9 @@ jobs:
                 })
               );
               for (const r of batchResults) if (r && r.mark_price > 0) allMetrics.push(r);
-              if (i + BATCH_SIZE < eligibleSymbols.length) await sleep(BATCH_DELAY);
+              if (i + BATCH_SIZE < nonStableSymbols.length) await sleep(BATCH_DELAY);
             }
-            log(`📈 Fetched metrics for ${allMetrics.length}/${eligibleSymbols.length} symbols`);
+            log(`📈 Fetched metrics for ${allMetrics.length}/${nonStableSymbols.length} symbols`);
 
             // Pre-calculate range probabilities for sorting
             for (const m of allMetrics) {
@@ -1004,10 +1021,20 @@ jobs:
               }
             }
             
-            allMetrics.sort((a, b) => b.range_prob - a.range_prob);
+            const tradableMetrics = allMetrics.filter(m => {
+              const vol1mPct = (m.vol_1m || 0) * 100;
+              if (vol1mPct < MIN_VOL_1M_PCT) {
+                log(`🚫 Skip ${m.symbol}: vol_1m=${vol1mPct.toFixed(3)}% < ${MIN_VOL_1M_PCT}% (too stable)`);
+                return false;
+              }
+              return true;
+            });
+            log(`📊 Tradable coins: ${tradableMetrics.length}/${allMetrics.length} (after vol filter)`);
+
+            tradableMetrics.sort((a, b) => b.range_prob - a.range_prob);
 
             const TOP_10_COUNT = 10;
-            const topCandidates = allMetrics.slice(0, TOP_10_COUNT);
+            const topCandidates = tradableMetrics.slice(0, TOP_10_COUNT);
             log(`🏆 Top 10 by P(±${FLUCTUATION_TARGET_PCT}%) range probability:`);
             topCandidates.forEach((m, i) => log(
               `   ${i+1}. ${m.symbol} P=${m.range_prob}% ` +
@@ -1022,28 +1049,24 @@ jobs:
             for (const cand of topCandidates) {
               if (selected.length >= TARGET_TOP_N) break;
               if (selected.some(s => s.base === cand.base)) continue;
-            
-              // Skip if vol_1m unavailable
+
               if (cand.vol_1m == null || cand.vol_1m <= 0) {
                 log(`   ⏭️  Skip ${cand.symbol}: vol_1m unavailable`);
                 continue;
               }
-            
-              // Skip if 1m stability check fails
+
               const klines1m = await fetchBybit1mKlines(cand.symbol, 5);
               const isStable = checkRecentStability(klines1m, MAX_1M_FLUCTUATION_PCT);
               if (!isStable) {
                 log(`   ⏭️  Skip ${cand.symbol}: 1m fluctuation exceeds ${MAX_1M_FLUCTUATION_PCT}%`);
                 continue;
               }
-            
-              // Dynamic TTL based on volatility
+
               const volHoldTarget = (FLUCTUATION_TARGET_PCT / 100) / Math.max(cand.vol_1m, 1e-6);
               const theoreticalMinutes = Math.pow(volHoldTarget, 2);
               const holdMinutes = clamp(theoreticalMinutes * 0.6, 30, 180); // 0.5-3 hours
               const hold_sec = Math.round(holdMinutes * 60);
-            
-              // Calculate range probability
+
               const rangeCalc = calculateRangeProbability(
                 {
                   obi: cand.obi,
@@ -1054,31 +1077,28 @@ jobs:
                 cand.vol_1m,
                 holdMinutes
               );
-            
+
               const rangeProbPct = rangeCalc.prob;
-            
-              // Skip if probability too low
+
               if (rangeProbPct < 50) {
                 log(`   ⏭️  Skip ${cand.symbol}: P(±${FLUCTUATION_TARGET_PCT}%)=${rangeProbPct}% < 50%`);
                 continue;
               }
-            
-              // Side selection based on OBI
+
               const fundingSide = cand.funding_rate_raw > 0 ? "short" : "long";
               const obiSide = (cand.obi || 0) > 0 ? "long" : "short";
               const selectedSide = Math.abs(cand.obi || 0) > 0.1 ? obiSide : fundingSide;
-            
-              // TP/SL aligned with fluctuation target
-              const tp_bps = Math.round(FLUCTUATION_TARGET_PCT * 100 * 0.8); // 80% of target
-              const sl_bps = Math.round(FLUCTUATION_TARGET_PCT * 100 * 0.6); // 60% of target
+
+              const tp_bps = Math.round(FLUCTUATION_TARGET_PCT * 100 * 0.8);
+              const sl_bps = Math.round(FLUCTUATION_TARGET_PCT * 100 * 0.6);
               const cost_bps = COST_BPS + Math.round(cand.spread_bps / 2);
-              
+
               const p_win = rangeProbPct / 100;
               const ev_bps = Math.round(p_win * tp_bps - (1 - p_win) * sl_bps - cost_bps);
-            
+
               log(`   ✅ ${cand.symbol}: P(±${FLUCTUATION_TARGET_PCT}%)=${rangeProbPct}% vol=${(cand.vol_1m * 100).toFixed(3)}% TTL=${(hold_sec / 60).toFixed(0)}min side=${selectedSide.toUpperCase()}`);
               log(`      Details: ${JSON.stringify(rangeCalc.details)}`);
-            
+
               selected.push({
                 symbol: cand.symbol, base: cand.base, quote: cand.quote,
                 side: selectedSide,
@@ -1088,7 +1108,7 @@ jobs:
                 ev_bps, exp_lcb_bps: ev_bps, regime: "range", style: "range",
                 vol_1h_pct: cand.vol_1h_pct, funding_rate: cand.funding_rate, funding_rate_raw: cand.funding_rate_raw,
                 oi_delta_pct: cand.oi_delta_pct, volume_1h_usd: cand.volume_1h_usd, basis_bps: cand.basis_bps,
-                current_oi_usd: cand.current_oi_usd, 
+                current_oi_usd: cand.current_oi_usd,
                 confidence: rangeProbPct,
                 range_prob: rangeProbPct,
                 range_details: rangeCalc.details,
@@ -1248,6 +1268,7 @@ jobs:
               fluctuation_config: {
                 target_pct: FLUCTUATION_TARGET_PCT,
                 max_1m_filter: MAX_1M_FLUCTUATION_PCT,
+                min_1m_filter: MIN_VOL_1M_PCT,
                 distribution: "student_t_df5"
               },
               counts: { bybit_universe: bybitSymbols.length, metrics_fetched: allMetrics.length, selected: picks.length },
