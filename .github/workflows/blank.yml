@@ -46,6 +46,7 @@ jobs:
       ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
       BYBIT_BASE: ${{ vars.BYBIT_BASE }}
       FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}
+      HEDGE: ${{ vars.HEDGE }}
 
       # New Confidence Model Knobs
       DIRECTION: ${{ vars.DIRECTION }}
@@ -298,6 +299,7 @@ jobs:
           const LONG_EDGE_MULT_MIN=Number(process.env.LONG_EDGE_MULT_MIN||"4");
           const LONG_BOUNCE_SL_ATR=Number(process.env.LONG_BOUNCE_SL_ATR||"0.50"), LONG_BOUNCE_TP_ATR=Number(process.env.LONG_BOUNCE_TP_ATR||"0.90");
           const LONG_SIMILARITY_RHO=Number(process.env.LONG_SIMILARITY_RHO||"0.84");
+          const HEDGE=(process.env.HEDGE||"on").toLowerCase()==="on";
 
           const IDEAL_VOL_1H_PCT = 2.0;
           const IDEAL_FUNDING_RATE = 0.0004;
@@ -320,7 +322,7 @@ jobs:
               LONG_BOUNCE_SL_ATR, LONG_BOUNCE_TP_ATR, LONG_SIMILARITY_RHO, TOP_N, MAX_SPREAD_BPS,
               EXP_LCB_MIN_BPS_BASE, COST_BPS, NOTIONAL, DEPTH_LIMIT, OBI_TOPN, MIN_TF_ALIGN, TF_WEIGHTS,
               IDEAL_VOL_1H_PCT, IDEAL_FUNDING_RATE, IDEAL_OI_DELTA_PCT, IDEAL_VOLUME_1H_USD, IDEAL_SPREAD_BPS,
-              WEIGHT_VOL_1H, WEIGHT_FUNDING, WEIGHT_OI_DELTA, WEIGHT_VOLUME, WEIGHT_SPREAD
+              WEIGHT_VOL_1H, WEIGHT_FUNDING, WEIGHT_OI_DELTA, WEIGHT_VOLUME, WEIGHT_SPREAD, HEDGE
             };
             return hashObj(knobs);
           }catch{ return "cfg-unknown"; } })();
@@ -914,7 +916,15 @@ jobs:
               if (selected.length >= TARGET_TOP_N) break;
               if (selected.some(s => s.base === cand.base)) continue;
               
-              const side = cand.funding_rate_raw > 0 ? "short" : "long";
+              let side;
+              if (HEDGE) {
+                // Original behavior: use funding rate
+                side = cand.funding_rate_raw > 0 ? "short" : "long";
+              } else {
+                // Random: 50% chance for long or short
+                side = Math.random() < 0.5 ? "long" : "short";
+              }
+              
               const atr_bps = Math.round(cand.vol_1h_pct * 100);
               const tp_bps = Math.max(30, Math.round(atr_bps * 0.9));
               const sl_bps = Math.min(80, Math.max(20, Math.round(atr_bps * 0.5)));
@@ -932,7 +942,7 @@ jobs:
                 mark_price: cand.mark_price, spread_bps: cand.spread_bps,
                 tp_bps, sl_bps, cost_bps, rrr: +(tp_bps / sl_bps).toFixed(2),
                 p_win: +p_win.toFixed(3), p_lcb: +p_win.toFixed(3), p_raw: +p_win.toFixed(3),
-                ev_bps, exp_lcb_bps: ev_bps, regime: "hedge", style: "hedge",
+                ev_bps, exp_lcb_bps: ev_bps, regime: HEDGE ? "hedge" : "random", style: HEDGE ? "hedge" : "random",
                 vol_1h_pct: cand.vol_1h_pct, funding_rate: cand.funding_rate, funding_rate_raw: cand.funding_rate_raw,
                 oi_delta_pct: cand.oi_delta_pct, volume_1h_usd: cand.volume_1h_usd, basis_bps: cand.basis_bps,
                 current_oi_usd: cand.current_oi_usd, confidence: cand.hedge_confidence, hedge_confidence: cand.hedge_confidence,
@@ -1062,7 +1072,7 @@ jobs:
               golden_metrics_config: { ideal_vol_1h_pct: IDEAL_VOL_1H_PCT, ideal_funding_rate: IDEAL_FUNDING_RATE,
                 ideal_oi_delta_pct: IDEAL_OI_DELTA_PCT, ideal_volume_1h_usd: IDEAL_VOLUME_1H_USD,
                 weights: { vol_1h: WEIGHT_VOL_1H, funding: WEIGHT_FUNDING, oi_delta: WEIGHT_OI_DELTA, volume: WEIGHT_VOLUME }},
-              extras: { v2_ideas: picksV2, features_requested: ["maker_join", "post_only", "linear", "hedge_trading", "bybit_execution"] }
+              extras: { v2_ideas: picksV2, features_requested: ["maker_join", "post_only", "linear", "hedge_trading", "bybit_execution"], hedge_mode: HEDGE ? "on" : "off" }
             };
             const payload = { ts: new Date().toISOString(), mode: "normal", source: "external_pusher", meta, top_n: picks.length || 0, ideas: picks || [] };
             
@@ -1075,7 +1085,7 @@ jobs:
 
             if (PUSH_URL_V2) {
               const payloadV2 = { ts: new Date().toISOString(), mode: "normal", source: "external_pusher",
-                meta: { origin: "github_actions_v2_bybit", strategy: "bybit-hedge-ultimate", data_source: "bybit_linear", golden_metrics: true, execution: "bybit_linear" },
+                meta: { origin: "github_actions_v2_bybit", strategy: "bybit-hedge-ultimate", data_source: "bybit_linear", golden_metrics: true, execution: "bybit_linear", hedge_mode: HEDGE ? "on" : "off" },
                 top_n: picksV2.length, ideas: picksV2 };
               log(`pushing ${picksV2.length} v2 ideas to ${PUSH_URL_V2}`);
               try {
