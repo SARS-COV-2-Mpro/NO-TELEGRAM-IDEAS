@@ -956,7 +956,7 @@ jobs:
             }
             log(`✅ Selected ${selected.length} ideas (TOP ${TARGET_TOP_N} from Top 10)`);
             const flipped = selected.map(orig => ({ ...orig, side: orig.side === "long" ? "short" : "long", flipped: true, original_idea_id: orig.symbol + "_" + orig.side }));
-            const selectedWithFlipped = [...selected, ...flipped];
+            const selectedWithFlipped = HEDGE ? [...selected, ...flipped] : selected;
 
             const wEv = softmax(selectedWithFlipped.map(x => x.exp_lcb_bps), 20);
             let picksV2 = selectedWithFlipped.map((x, i) => {
