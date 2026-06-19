@@ -914,7 +914,7 @@ jobs:
             echo "[gha] pushing 0 ideas to ${raw_push_url}"
             mkdir -p /tmp
             : > /tmp/push_resp.txt
-            http_code=$(curl -g -sS -o /tmp/push_resp.txt -w "%{http_code}" -X POST -H "Content-Type: "application/json" -H "Authorization: Bearer ${PUSH_TOKEN}" --data-raw "${payload}" --max-time 12 "${raw_push_url}" || true)
+            http_code=$(curl -g -sS -o /tmp/push_resp.txt -w "%{http_code}" -X POST -H "Content-Type: application/json" -H "Authorization: Bearer ${PUSH_TOKEN}" --data-raw "${payload}" --max-time 12 "${raw_push_url}" || true)
             body="$(head -c 400 /tmp/push_resp.txt || true)"
             echo "[gha] push status ${http_code} ${body}"
             exit 0
