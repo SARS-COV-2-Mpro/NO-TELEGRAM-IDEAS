@@ -1133,7 +1133,7 @@ jobs:
             const { state, persist } = await loadState();
 
             state.run_counter = (state.run_counter || 0) + 1;
-            log(`🔄 Run ${state.run_counter}/6`);
+            log(`🔄 Run ${state.run_counter}/3`);
             const SHOULD_WIPE = (state.run_counter >= 3);
 
             if (SHOULD_WIPE) {
