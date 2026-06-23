@@ -49,12 +49,6 @@ jobs:
       FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}
       HEDGE: ${{ vars.HEDGE }}
 
-      # New proven system parameters
-      UNIVERSAL_SL_BPS: ${{ vars.UNIVERSAL_SL_BPS }}
-      UNIVERSAL_TP_BPS: ${{ vars.UNIVERSAL_TP_BPS }}
-      MIN_CONFIDENCE_FILTER: ${{ vars.MIN_CONFIDENCE_FILTER }}
-      MAX_NOISE_FILTER: ${{ vars.MAX_NOISE_FILTER }}
-
       # New Confidence Model Knobs
       DIRECTION: ${{ vars.DIRECTION }}
       MR_SLOPE_MAX_ATR50: ${{ vars.MR_SLOPE_MAX_ATR50 }}
@@ -554,12 +548,6 @@ jobs:
           const HEDGE_MODE = (process.env.HEDGE || "on").toLowerCase() === "on";
           log(`🎲 HEDGE mode: ${HEDGE_MODE ? "ON (both sides, per-symbol CTS)" : "OFF (one side via CTS consensus)"}`);
 
-          // New proven system parameters
-          const UNIVERSAL_SL_BPS = Number(process.env.UNIVERSAL_SL_BPS || "90");
-          const UNIVERSAL_TP_BPS = Number(process.env.UNIVERSAL_TP_BPS || "370");
-          const MIN_CONFIDENCE_FILTER = Number(process.env.MIN_CONFIDENCE_FILTER || "60");
-          const MAX_NOISE_FILTER = Number(process.env.MAX_NOISE_FILTER || "0.22");
-
           // ── CTS Config — calibrated defaults for crypto perpetuals ─
           const CTS_CANDIDATES    = Number(process.env.CTS_CANDIDATES    || "50");
           const CTS_ENABLED       = (process.env.CTS_ENABLED || "true").toLowerCase() === "true";
@@ -608,8 +596,7 @@ jobs:
               WEIGHT_VOL_1H, WEIGHT_FUNDING, WEIGHT_OI_DELTA, WEIGHT_VOLUME, WEIGHT_SPREAD,
               HEDGE: process.env.HEDGE, MAX_EV_BPS,
               CTS_WEIGHT_M, CTS_WEIGHT_S, CTS_WEIGHT_V, CTS_WEIGHT_N,
-              CTS_THRESHOLD, CTS_MAX_NOISE, CTS_EMA_LAG,
-              UNIVERSAL_SL_BPS, UNIVERSAL_TP_BPS, MIN_CONFIDENCE_FILTER, MAX_NOISE_FILTER
+              CTS_THRESHOLD, CTS_MAX_NOISE, CTS_EMA_LAG
             };
             return hashObj(knobs);
           }catch{ return "cfg-unknown"; } })();
@@ -1133,11 +1120,11 @@ jobs:
             const { state, persist } = await loadState();
 
             state.run_counter = (state.run_counter || 0) + 1;
-            log(`🔄 Run ${state.run_counter}/3`);
-            const SHOULD_WIPE = (state.run_counter >= 3);
+            log(`🔄 Run ${state.run_counter}/6`);
+            const SHOULD_WIPE = (state.run_counter >= 6);
 
             if (SHOULD_WIPE) {
-              log("🗑️  RUN 3: WIPE GIST AND RESTART FRESH");
+              log("🗑️  RUN 6: WIPE GIST AND RESTART FRESH");
               await saveState(persist, { run_counter: 0 }, {}, 2, true);
               state.v = "bybit-hedge-1.0";
               state.run_counter = 1;
@@ -1331,28 +1318,11 @@ jobs:
 
             for (const cand of candidatesForSide) {
               if (selected.length >= TARGET_TOP_N) break;
-
-              // 1. Duplicate base check
               if (selected.some(s => s.base === cand.base)) {
                 log(`   ⏭️  ${cand.symbol}: duplicate base`);
                 continue;
               }
 
-              // 2. NOISE FILTER (Critical for 0.9/3.7 survival)
-              const candNoise = cand.cts?.N || 1.0;
-              if (candNoise >= MAX_NOISE_FILTER) {
-                log(`   ⏭️  ${cand.symbol}: noise too high (N=${candNoise.toFixed(2)} ≥ ${MAX_NOISE_FILTER})`);
-                continue;
-              }
-
-              // 3. CONFIDENCE FILTER
-              const candConf = cand.hedge_confidence || 0;
-              if (candConf < MIN_CONFIDENCE_FILTER) {
-                log(`   ⏭️  ${cand.symbol}: confidence too low (${candConf} < ${MIN_CONFIDENCE_FILTER})`);
-                continue;
-              }
-
-              // 4. Stability check
               const klines1m = await fetchBybit1mKlines(cand.symbol, 5);
               const isStable = checkRecentStability(klines1m, MAX_1M_FLUCTUATION_PCT);
               if (!isStable) {
@@ -1360,27 +1330,23 @@ jobs:
                 continue;
               }
 
-              // 5. UNIVERSAL SL/TP (Proven values from real trades)
-              const sl_bps   = UNIVERSAL_SL_BPS;   // 90 bps = 0.90%
-              const tp_bps   = UNIVERSAL_TP_BPS;   // 370 bps = 3.70%
+              const atr_bps  = Math.round(cand.vol_1h_pct * 100);
+              const tp_bps   = Math.max(30, Math.round(atr_bps * 0.9));
+              const sl_bps   = Math.min(80, Math.max(20, Math.round(atr_bps * 0.5)));
               const cost_bps = COST_BPS + Math.round(cand.spread_bps / 2);
-              const rrr      = tp_bps / sl_bps;    // 4.1:1
-
-              // 6. EV calculation (aligned with actual RRR)
-              const p_win  = 0.40; // Conservative 40% target win rate with filter
-              const ev_bps = Math.round(p_win * tp_bps - (1 - p_win) * sl_bps - cost_bps);
+              const p_win    = 0.50 + 0.15 * Math.tanh(cand.vol_1h_pct / 3);
+              const ev_bps   = Math.round(p_win * tp_bps - (1 - p_win) * sl_bps - cost_bps);
 
               if (ev_bps < 0) {
                 log(`   ⏭️  ${cand.symbol}: negative EV (${ev_bps}bps)`);
                 continue;
               }
-
+              
               if (ev_bps > MAX_EV_BPS) {
                 log(`   ⏭️  ${cand.symbol}: EV too high (${ev_bps}bps > ${MAX_EV_BPS}bps max)`);
                 continue;
               }
 
-              // 7. Side selection
               let side;
               if (HEDGE_MODE) {
                 side = cand.cts_signal !== "neutral"
@@ -1392,12 +1358,12 @@ jobs:
               if (!side) continue;
 
               const sideIcon = side === "long" ? "🟢" : "🔴";
-              log(`   ✅ ${sideIcon} ${cand.symbol}: selected EV=${ev_bps}bps CTS=${(cand.cts_score||0).toFixed(3)} N=${candNoise.toFixed(2)} SL=${sl_bps}bps TP=${tp_bps}bps`);
+              log(`   ✅ ${sideIcon} ${cand.symbol}: selected EV=${ev_bps}bps CTS=${(cand.cts_score||0).toFixed(3)} N=${cand.cts?.N?.toFixed(2)||"?"}`);
 
               selected.push({
                 symbol: cand.symbol, base: cand.base, quote: cand.quote, side,
                 mark_price: cand.mark_price, spread_bps: cand.spread_bps,
-                tp_bps, sl_bps, cost_bps, rrr: +rrr.toFixed(2),
+                tp_bps, sl_bps, cost_bps, rrr: +(tp_bps / sl_bps).toFixed(2),
                 p_win: +p_win.toFixed(3), p_lcb: +p_win.toFixed(3), p_raw: +p_win.toFixed(3),
                 ev_bps, exp_lcb_bps: ev_bps, regime: "hedge", style: "hedge",
                 vol_1h_pct: cand.vol_1h_pct, funding_rate: cand.funding_rate,
