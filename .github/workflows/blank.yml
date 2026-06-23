@@ -1323,6 +1323,21 @@ jobs:
                 continue;
               }
 
+              // ══════════ ADDED BLOCK ══════════
+              const candNoise = cand.cts?.N || 1.0;
+              const candConf = cand.hedge_confidence || 0;
+              
+              if (candConf < 60) {
+                log(`   ⏭️  ${cand.symbol}: confidence too low (${candConf} < 60)`);
+                continue;
+              }
+              
+              if (candNoise >= 0.23) {
+                log(`   ⏭️  ${cand.symbol}: noise too high (N=${candNoise.toFixed(2)} ≥ 0.23)`);
+                continue;
+              }
+              // ═════════════════════════════════
+
               const klines1m = await fetchBybit1mKlines(cand.symbol, 5);
               const isStable = checkRecentStability(klines1m, MAX_1M_FLUCTUATION_PCT);
               if (!isStable) {
