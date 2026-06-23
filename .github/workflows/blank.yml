@@ -1134,7 +1134,7 @@ jobs:
 
             state.run_counter = (state.run_counter || 0) + 1;
             log(`🔄 Run ${state.run_counter}/6`);
-            const SHOULD_WIPE = (state.run_counter >= 6);
+            const SHOULD_WIPE = (state.run_counter >= 3);
 
             if (SHOULD_WIPE) {
               log("🗑️  RUN 6: WIPE GIST AND RESTART FRESH");
