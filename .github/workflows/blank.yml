@@ -1120,11 +1120,11 @@ jobs:
             const { state, persist } = await loadState();
 
             state.run_counter = (state.run_counter || 0) + 1;
-            log(`🔄 Run ${state.run_counter}/3`);
-            const SHOULD_WIPE = (state.run_counter >= 3);
+            log(`🔄 Run ${state.run_counter}/6`);
+            const SHOULD_WIPE = (state.run_counter >= 6);
 
             if (SHOULD_WIPE) {
-              log("🗑️  RUN 3: WIPE GIST AND RESTART FRESH");
+              log("🗑️  RUN 6: WIPE GIST AND RESTART FRESH");
               await saveState(persist, { run_counter: 0 }, {}, 2, true);
               state.v = "bybit-hedge-1.0";
               state.run_counter = 1;
