@@ -49,6 +49,11 @@ jobs:
       FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}
       HEDGE: ${{ vars.HEDGE }}
 
+      # Executer Reality
+      EXEC_SL_BPS: ${{ vars.EXEC_SL_BPS }}
+      EXEC_TP_BPS: ${{ vars.EXEC_TP_BPS }}
+      MIN_EV_BPS: ${{ vars.MIN_EV_BPS }}
+
       # New Confidence Model Knobs
       DIRECTION: ${{ vars.DIRECTION }}
       MR_SLOPE_MAX_ATR50: ${{ vars.MR_SLOPE_MAX_ATR50 }}
@@ -596,7 +601,10 @@ jobs:
               WEIGHT_VOL_1H, WEIGHT_FUNDING, WEIGHT_OI_DELTA, WEIGHT_VOLUME, WEIGHT_SPREAD,
               HEDGE: process.env.HEDGE, MAX_EV_BPS,
               CTS_WEIGHT_M, CTS_WEIGHT_S, CTS_WEIGHT_V, CTS_WEIGHT_N,
-              CTS_THRESHOLD, CTS_MAX_NOISE, CTS_EMA_LAG
+              CTS_THRESHOLD, CTS_MAX_NOISE, CTS_EMA_LAG,
+              EXEC_SL_BPS: process.env.EXEC_SL_BPS,
+              EXEC_TP_BPS: process.env.EXEC_TP_BPS,
+              MIN_EV_BPS: process.env.MIN_EV_BPS
             };
             return hashObj(knobs);
           }catch{ return "cfg-unknown"; } })();
@@ -1316,6 +1324,11 @@ jobs:
             let selected = [];
             log(`🎯 Selecting top ${TARGET_TOP_N} from ${candidatesForSide.length} candidates...`);
 
+            // Read executer config from ENV
+            const EXEC_SL_BPS = Number(process.env.EXEC_SL_BPS || "180");
+            const EXEC_TP_BPS = Number(process.env.EXEC_TP_BPS || "240");
+            const MIN_EV_BPS  = Number(process.env.MIN_EV_BPS  || "5");
+
             for (const cand of candidatesForSide) {
               if (selected.length >= TARGET_TOP_N) break;
               if (selected.some(s => s.base === cand.base)) {
@@ -1330,20 +1343,19 @@ jobs:
                 continue;
               }
 
-              const atr_bps  = Math.round(cand.vol_1h_pct * 100);
-              const tp_bps   = Math.max(30, Math.round(atr_bps * 0.9));
-              const sl_bps   = Math.min(80, Math.max(20, Math.round(atr_bps * 0.5)));
+              // Use executer's actual SL/TP for EV calculation
               const cost_bps = COST_BPS + Math.round(cand.spread_bps / 2);
-              const p_win    = 0.50 + 0.15 * Math.tanh(cand.vol_1h_pct / 3);
-              const ev_bps   = Math.round(p_win * tp_bps - (1 - p_win) * sl_bps - cost_bps);
+              const p_win    = 0.48 + 0.12 * Math.tanh(cand.vol_1h_pct / 2.0);
+              const raw_ev   = (p_win * EXEC_TP_BPS) - ((1 - p_win) * EXEC_SL_BPS) - cost_bps;
 
-              if (ev_bps < 0) {
-                log(`   ⏭️  ${cand.symbol}: negative EV (${ev_bps}bps)`);
+              // Filter using raw (non-rounded) EV to avoid 0.49 -> 0 rounding errors
+              if (raw_ev <= MIN_EV_BPS) {
+                log(`   ⏭️  ${cand.symbol}: Low Edge (${raw_ev.toFixed(1)} bps, need >${MIN_EV_BPS})`);
                 continue;
               }
-              
-              if (ev_bps > MAX_EV_BPS) {
-                log(`   ⏭️  ${cand.symbol}: EV too high (${ev_bps}bps > ${MAX_EV_BPS}bps max)`);
+
+              if (raw_ev > MAX_EV_BPS) {
+                log(`   ⏭️  ${cand.symbol}: EV too high (${raw_ev.toFixed(1)}bps > ${MAX_EV_BPS}bps max)`);
                 continue;
               }
 
@@ -1358,32 +1370,29 @@ jobs:
               if (!side) continue;
 
               const sideIcon = side === "long" ? "🟢" : "🔴";
-              log(`   ✅ ${sideIcon} ${cand.symbol}: selected EV=${ev_bps}bps CTS=${(cand.cts_score||0).toFixed(3)} N=${cand.cts?.N?.toFixed(2)||"?"}`);
+              const ev_bps = Math.round(raw_ev);
+              log(`   ✅ ${sideIcon} ${cand.symbol}: selected EV=${ev_bps}bps (raw=${raw_ev.toFixed(1)}) CTS=${(cand.cts_score||0).toFixed(2)}`);
 
               selected.push({
                 symbol: cand.symbol, base: cand.base, quote: cand.quote, side,
                 mark_price: cand.mark_price, spread_bps: cand.spread_bps,
-                tp_bps, sl_bps, cost_bps, rrr: +(tp_bps / sl_bps).toFixed(2),
+                tp_bps: EXEC_TP_BPS, sl_bps: EXEC_SL_BPS, cost_bps, 
+                rrr: +(EXEC_TP_BPS / EXEC_SL_BPS).toFixed(2),
                 p_win: +p_win.toFixed(3), p_lcb: +p_win.toFixed(3), p_raw: +p_win.toFixed(3),
                 ev_bps, exp_lcb_bps: ev_bps, regime: "hedge", style: "hedge",
                 vol_1h_pct: cand.vol_1h_pct, funding_rate: cand.funding_rate,
                 funding_rate_raw: cand.funding_rate_raw, oi_delta_pct: cand.oi_delta_pct,
                 volume_1h_usd: cand.volume_1h_usd, basis_bps: cand.basis_bps,
                 current_oi_usd: cand.current_oi_usd, confidence: cand.hedge_confidence,
-                hedge_confidence: cand.hedge_confidence, hold_sec: 3600,
+                hedge_confidence: cand.hedge_confidence, hold_sec: 7200,
                 cts_score:  cand.cts_score  || 0,
                 cts_signal: cand.cts_signal || "neutral",
                 cts_detail: cand.cts ? {
                   M: +cand.cts.M.toFixed(6), S: +cand.cts.S.toFixed(4),
-                  V: +cand.cts.V.toFixed(4), N: +cand.cts.N.toFixed(4),
-                  HH: cand.cts.HH, HL: cand.cts.HL, LH: cand.cts.LH, LL: cand.cts.LL
+                  V: +cand.cts.V.toFixed(4), N: +cand.cts.N.toFixed(4)
                 } : null,
                 combined_score: +combinedScore(cand).toFixed(4),
-                reasons: reasonBuilder({
-                  vol_1h_pct: cand.vol_1h_pct, funding_rate: cand.funding_rate,
-                  oi_delta_pct: cand.oi_delta_pct, volume_1h_usd: cand.volume_1h_usd,
-                  basis_bps: cand.basis_bps
-                }),
+                reasons: [],
                 ret5: []
               });
             }
