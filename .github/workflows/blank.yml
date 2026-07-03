@@ -949,19 +949,19 @@ jobs:
             const wipeToEmpty = state && Object.keys(state).length === 1 && state.run_counter === 0;
 
             async function patch(files, etag) {
-  const headers = {
-    Authorization: `Bearer ${persist.token}`,
-    "Accept": "application/vnd.github+json",
-    "Content-Type": "application/json",
-    "User-Agent": UA
-  };
-  // GitHub Gist does not support If-Match — omit it entirely
-  return await fetchWithTimeout(gistUrl, {
-    method: "PATCH",
-    headers,
-    body: JSON.stringify({ files })
-  }, 15000);
-}
+              const headers = {
+                Authorization: `Bearer ${persist.token}`,
+                "Accept": "application/vnd.github+json",
+                "Content-Type": "application/json",
+                "User-Agent": UA
+              };
+              if (etag) headers["If-Match"] = etag;
+              return await fetchWithTimeout(gistUrl, {
+                method: "PATCH",
+                headers,
+                body: JSON.stringify({ files })
+              }, 15000);
+            }
 
             let toSave = state;
             let etag = persist.etag || null;
@@ -1870,40 +1870,33 @@ jobs:
 
                 if (!chosen) continue;
                 
-// ========== FINAL CONFIDENCE CALCULATION ==========
-// Signal score stays pure — never degraded by execution quality
-const signalScore = cand.hedge_confidence;
-
-// ── Execution quality GATES (pass/fail, not multipliers) ──
-const spreadOK  = spreadBps <= MAX_SPREAD_BPS;
-const depthOK   = depth1pUSD >= DEPTH_1P_MIN_USD * 0.3;  // soft floor (30%)
-const costOK    = chosen.cost_bps <= MAX_COST_BPS_HARD;
-
-if (!spreadOK) {
-  log(`[GATE] ${cand.symbol} spread=${spreadBps}bps > MAX_SPREAD_BPS=${MAX_SPREAD_BPS} — skip`);
-  continue;
-}
-if (!depthOK) {
-  log(`[GATE] ${cand.symbol} depth1p=$${Math.round(depth1pUSD)} < min=$${Math.round(DEPTH_1P_MIN_USD*0.3)} — skip`);
-  continue;
-}
-if (!costOK) {
-  log(`[GATE] ${cand.symbol} cost=${chosen.cost_bps}bps > MAX_COST_BPS_HARD=${MAX_COST_BPS_HARD} — skip`);
-  continue;
-}
-
-// ── Small adjustments only (signal stays dominant) ──
-const evMult           = clamp(chosen.viab_mult || 1, 0.7, 1.3);
-const btcMult          = (chosen.side === "long" && !btcUp1h) ? 0.90 : 1.0;
-const fundingAlignBonus = (
-  (chosen.side === "short" && cand.funding_rate_raw > 0) ||
-  (chosen.side === "long"  && cand.funding_rate_raw < 0)
-) ? 1.1 : 1.0;
-
-// Final confidence = signal score with small adjustments only
-const finalConf = Math.round(
-  signalScore * evMult * btcMult * fundingAlignBonus
-);                
+                // ========== FINAL CONFIDENCE CALCULATION ==========
+                // Base from golden 4 metrics (already 0-100)
+                const baseConf = cand.hedge_confidence;
+                
+                // Execution quality multipliers
+                const spreadMult = clamp(1 - Math.max(0, (spreadBps - 5)) / 30, 0.5, 1.1);
+                const depthMult = clamp(depth1pUSD / Math.max(1, DEPTH_1P_MIN_USD), 0.3, 1.2);
+                const slipMult = clamp(1 - Math.max(0, (chosen.cost_bps - COST_BPS)) / 25, 0.5, 1.1);
+                const oiMult = clamp(cand.current_oi_usd / 50_000_000, 0.4, 1.3);
+                
+                // EV multiplier
+                const evMult = clamp(chosen.viab_mult || 1, 0.3, 1.3);
+                
+                // Direction bias for BTC regime
+                const btcMult = (chosen.side === "long" && !btcUp1h) ? 0.85 : 1.0;
+                
+                // Funding alignment bonus
+                const fundingAlignBonus = (
+                  (chosen.side === "short" && cand.funding_rate_raw > 0) ||
+                  (chosen.side === "long" && cand.funding_rate_raw < 0)
+                ) ? 1.1 : 1.0;
+                
+                // Final confidence
+                const finalConf = Math.round(
+                  baseConf * spreadMult * depthMult * slipMult * oiMult * evMult * btcMult * fundingAlignBonus
+                );
+                
                 // Build reasons
                 const reasons = reasonBuilder({
                   vol_1h_pct: cand.vol_1h_pct,
