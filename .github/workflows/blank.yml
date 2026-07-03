@@ -63,10 +63,10 @@ jobs:
       LONG_BOUNCE_TP_ATR: ${{ vars.LONG_BOUNCE_TP_ATR }}
       LONG_SIMILARITY_RHO: ${{ vars.LONG_SIMILARITY_RHO }}
       HEDGE: ${{ vars.HEDGE }}
-REG_INTERVAL: ${{ vars.REG_INTERVAL }}
-REG_LIMIT: ${{ vars.REG_LIMIT }}
-REG_SLOPE_THRESHOLD: ${{ vars.REG_SLOPE_THRESHOLD }}
-REG_RANGE_THRESHOLD: ${{ vars.REG_RANGE_THRESHOLD }}
+      REG_INTERVAL: ${{ vars.REG_INTERVAL }}
+      REG_LIMIT: ${{ vars.REG_LIMIT }}
+      REG_SLOPE_THRESHOLD: ${{ vars.REG_SLOPE_THRESHOLD }}
+      REG_RANGE_THRESHOLD: ${{ vars.REG_RANGE_THRESHOLD }}
 
       # New (MTF + Provenance + Align)
       MIN_TF_ALIGN: ${{ vars.MIN_TF_ALIGN }}
