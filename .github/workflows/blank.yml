@@ -1830,8 +1830,10 @@ jobs:
                     }
                   };
 
-                } else if (forcedSide === "short" && DIRECTION !== "long") {   let tp = Math.round(atr_bps * LONG_BOUNCE_TP_ATR);   let sl = Math.round(atr_bps * LONG_BOUNCE_SL_ATR);   sl = Math.min(sl, MAX_SL_BPS);   tp = Math.max(tp, Math.round(sl * 1.5));
+                } else if (forcedSide === "short" && DIRECTION !== "long") {   let tp = Math.round(atr_bps * LONG_BOUNCE_TP_ATR);   let sl = Math.round(atr_bps * LONG_BOUNCE_SL_ATR);   let tp = Math.round(atr_bps * LONG_BOUNCE_TP_ATR);   let sl = Math.round(atr_bps * LONG_BOUNCE_SL_ATR);
 
+                  sl = Math.min(sl, MAX_SL_BPS);
+                  tp = Math.max(tp, Math.round(sl * 1.5));
 
                   const evLCB = Math.round(pShort_lcb * tp - (1 - pShort_lcb) * sl - costShort);
                   const edgeS = tp / Math.max(1, 4 * costShort);
