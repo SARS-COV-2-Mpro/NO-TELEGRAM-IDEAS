@@ -2363,7 +2363,7 @@ if (!chosen) continue;
               }
             }
             
-          } catch (e) {
+                    } catch (e) {
             reason = reason !== "ok" ? reason : "data_error";
             const payload = {
               ts: new Date().toISOString(),
@@ -2392,7 +2392,7 @@ if (!chosen) continue;
               log("push failed", e2?.message || e2);
             }
           }
-          })();
+         })();
           NODE
 
           EXIT_CODE=$?
