@@ -312,10 +312,10 @@ jobs:
           const LONG_EDGE_MULT_MIN=Number(process.env.LONG_EDGE_MULT_MIN||"4");
           const LONG_BOUNCE_SL_ATR=Number(process.env.LONG_BOUNCE_SL_ATR||"0.50"), LONG_BOUNCE_TP_ATR=Number(process.env.LONG_BOUNCE_TP_ATR||"0.90");
           const LONG_SIMILARITY_RHO=Number(process.env.LONG_SIMILARITY_RHO||"0.84");
-const REG_INTERVAL=Number(process.env.REG_INTERVAL||"5");
-const REG_LIMIT=Number(process.env.REG_LIMIT||"12");
-const REG_SLOPE_THRESHOLD=Number(process.env.REG_SLOPE_THRESHOLD||"0.15");
-const REG_RANGE_THRESHOLD=Number(process.env.REG_RANGE_THRESHOLD||"0.0");
+          const REG_INTERVAL=Number(process.env.REG_INTERVAL||"5");
+          const REG_LIMIT=Number(process.env.REG_LIMIT||"12");
+          const REG_SLOPE_THRESHOLD=Number(process.env.REG_SLOPE_THRESHOLD||"0.15");
+          const REG_RANGE_THRESHOLD=Number(process.env.REG_RANGE_THRESHOLD||"0.0");
 
           // Golden 4 metrics ideal thresholds (for confidence scoring, NOT gates)
           const IDEAL_VOL_1H_PCT = 2.0;       // |1h price change| >= 2%
