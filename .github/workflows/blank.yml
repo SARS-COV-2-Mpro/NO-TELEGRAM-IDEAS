@@ -1757,13 +1757,15 @@ jobs:
                 } else if (DIRECTION === "short") {
                   forcedSide = "short";
                 } else if (regime === "trend") {
+                  // Trend: slope is primary, dirEdge confirms
                   const slopeConfirmed = (slopeDir > 0 && dirEdge > 0) || (slopeDir < 0 && dirEdge < 0);
                   forcedSide = slopeDir > 0 ? "long" : "short";
                   if (!slopeConfirmed) {
                     log(`[DIR] ${cand.symbol} slope/edge conflict — skipping`);
-                    continue;
+                    continue; // skip conflicted signals
                   }
                 } else {
+                  // Mean revert: funding is primary
                   if (fundingScore > 0.3) forcedSide = "long";
                   else if (fundingScore < -0.3) forcedSide = "short";
                   else forcedSide = dirEdge >= 0 ? "long" : "short";
@@ -1867,6 +1869,7 @@ jobs:
                 }
 
                 if (!chosen) continue;
+                
                 // ========== FINAL CONFIDENCE CALCULATION ==========
                 // Base from golden 4 metrics (already 0-100)
                 const baseConf = cand.hedge_confidence;
@@ -2361,7 +2364,7 @@ jobs:
               }
             }
             
-                    } catch (e) {
+          } catch (e) {
             reason = reason !== "ok" ? reason : "data_error";
             const payload = {
               ts: new Date().toISOString(),
@@ -2390,7 +2393,7 @@ jobs:
               log("push failed", e2?.message || e2);
             }
           }
-         })();
+          })();
           NODE
 
           EXIT_CODE=$?
