@@ -1716,9 +1716,9 @@ jobs:
                     const slope = slopeBps(closes5m, REG_LIMIT);
 
                     const isTrend = Math.abs(slope) > REG_SLOPE_THRESHOLD;
-                    const isRange = range <= REG_RANGE_THRESHOLD || !isTrend;
+                    const isRange = range <= REG_RANGE_THRESHOLD;
+                    regime = (isTrend && !isRange) ? "trend" : "meanrevert";
 
-                    regime = isTrend ? "trend" : "meanrevert";
                     slopeDir = slope > 0 ? 1 : -1;
 
                     log(`[REG] ${cand.symbol} slope=${slope.toFixed(3)} range=${(range*100).toFixed(2)}% → ${regime} slopeDir=${slopeDir}`);
@@ -1830,9 +1830,8 @@ jobs:
                     }
                   };
 
-                } else if (forcedSide === "short" && DIRECTION !== "long") {
-                  let tp = Math.round(atr_bps * 1.0);
-                  let sl = Math.round(atr_bps * 0.5);
+                } else if (forcedSide === "short" && DIRECTION !== "long") {   let tp = Math.round(atr_bps * LONG_BOUNCE_TP_ATR);   let sl = Math.round(atr_bps * LONG_BOUNCE_SL_ATR);   let tp = Math.round(atr_bps * LONG_BOUNCE_TP_ATR);   let sl = Math.round(atr_bps * LONG_BOUNCE_SL_ATR);
+
                   sl = Math.min(sl, MAX_SL_BPS);
                   tp = Math.max(tp, Math.round(sl * 1.5));
 
@@ -1868,7 +1867,7 @@ jobs:
                   };
                 }
 
-                if (!chosen) continue;
+                if (!chosen) continue;  if ((cand.volume_1h_usd || 0) < MIN_VOL_1H_USD) {   log(`[GATE] ${cand.symbol} vol1h=$${Math.round((cand.volume_1h_usd||0)/1e6)}M < min=$${Math.round(MIN_VOL_1H_USD/1e6)}M — skip`);   continue; }
                 
                 // ========== FINAL CONFIDENCE CALCULATION ==========
                 // Signal score stays pure — never degraded by execution quality
