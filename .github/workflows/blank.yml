@@ -63,10 +63,6 @@ jobs:
       LONG_BOUNCE_TP_ATR: ${{ vars.LONG_BOUNCE_TP_ATR }}
       LONG_SIMILARITY_RHO: ${{ vars.LONG_SIMILARITY_RHO }}
       HEDGE: ${{ vars.HEDGE }}
-      REG_INTERVAL: ${{ vars.REG_INTERVAL }}
-      REG_LIMIT: ${{ vars.REG_LIMIT }}
-      REG_SLOPE_THRESHOLD: ${{ vars.REG_SLOPE_THRESHOLD }}
-      REG_RANGE_THRESHOLD: ${{ vars.REG_RANGE_THRESHOLD }}
 
       # New (MTF + Provenance + Align)
       MIN_TF_ALIGN: ${{ vars.MIN_TF_ALIGN }}
@@ -312,10 +308,6 @@ jobs:
           const LONG_EDGE_MULT_MIN=Number(process.env.LONG_EDGE_MULT_MIN||"4");
           const LONG_BOUNCE_SL_ATR=Number(process.env.LONG_BOUNCE_SL_ATR||"0.50"), LONG_BOUNCE_TP_ATR=Number(process.env.LONG_BOUNCE_TP_ATR||"0.90");
           const LONG_SIMILARITY_RHO=Number(process.env.LONG_SIMILARITY_RHO||"0.84");
-          const REG_INTERVAL=Number(process.env.REG_INTERVAL||"5");
-          const REG_LIMIT=Number(process.env.REG_LIMIT||"12");
-          const REG_SLOPE_THRESHOLD=Number(process.env.REG_SLOPE_THRESHOLD||"0.15");
-          const REG_RANGE_THRESHOLD=Number(process.env.REG_RANGE_THRESHOLD||"0.0");
 
           // Golden 4 metrics ideal thresholds (for confidence scoring, NOT gates)
           const IDEAL_VOL_1H_PCT = 2.0;       // |1h price change| >= 2%
@@ -1700,33 +1692,12 @@ jobs:
                 const d1 = depthWithinPctUSD(depth, mid, 0.01);
                 const depth1pUSD = (d1.asksUSD || 0) + (d1.bidsUSD || 0);
                 
-                // ========== STEP 1: REGIME DETECTION (5m slope aligned) ==========
-                let regime = "meanrevert"; // default
-                let slopeDir = 0;
-
-                try {
-                  const url5m = `${BINANCE_FAPI}/fapi/v1/klines?symbol=${cand.symbol}&interval=${REG_INTERVAL}m&limit=${REG_LIMIT}`;
-                  const k5m = await getJSON(url5m, 8000, 2);
-
-                  if (Array.isArray(k5m) && k5m.length >= REG_LIMIT) {
-                    const closes5m = k5m.map(x => +x[4]);
-                    const hi = Math.max(...closes5m);
-                    const lo = Math.min(...closes5m);
-                    const range = lo > 0 ? (hi - lo) / lo : 0;
-                    const slope = slopeBps(closes5m, REG_LIMIT);
-
-                    const isTrend = Math.abs(slope) > REG_SLOPE_THRESHOLD;
-                    const isRange = range <= REG_RANGE_THRESHOLD || !isTrend;
-
-                    regime = isTrend ? "trend" : "meanrevert";
-                    slopeDir = slope > 0 ? 1 : -1;
-
-                    log(`[REG] ${cand.symbol} slope=${slope.toFixed(3)} range=${(range*100).toFixed(2)}% → ${regime} slopeDir=${slopeDir}`);
-                  }
-                } catch(e) {
-                  log(`[REG] ${cand.symbol} fallback to vol-based regime`);
-                  regime = (cand.vol_1h_pct >= 1.5 && Math.abs(cand.funding_rate) >= 0.0003) ? "trend" : "meanrevert";
-                }
+                // ========== STEP 1: REGIME DETECTION (STATIC FALLBACK) ==========
+                const regime = (cand.vol_1h_pct >= 1.5 && Math.abs(cand.funding_rate) >= 0.0003)
+                  ? "trend"
+                  : "meanrevert";
+                const slopeDir = Math.sign(cand.price_change_1h || 0);
+                log(`[REG] ${cand.symbol} static regime=${regime} slopeDir=${slopeDir}`);
 
                 // ========== STEP 2: MULTI-SIGNAL DIRECTION ==========
                 const priceMom1h = cand.price_change_1h || 0;
