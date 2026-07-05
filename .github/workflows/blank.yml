@@ -655,49 +655,8 @@ jobs:
           // ---------- Binance Futures API Functions (Public, No Auth) ----------
           
           // FIXED: Fetch all USDT perpetual symbols from Binance Futures
-          async function fetchBinanceFuturesSymbols() {
-            const cacheKey = "binance_futures_symbols";
-            const cached = getCached(cache.binance, cacheKey, 300_000); // 5 min cache
-            if (cached) return cached;
-            
-            try {
-              const url = `${BINANCE_FAPI}/fapi/v1/exchangeInfo`;
-              log("Fetching Binance exchangeInfo from:", url);
-              
-              const response = await fetchWithTimeout(url, {}, 20000);
-              if (!response.ok) {
-                log(`Binance exchangeInfo failed: ${response.status}`);
-                return [];
-              }
-              
-              const data = await response.json();
-              if (!data?.symbols) {
-                log("Binance exchangeInfo has no symbols");
-                return [];
-              }
-              
-              const symbols = data.symbols
-                .filter(s => 
-                  s.contractType === "PERPETUAL" && 
-                  s.quoteAsset === "USDT" &&
-                  s.status === "TRADING"
-                )
-                .map(s => ({
-                  symbol: s.symbol,           // e.g., "BTCUSDT"
-                  base: s.baseAsset,          // e.g., "BTC"
-                  quote: s.quoteAsset,        // "USDT"
-                  pricePrecision: s.pricePrecision,
-                  quantityPrecision: s.quantityPrecision
-                }));
-              
-              setCached(cache.binance, cacheKey, symbols);
-              log(`📊 Binance Futures: ${symbols.length} USDT perpetuals found`);
-              return symbols;
-            } catch (e) {
-              log("fetchBinanceFuturesSymbols error:", e?.message || e);
-              return [];
-            }
-          }
+          async function fetchBinanceFuturesSymbols() {             const bases = [               "BTC","ETH","BNB","SOL","XRP","DOGE","ADA","AVAX","LINK","DOT",               "TRX","MATIC","LTC","BCH","ATOM","UNI","ETC","APT","FIL","ARB",               "OP","SUI","INJ","WLD","SEI","TIA","BLUR","PENDLE","JTO","PYTH",               "ENA","ETHFI","RENDER","TON","NEAR","FTM","ICP","VET","HBAR",               "ALGO","SAND","MANA","AXS","GALA","CHZ","CRV","AAVE","COMP",               "SNX","SUSHI","1INCH","OCEAN","KAVA","ROSE","ANKR","RAY","POPCAT",               "MASK","LRC","ZRX","BAND","CELO","HOT","ZIL","ONE","ENJ",               "GMT","APE","FLOW","IMX","LDO","STX","CFX","MAGIC","HIGH",               "ACH","GAL","LINA","SLP","ALICE","TLM","REEF","DUSK","POND"             ];             const symbols = bases.map(base => ({               symbol: base + "USDT",               base,               quote: "USDT",               pricePrecision: 4,               quantityPrecision: 2             }));             log(`📋 Using hardcoded symbol list: ${symbols.length} symbols`);             return symbols;           }             const bases = [               "BTC","ETH","BNB","SOL","XRP","DOGE","ADA","AVAX","LINK","DOT",               "TRX","MATIC","LTC","BCH","ATOM","UNI","ETC","APT","FIL","ARB",               "OP","SUI","INJ","WLD","SEI","TIA","BLUR","PENDLE","JTO","PYTH",               "ENA","ETHFI","RENDER","TON","NEAR","FTM","ICP","VET","HBAR",               "ALGO","SAND","MANA","AXS","GALA","CHZ","CRV","AAVE","COMP",               "SNX","SUSHI","1INCH","OCEAN","KAVA","ROSE","ANKR","RAY","POPCAT",               "MASK","LRC","ZRX","BAND","CELO","HOT","ZIL","ONE","ENJ",               "GMT","APE","FLOW","IMX","LDO","STX","CFX","MAGIC","HIGH",               "ACH","GAL","LINA","SLP","ALICE","TLM","REEF","DUSK","POND"             ];             const symbols = bases.map(base => ({               symbol: base + "USDT",               base,               quote: "USDT",               pricePrecision: 4,               quantityPrecision: 2             }));             log(`📋 Using hardcoded symbol list: ${symbols.length} symbols`);             return symbols;           }
+
 
           // Fetch 1h kline for price change % and volume
           async function fetchBinance1hKline(symbol) {
