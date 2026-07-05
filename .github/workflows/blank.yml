@@ -64,6 +64,17 @@ jobs:
       LONG_SIMILARITY_RHO: ${{ vars.LONG_SIMILARITY_RHO }}
       HEDGE: ${{ vars.HEDGE }}
 
+      # V5 Regime Engine Variables
+      REG_INTERVAL: ${{ vars.REG_INTERVAL }}
+      REG_LIMIT: ${{ vars.REG_LIMIT }}
+      REG_SLOPE_THRESHOLD: ${{ vars.REG_SLOPE_THRESHOLD }}
+      SLOPE_EXIT_RATIO: ${{ vars.SLOPE_EXIT_RATIO }}
+      REG_RANGING_THRESHOLD: ${{ vars.REG_RANGING_THRESHOLD }}
+      REG_RANGE_THRESHOLD: ${{ vars.REG_RANGE_THRESHOLD }}
+      ATR_VOLATILE_THRESHOLD: ${{ vars.ATR_VOLATILE_THRESHOLD }}
+      REG_CONFIRM_BARS: ${{ vars.REG_CONFIRM_BARS }}
+      MIN_ALT_SCORE: ${{ vars.MIN_ALT_SCORE }}
+
       # New (MTF + Provenance + Align)
       MIN_TF_ALIGN: ${{ vars.MIN_TF_ALIGN }}
       TF_WEIGHTS: ${{ vars.TF_WEIGHTS }}
@@ -132,6 +143,172 @@ jobs:
           const toCSVLine=(row,keys)=> keys.map(k=>{ let v=row?.[k]; if(v==null) return ""; if(typeof v==="object") v=JSON.stringify(v); const s=String(v); return s.includes(",")||s.includes("\n")||s.includes('"')? `"${s.replace(/"/g,'""')}"`: s; }).join(",");
 
           const slopeBps=(arr,len=21)=>{ if(!arr?.length||arr.length<Math.max(5,len)) return 0; const s=arr.slice(-len); const n=s.length; const last=s[n-1]||1; const mx=(n-1)/2; let num=0,den=0; for(let i=0;i<n;i++){ const x=i, y=((s[i]||last)-last)/last*10000; num+=(x-mx)*y; den+=(x-mx)*(x-mx); } return den>0? num/den : 0; };
+
+          // ============================================================
+          // V5 REGIME ENGINE HELPERS (Corrected)
+          // ============================================================
+
+          function calcLinearRegressionSlope(closes) {
+            const n = closes.length;
+            if (n < 2) return 0;
+
+            let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+            for (let i = 0; i < n; i++) {
+              sumX  += i;
+              sumY  += closes[i];
+              sumXY += i * closes[i];
+              sumX2 += i * i;
+            }
+
+            const denom = (n * sumX2 - sumX * sumX);
+            if (denom === 0) return 0;
+
+            const slope    = (n * sumXY - sumX * sumY) / denom;
+            const avgPrice = sumY / n;
+            if (avgPrice === 0) return 0;
+            return (slope / avgPrice) * 100;
+          }
+
+          function computeATR(candles, period = 14) {
+            if (!candles || candles.length < period + 1) return 0;
+
+            const closes = candles.map(c => +c[4]);
+
+            const trueRanges = candles.slice(1).map((c, i) => {
+              const prevClose = closes[i];
+              return Math.max(
+                +c[2] - +c[3],
+                Math.abs(+c[2] - prevClose),
+                Math.abs(+c[3] - prevClose)
+              );
+            });
+
+            const atr = trueRanges.slice(-period).reduce((a, b) => a + b, 0) / Math.min(period, trueRanges.length);
+            return atr;
+          }
+
+          // V5 Regime Detection with Hysteresis + Confirmation (bugs 1, 4 fixed)
+          function detectV5Regime(state, symbol, candleData) {
+            const V5_SLOPE_THRESHOLD   = Number(process.env.REG_SLOPE_THRESHOLD    || "0.08");
+            const V5_RANGE_THRESHOLD   = Number(process.env.REG_RANGE_THRESHOLD    || "0.30");
+            const V5_RANGING_THRESHOLD = Number(process.env.REG_RANGING_THRESHOLD  || "0.15");
+            const V5_ATR_VOLATILE      = Number(process.env.ATR_VOLATILE_THRESHOLD || "0.35");
+            const V5_SLOPE_EXIT_RATIO  = Number(process.env.SLOPE_EXIT_RATIO       || "0.65");
+            const V5_CONFIRM_BARS      = Number(process.env.REG_CONFIRM_BARS       || "3");
+
+            // FIX (Bug 4): fixed absolute floor, not self-referential
+            const MIN_CANDLES_REQUIRED = 15; // ATR(14) + 1
+            if (!candleData || candleData.length < MIN_CANDLES_REQUIRED) {
+              return { regime: "Choppy", candidate: "Choppy", confirmed: false, slopePct: 0, atrPercent: 0, rangePct: 0, slopeThreshold: V5_SLOPE_THRESHOLD, detail: "Not enough data" };
+            }
+
+            const closes = candleData.map(c => +c[4]);
+            const highs  = candleData.map(c => +c[2]);
+            const lows   = candleData.map(c => +c[3]);
+
+            const sma          = closes.reduce((a, b) => a + b, 0) / closes.length;
+            const currentPrice = closes[closes.length - 1];
+
+            const atr        = computeATR(candleData, 14);
+            const atrPercent = sma > 0 ? (atr / sma) * 100 : 0;
+
+            const slopePct = calcLinearRegressionSlope(closes);
+
+            const highestHigh = Math.max(...highs);
+            const lowestLow   = Math.min(...lows);
+            const rangePct    = sma > 0 ? ((highestHigh - lowestLow) / sma) * 100 : 0;
+
+            const SLOPE_ENTER = V5_SLOPE_THRESHOLD;
+            const SLOPE_EXIT  = V5_SLOPE_THRESHOLD * V5_SLOPE_EXIT_RATIO;
+
+            const lastRegime = state.regime_state?.[symbol] || "Choppy";
+
+            // FIX (Bug 1): Ranging check uses the LOW threshold (hard floor).
+            // Trend confirmation checks use the HIGH threshold (must clear ranging zone with margin).
+            let candidateRegime;
+
+            if (atrPercent > V5_ATR_VOLATILE) {
+              candidateRegime = "Volatile";
+
+            } else if (rangePct < V5_RANGING_THRESHOLD) {
+              candidateRegime = "Ranging";
+
+            } else if (lastRegime === "Trending Up") {
+              if (slopePct > SLOPE_EXIT && currentPrice > sma && rangePct > V5_RANGE_THRESHOLD) {
+                candidateRegime = "Trending Up";
+              } else if (slopePct < -SLOPE_EXIT && currentPrice < sma) {
+                candidateRegime = "Trending Down";
+              } else {
+                candidateRegime = "Choppy";
+              }
+
+            } else if (lastRegime === "Trending Down") {
+              if (slopePct < -SLOPE_EXIT && currentPrice < sma && rangePct > V5_RANGE_THRESHOLD) {
+                candidateRegime = "Trending Down";
+              } else if (slopePct > SLOPE_EXIT && currentPrice > sma) {
+                candidateRegime = "Trending Up";
+              } else {
+                candidateRegime = "Choppy";
+              }
+
+            } else {
+              if (slopePct > SLOPE_ENTER && currentPrice > sma && rangePct > V5_RANGE_THRESHOLD) {
+                candidateRegime = "Trending Up";
+              } else if (slopePct < -SLOPE_ENTER && currentPrice < sma && rangePct > V5_RANGE_THRESHOLD) {
+                candidateRegime = "Trending Down";
+              } else {
+                candidateRegime = "Choppy";
+              }
+            }
+
+            // Confirmation Logic
+            if (!state.regime_history) state.regime_history = {};
+            if (!state.regime_history[symbol]) state.regime_history[symbol] = [];
+
+            const history = state.regime_history[symbol];
+            history.push({ regime: candidateRegime, ts: Date.now() });
+            if (history.length > 10) history.shift();
+
+            const recentHistory = history.slice(-V5_CONFIRM_BARS);
+            const matchCount    = recentHistory.filter(h => h.regime === candidateRegime).length;
+            const needed        = Math.min(V5_CONFIRM_BARS, recentHistory.length);
+
+            let confirmedRegime;
+            let isConfirmed = false;
+
+            if (candidateRegime === lastRegime) {
+              confirmedRegime = candidateRegime;
+              isConfirmed = true;
+            } else if (needed === 0) {
+              confirmedRegime = candidateRegime;
+              isConfirmed = true;
+            } else if (matchCount >= needed) {
+              confirmedRegime = candidateRegime;
+              isConfirmed = true;
+            } else {
+              confirmedRegime = lastRegime;
+              isConfirmed = false;
+            }
+
+            if (!state.regime_state) state.regime_state = {};
+            if (!state.regime_last_update) state.regime_last_update = {};
+
+            state.regime_state[symbol] = confirmedRegime;
+            state.regime_last_update[symbol] = Date.now();
+
+            const detail = `ATR=${atrPercent.toFixed(2)}% slope=${slopePct.toFixed(3)}% range=${rangePct.toFixed(2)}% confirm=${matchCount}/${needed}`;
+
+            return {
+              regime: confirmedRegime,
+              candidate: candidateRegime,
+              confirmed: isConfirmed,
+              slopePct,
+              atrPercent,
+              rangePct,
+              slopeThreshold: V5_SLOPE_THRESHOLD, // returned for downstream Volatile mapping (Bug 2 fix)
+              detail
+            };
+          }
 
           const computeMTFIndicators=(km,weights)=>{ const TFs=["1m","3m","5m","15m","30m","1h","2h","4h","12h","1d"]; const wNorm=(()=>{ let out={}; let sw=0; for(const tf of TFs){ const w=+((weights&&weights[tf])||0); if(w>0){ out[tf]=w; sw+=w; } } if(sw<=0){ out={"1m":0.08,"3m":0.08,"5m":0.12,"15m":0.15,"30m":0.12,"1h":0.12,"2h":0.10,"4h":0.08,"12h":0.07,"1d":0.08}; sw=1; } for(const k of Object.keys(out)) out[k]=out[k]/sw; return out; })();
             const perTF={}; const agg={ rsi:0, adx:0, atr_bps:0, roc1:0, roc3:0 }; let ww=0; const retSeries={};
@@ -329,7 +506,12 @@ jobs:
               LONG_BOUNCE_SL_ATR, LONG_BOUNCE_TP_ATR, LONG_SIMILARITY_RHO, TOP_N, MAX_SPREAD_BPS,
               EXP_LCB_MIN_BPS_BASE, COST_BPS, NOTIONAL, DEPTH_LIMIT, OBI_TOPN, MIN_TF_ALIGN, TF_WEIGHTS,
               IDEAL_VOL_1H_PCT, IDEAL_FUNDING_RATE, IDEAL_OI_DELTA_PCT, IDEAL_VOLUME_1H_USD,
-              WEIGHT_VOL_1H, WEIGHT_FUNDING, WEIGHT_OI_DELTA, WEIGHT_VOLUME
+              WEIGHT_VOL_1H, WEIGHT_FUNDING, WEIGHT_OI_DELTA, WEIGHT_VOLUME,
+              REG_INTERVAL: process.env.REG_INTERVAL, REG_LIMIT: process.env.REG_LIMIT,
+              REG_SLOPE_THRESHOLD: process.env.REG_SLOPE_THRESHOLD, SLOPE_EXIT_RATIO: process.env.SLOPE_EXIT_RATIO,
+              REG_RANGING_THRESHOLD: process.env.REG_RANGING_THRESHOLD, REG_RANGE_THRESHOLD: process.env.REG_RANGE_THRESHOLD,
+              ATR_VOLATILE_THRESHOLD: process.env.ATR_VOLATILE_THRESHOLD, REG_CONFIRM_BARS: process.env.REG_CONFIRM_BARS,
+              MIN_ALT_SCORE: process.env.MIN_ALT_SCORE
             };
             return hashObj(knobs);
           }catch{ return "cfg-unknown"; } })();
@@ -798,14 +980,19 @@ jobs:
           // ⚠️ THIS SECTION IS 100% UNCHANGED FROM ORIGINAL
           async function loadState(){
             const token=process.env.GIST_TOKEN, id=process.env.GIST_ID;
-            const init={ v:"binance-hedge-7.0",  // ← CHANGED version string
+            const init={ v:"binance-hedge-7.0",
               run_counter: 0,
               cooldown:{}, cooldown_side:{}, pending:[], equity:[], closed:[],
               mr_lockout:{}, sym_stats:{}, sym_stats_real:{}, calibCoeffs:{}, lastReconcileTs:0,
               calibration_holdout:[],
               learned_trade_keys: [],
               calib_symbol_counts: {},
-              calib_last_version: CALIB_VERSION
+              calib_last_version: CALIB_VERSION,
+
+              // V5 Regime State
+              regime_state: {},
+              regime_history: {},
+              regime_last_update: {}
             };
             if(!token||!id) return { state:init, persist:null };
             try{
@@ -832,6 +1019,9 @@ jobs:
               if (!Array.isArray(s.learned_trade_keys)) s.learned_trade_keys = [];
               if (!s.calib_symbol_counts) s.calib_symbol_counts = {};
               if (s.run_counter == null) s.run_counter = 0;
+              if (!s.regime_state) s.regime_state = {};
+              if (!s.regime_history) s.regime_history = {};
+              if (!s.regime_last_update) s.regime_last_update = {};
 
               if (s.calib_last_version !== CALIB_VERSION) {
                 log(`🔄 Calibration version change: ${s.calib_last_version} → ${CALIB_VERSION}`);
@@ -923,6 +1113,11 @@ jobs:
               return { ...rc, learned, learned_at_ts };
             });
             
+            // Merge regime state (local wins per-symbol on conflict — same run typically owns fresh data)
+            merged.regime_state = { ...(remote.regime_state || {}), ...(local.regime_state || {}) };
+            merged.regime_history = { ...(remote.regime_history || {}), ...(local.regime_history || {}) };
+            merged.regime_last_update = { ...(remote.regime_last_update || {}), ...(local.regime_last_update || {}) };
+
             merged.version_ts = Date.now();
 
             log("[gha] mergeStates: remote_pending_after_drops", remotePending.length,
@@ -1531,6 +1726,11 @@ jobs:
               state.learned_trade_keys = [];
               state.calib_symbol_counts = {};
               state.calib_last_version = CALIB_VERSION;
+
+              // V5 regime state reset
+              state.regime_state = {};
+              state.regime_history = {};
+              state.regime_last_update = {};
               
               log("♻️  State reset to fresh. Continuing with idea generation...");
             }
@@ -1544,6 +1744,30 @@ jobs:
             // 🗑️  Keep only last 10 closed trades AFTER learning
             cleanExpiredClosedTrades(state);
 
+            // Clean old regime state (keep only last 300 symbols)
+            if (state.regime_state && Object.keys(state.regime_state).length > 300) {
+              const sorted = Object.entries(state.regime_last_update || {})
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 300)
+                .map(x => x[0]);
+              const keep = {};
+              for (const sym of sorted) keep[sym] = state.regime_state[sym];
+              state.regime_state = keep;
+            }
+
+            // Clean old regime history (keep only last 100 symbols)
+            if (state.regime_history && Object.keys(state.regime_history).length > 100) {
+              const sorted = Object.entries(state.regime_last_update || {})
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 100)
+                .map(x => x[0]);
+              const keep = {};
+              for (const sym of sorted) {
+                if (state.regime_history[sym]) keep[sym] = state.regime_history[sym];
+              }
+              state.regime_history = keep;
+            }
+
             // Preserve cleaned state
             const preserved = {
               v: state.v || "binance-hedge-7.0",
@@ -1556,6 +1780,11 @@ jobs:
               learned_trade_keys: state.learned_trade_keys || [],
               calib_symbol_counts: state.calib_symbol_counts || {},
               calib_last_version: state.calib_last_version || CALIB_VERSION,
+
+              // V5 regime state — preserve across cycles
+              regime_state: state.regime_state || {},
+              regime_history: state.regime_history || {},
+              regime_last_update: state.regime_last_update || {},
               
               pending: [],
               
@@ -1658,6 +1887,37 @@ jobs:
             const btcMetrics = allMetrics.find(m => m.symbol === "BTCUSDT");
             const btcUp1h = btcMetrics ? (btcMetrics.price_change_1h > 0) : true;
             
+            // ========== V5: BATCH PRE-FETCH REGIME CANDLES ==========
+            log("📉 Pre-fetching regime candles for all candidates...");
+            const REG_INTERVAL = Number(process.env.REG_INTERVAL || "3");
+            const REG_LIMIT    = Number(process.env.REG_LIMIT    || "20");
+            const regimeCandlesMap = new Map();
+
+            const REG_BATCH_SIZE = 15;
+            const REG_BATCH_DELAY = 300;
+
+            for (let i = 0; i < topCandidates.length; i += REG_BATCH_SIZE) {
+              const batch = topCandidates.slice(i, i + REG_BATCH_SIZE);
+              const results = await Promise.all(
+                batch.map(async (cand) => {
+                  try {
+                    const urlReg = `${BINANCE_FAPI}/fapi/v1/klines?symbol=${cand.symbol}&interval=${REG_INTERVAL}m&limit=${REG_LIMIT}`;
+                    const kReg = await getJSON(urlReg, 8000, 2);
+                    return { symbol: cand.symbol, candles: Array.isArray(kReg) ? kReg : null };
+                  } catch (e) {
+                    return { symbol: cand.symbol, candles: null };
+                  }
+                })
+              );
+              for (const r of results) {
+                regimeCandlesMap.set(r.symbol, r.candles);
+              }
+              if (i + REG_BATCH_SIZE < topCandidates.length) {
+                await sleep(REG_BATCH_DELAY);
+              }
+            }
+            log(`📉 Regime candles fetched for ${[...regimeCandlesMap.values()].filter(v => v).length}/${topCandidates.length} symbols`);
+
             // ========== DETAILED REFINEMENT WITH BINANCE DATA ==========
             const refined = [];
             
@@ -1692,48 +1952,141 @@ jobs:
                 const d1 = depthWithinPctUSD(depth, mid, 0.01);
                 const depth1pUSD = (d1.asksUSD || 0) + (d1.bidsUSD || 0);
                 
-                // Determine regime based on volatility and funding
-                const regime = (cand.vol_1h_pct >= 1.5 && Math.abs(cand.funding_rate) >= 0.0003) ? "trend" : "meanrevert";
+                // ========== STEP 1: V5 REGIME DETECTION ==========
+                let regime = "meanrevert";
+                let slopeDir = 0;
+                let v5Result = null;
+
+                try {
+                  const kReg = regimeCandlesMap.get(cand.symbol);
+
+                  if (Array.isArray(kReg) && kReg.length >= 15) {
+                    v5Result = detectV5Regime(state, cand.symbol, kReg);
+
+                    if (v5Result.regime === "Trending Up") {
+                      regime = "trend";
+                      slopeDir = 1;
+
+                    } else if (v5Result.regime === "Trending Down") {
+                      regime = "trend";
+                      slopeDir = -1;
+
+                    } else if (v5Result.regime === "Volatile") {
+                      // FIX (Bug 2): only treat Volatile as trend if slope also confirms real direction.
+                      // Otherwise Volatile-without-direction is treated as meanrevert (fade candidate).
+                      if (Math.abs(v5Result.slopePct) > v5Result.slopeThreshold) {
+                        regime = "trend";
+                        slopeDir = v5Result.slopePct >= 0 ? 1 : -1;
+                      } else {
+                        regime = "meanrevert";
+                        slopeDir = v5Result.slopePct >= 0 ? 1 : -1;
+                      }
+
+                    } else {
+                      // Choppy (Ranging is gated out separately in Step 7)
+                      regime = "meanrevert";
+                      slopeDir = v5Result.slopePct >= 0 ? 1 : -1;
+                    }
+
+                    log(`[V5-REG] ${cand.symbol} ${v5Result.regime} (${v5Result.candidate}) ${v5Result.confirmed ? '✓' : '⏳'} ${v5Result.detail}`);
+
+                  } else {
+                    log(`[V5-REG] ${cand.symbol} insufficient data — fallback meanrevert`);
+                  }
+
+                } catch(e) {
+                  log(`[V5-REG] ${cand.symbol} error:`, e?.message || e);
+                  regime = "meanrevert";
+                  slopeDir = 0;
+                }
                 
-                // Get calibrated probabilities
+                // ========== V5 RANGING BLOCK GATE ==========
+                if (v5Result && v5Result.regime === "Ranging") {
+                  log(`[V5-GATE] ${cand.symbol} SKIP: Ranging regime → no trade`);
+                  continue;
+                }
+
+                // ========== STEP 2: MULTI-SIGNAL DIRECTION ==========
+                const priceMom1h = cand.price_change_1h || 0;
+                const momDirection = Math.sign(priceMom1h);
+                const momScore = Math.tanh(Math.abs(priceMom1h) / 0.02) * momDirection;
+
+                const oiDir = Math.sign(cand.oi_delta_pct || 0) * momDirection;
+                const oiScore = Math.tanh((cand.oi_delta_pct || 0) / 10) * oiDir;
+
+                const fundingScore = -Math.sign(cand.funding_rate_raw || 0) *
+                  Math.tanh(Math.abs(cand.funding_rate_raw || 0) / 0.001);
+
+                const volConfirm = Math.tanh((cand.volume_1h_usd || 0) / IDEAL_VOLUME_1H_USD);
+                const btcRegimeScore = btcUp1h ? 0.1 : -0.1;
+
+                const dirEdge = (
+                  momScore     * 0.40 +
+                  oiScore      * 0.25 +
+                  fundingScore * 0.20 +
+                  btcRegimeScore * 0.15
+                ) * (0.5 + 0.5 * volConfirm);
+
+                // ========== STEP 3: FORCED SIDE DECISION ==========
+                let forcedSide = null;
+
+                if (DIRECTION === "long") {
+                  forcedSide = "long";
+                } else if (DIRECTION === "short") {
+                  forcedSide = "short";
+                } else if (regime === "trend") {
+                  // Trend: slope is primary, dirEdge confirms
+                  const slopeConfirmed = (slopeDir > 0 && dirEdge > 0) || (slopeDir < 0 && dirEdge < 0);
+                  forcedSide = slopeDir > 0 ? "long" : "short";
+                  if (!slopeConfirmed) {
+                    log(`[DIR] ${cand.symbol} slope/edge conflict — skipping`);
+                    continue; // skip conflicted signals
+                  }
+                } else {
+                  // Mean revert: funding is primary
+                  if (fundingScore > 0.3) forcedSide = "long";
+                  else if (fundingScore < -0.3) forcedSide = "short";
+                  else forcedSide = dirEdge >= 0 ? "long" : "short";
+                }
+
+                log(`[DIR] ${cand.symbol} regime=${regime} edge=${dirEdge.toFixed(3)} mom=${momScore.toFixed(3)} oi=${oiScore.toFixed(3)} fund=${fundingScore.toFixed(3)} → ${forcedSide}`);
+
+                // ========== STEP 4: CALIBRATED PROBABILITIES ==========
+                const pBase = 0.45 + 0.35 * Math.tanh(cand.vol_1h_pct / 3);
+                const pLong0 = clamp(pBase + dirEdge * 0.25, 0.28, 0.88);
+                const pShort0 = clamp(pBase - dirEdge * 0.25, 0.28, 0.88);
+
                 const coeffL = getCoeffs(state, "long", regime);
                 const coeffS = getCoeffs(state, "short", regime);
                 const nL = Math.max(1, Math.min(500, coeffL?.n || 0));
                 const nS = Math.max(1, Math.min(500, coeffS?.n || 0));
-                
-                // Base probability from golden metrics
-                const pBase = 0.45 + 0.35 * Math.tanh(cand.vol_1h_pct / 3);
-                
-                // Direction bias from funding rate
-                const fundingBias = -Math.sign(cand.funding_rate_raw) * Math.min(0.15, Math.abs(cand.funding_rate_raw) * 100);
-                
-                const pLong0 = clamp(pBase + fundingBias, 0.30, 0.85);
-                const pShort0 = clamp(pBase - fundingBias, 0.30, 0.85);
-                
+
                 const pLong = calibrateP(state, "long", regime, pLong0);
                 const pShort = calibrateP(state, "short", regime, pShort0);
                 const pLong_lcb = wilsonLCB(pLong, nL, WILSON_Z);
                 const pShort_lcb = wilsonLCB(pShort, nS, WILSON_Z);
-                
-                // ATR estimation from 1h volatility
+
+                // ========== STEP 5: BUILD CHOSEN SIDE ONLY ==========
                 const atr_bps = Math.round(cand.vol_1h_pct * 100);
-                
-                // TP/SL based on volatility
                 const MAX_SL_BPS = 80;
-                let candLong = null, candShort = null;
-                
-                if (DIRECTION !== "short") {
+                let chosen = null;
+
+                if (forcedSide === "long" && DIRECTION !== "short") {
                   let tp = Math.round(atr_bps * LONG_BOUNCE_TP_ATR);
                   let sl = Math.round(atr_bps * LONG_BOUNCE_SL_ATR);
                   sl = Math.min(sl, MAX_SL_BPS);
                   tp = Math.max(tp, Math.round(sl * 1.5));
-                  
+
                   const evLCB = Math.round(pLong_lcb * tp - (1 - pLong_lcb) * sl - costLong);
                   const edgeL = tp / Math.max(1, LONG_EDGE_MULT_MIN * costLong);
                   const evScoreL = evLCB / Math.max(8, EXP_LCB_MIN_BPS_BASE);
-                  const viabMultL = clamp(0.5 * clamp(edgeL, 0.3, 1.4) + 0.5 * clamp(evScoreL, 0.3, 1.4), 0.3, 1.3);
-                  
-                  candLong = {
+                  const viabMultL = clamp(
+                    0.5 * clamp(edgeL, 0.3, 1.4) +
+                    0.5 * clamp(evScoreL, 0.3, 1.4),
+                    0.3, 1.3
+                  );
+
+                  chosen = {
                     side: "long",
                     p_lcb: pLong_lcb,
                     p_raw: pLong0,
@@ -1742,24 +2095,35 @@ jobs:
                     tp_bps: tp,
                     sl_bps: sl,
                     cost_bps: costLong,
-                    style: "hedge",
+                    style: regime === "trend" ? "trend_follow" : "mean_revert",
                     regime,
-                    viab_mult: viabMultL
+                    viab_mult: viabMultL,
+                    dir_edge: dirEdge,
+                    dir_signals: {
+                      momentum: +momScore.toFixed(3),
+                      oi_flow: +oiScore.toFixed(3),
+                      funding: +fundingScore.toFixed(3),
+                      slope_dir: slopeDir,
+                      btc_regime: btcRegimeScore
+                    }
                   };
-                }
-                
-                if (DIRECTION !== "long") {
-                  let tp = Math.round(atr_bps * 1.0);
-                  let sl = Math.round(atr_bps * 0.5);
+
+                } else if (forcedSide === "short" && DIRECTION !== "long") {
+                  let tp = Math.round(atr_bps * LONG_BOUNCE_TP_ATR);
+                  let sl = Math.round(atr_bps * LONG_BOUNCE_SL_ATR);
                   sl = Math.min(sl, MAX_SL_BPS);
                   tp = Math.max(tp, Math.round(sl * 1.5));
-                  
+
                   const evLCB = Math.round(pShort_lcb * tp - (1 - pShort_lcb) * sl - costShort);
                   const edgeS = tp / Math.max(1, 4 * costShort);
                   const evScoreS = evLCB / Math.max(8, EXP_LCB_MIN_BPS_BASE);
-                  const viabMultS = clamp(0.5 * clamp(edgeS, 0.3, 1.4) + 0.5 * clamp(evScoreS, 0.3, 1.4), 0.3, 1.3);
-                  
-                  candShort = {
+                  const viabMultS = clamp(
+                    0.5 * clamp(edgeS, 0.3, 1.4) +
+                    0.5 * clamp(evScoreS, 0.3, 1.4),
+                    0.3, 1.3
+                  );
+
+                  chosen = {
                     side: "short",
                     p_lcb: pShort_lcb,
                     p_raw: pShort0,
@@ -1768,17 +2132,20 @@ jobs:
                     tp_bps: tp,
                     sl_bps: sl,
                     cost_bps: costShort,
-                    style: "hedge",
+                    style: regime === "trend" ? "trend_follow" : "mean_revert",
                     regime,
-                    viab_mult: viabMultS
+                    viab_mult: viabMultS,
+                    dir_edge: dirEdge,
+                    dir_signals: {
+                      momentum: +momScore.toFixed(3),
+                      oi_flow: +oiScore.toFixed(3),
+                      funding: +fundingScore.toFixed(3),
+                      slope_dir: slopeDir,
+                      btc_regime: btcRegimeScore
+                    }
                   };
                 }
-                
-                // Choose better side
-                const chosen = candLong && candShort
-                  ? (candLong.exp_lcb_bps >= candShort.exp_lcb_bps ? candLong : candShort)
-                  : (candLong || candShort || null);
-                
+
                 if (!chosen) continue;
                 
                 // ========== FINAL CONFIDENCE CALCULATION ==========
@@ -1870,6 +2237,16 @@ jobs:
             }
             
             log(`🔍 Refined ${refined.length} candidates with execution quality analysis`);
+
+            // ========== V5 MIN_ALT_SCORE GATE ==========
+            const MIN_ALT_SCORE = Number(process.env.MIN_ALT_SCORE || "0");
+            if (MIN_ALT_SCORE > 0) {
+              const beforeFilter = refined.length;
+              const afterFilter = refined.filter(r => r.confidence >= MIN_ALT_SCORE);
+              log(`[V5-GATE] MIN_ALT_SCORE=${MIN_ALT_SCORE} filtered ${beforeFilter - afterFilter.length}/${beforeFilter} symbols`);
+              refined.length = 0;
+              refined.push(...afterFilter);
+            }
 
             // ========== FINAL SELECTION ==========
             refined.sort((a, b) => b.confidence - a.confidence);
