@@ -421,7 +421,7 @@ jobs:
           const MEXC_BASES=[process.env.MEXC_BASE,"https://api.mexc.com","https://www.mexc.com"].filter(Boolean);
           
           // Binance Futures endpoints (public, no API key needed)
-          const BINANCE_FAPI = "httnps://joyful-sawfish-4713.abdulrahmanqhasemlou.deno.net";
+          const BINANCE_FAPI = "https://joyful-sawfish-4713.abdulrahmanqhasemlou.deno.net";
           const BINANCE_SPOT = "https://joyful-sawfish-4713.abdulrahmanqhasemlou.deno.net";
           
           const MIN_TF_ALIGN=(Number(process.env.MIN_TF_ALIGN||"0.60"));
