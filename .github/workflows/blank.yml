@@ -100,7 +100,7 @@ jobs:
           fi
 
           set +e
-          node - <<'NODE'
+          node --input-type=commonjs - <<'NODE'
           (async ()=>{
           'use strict';
           const crypto = require('crypto');
