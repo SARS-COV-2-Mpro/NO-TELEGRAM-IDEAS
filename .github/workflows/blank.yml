@@ -1,4 +1,3 @@
-0
 name: Ideas Pusher (MEXC Ultimate 7.7.7)
 
 on:
@@ -334,7 +333,7 @@ jobs:
           // ══════════════════════════════════════════════
           // BYBIT API (Direct — No Proxy Needed)
           // ══════════════════════════════════════════════
-          const BYBIT_API = "https://lonely-manya-mazetofutures-c11b521d.koyeb.app/mainnet";
+          const BYBIT_API = "https://api.bybit.com";
 
           const MIN_TF_ALIGN=(Number(process.env.MIN_TF_ALIGN||"0.60"));
           let TF_WEIGHTS={}; try{ TF_WEIGHTS=JSON.parse(process.env.TF_WEIGHTS||"{}"); }catch{ TF_WEIGHTS={}; }
@@ -543,7 +542,34 @@ jobs:
           }
 
           // Fetch OI history for delta calculation
-          async function fetchBybitOIHist(symbol) {   const cacheKey = `bybit_oi_hist_${symbol}`;   const cached = getCached(cache.bybit, cacheKey, TTL.bybit);   if (cached) return cached;    try {     const url = `${BYBIT_API}/v5/market/open-interest?category=linear&symbol=${symbol}&intervalTime=1h&limit=3`;     const data = await getJSON(url, 10000, 2);      // IMPORTANT: validate response     if (!data || data.retCode !== 0) return null;      const list = data.result?.list;     if (!Array.isArray(list) || list.length < 2) return null;      // Bybit returns newest first     const current = +list[0]?.openInterest || 0; // contracts     const prev1h  = +list[1]?.openInterest || 0;     const prev2h  = list[2] ? (+list[2]?.openInterest || prev1h) : prev1h;      const oiDelta1h = prev1h > 0 ? ((current - prev1h) / prev1h) : 0;     const oiDelta2h = prev2h > 0 ? ((current - prev2h) / prev2h) : 0;      const result = {       symbol,       currentOI: current,       prev1hOI: prev1h,       oiDelta1hPct: Math.abs(oiDelta1h) * 100,       oiDelta2hPct: Math.abs(oiDelta2h) * 100,       oiDelta1hRaw: oiDelta1h,       ts: Date.now()     };      setCached(cache.bybit, cacheKey, result);     return result;   } catch (e) {     return null;   } }
+          async function fetchBybitOIHist(symbol) {
+            const cacheKey = `bybit_oi_hist_${symbol}`;
+            const cached = getCached(cache.bybit, cacheKey, TTL.bybit);
+            if (cached) return cached;
+            try {
+              const url = `${BYBIT_API}/v5/market/open-interest?category=linear&symbol=${symbol}&intervalTime=1h&limit=3`;
+              const data = await getJSON(url, 10000, 2);
+              if (!data?.result?.list || data.result.list.length < 2) return null;
+              const list = data.result.list;
+              // Bybit returns newest first
+              const current = +list[0]?.openInterestValue || 0;
+              const prev1h  = +list[1]?.openInterestValue || 0;
+              const prev2h  = list[2] ? +list[2]?.openInterestValue : prev1h;
+              const oiDelta1h = prev1h > 0 ? ((current - prev1h) / prev1h) : 0;
+              const oiDelta2h = prev2h > 0 ? ((current - prev2h) / prev2h) : 0;
+              const result = {
+                symbol,
+                currentOI_USD: current,
+                prev1hOI_USD: prev1h,
+                oiDelta1hPct: Math.abs(oiDelta1h) * 100,
+                oiDelta2hPct: Math.abs(oiDelta2h) * 100,
+                oiDelta1hRaw: oiDelta1h,
+                ts: Date.now()
+              };
+              setCached(cache.bybit, cacheKey, result);
+              return result;
+            } catch (e) { return null; }
+          }
 
           // Fetch orderbook for OBI and slip
           async function fetchBybitDepth(symbol) {
