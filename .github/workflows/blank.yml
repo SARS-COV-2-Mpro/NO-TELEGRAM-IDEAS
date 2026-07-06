@@ -1068,7 +1068,7 @@ jobs:
             // ========== BATCH PRE-FETCH REGIME CANDLES (BYBIT) ==========
             log("📉 Pre-fetching regime candles...");
             const REG_INTERVAL=Number(process.env.REG_INTERVAL||"3");
-            const REG_LIMIT=Number(process.env.REG_LIMIT||"20");
+            const REG_LIMIT=Math.max(30, Number(process.env.REG_LIMIT||"60"));
             const regimeCandlesMap=new Map();
             const REG_BATCH_SIZE=15, REG_BATCH_DELAY=300;
 
@@ -1083,7 +1083,7 @@ jobs:
               for(const r of results) regimeCandlesMap.set(r.symbol,r.candles);
               if(i+REG_BATCH_SIZE<topCandidates.length) await sleep(REG_BATCH_DELAY);
             }
-            log(`📉 Regime candles fetched for ${[...regimeCandlesMap.values()].filter(v=>v).length}/${topCandidates.length} symbols`);
+            const validCandleCounts=[...regimeCandlesMap.values()].map(v=>Array.isArray(v)?v.length:0); const sufficientCount=validCandleCounts.filter(len=>len>=15).length; log(`📉 Regime candles: ${sufficientCount}/${topCandidates.length} symbols have sufficient data (avg=${Math.round(mean(validCandleCounts))} candles, min=${Math.min(...validCandleCounts)}, max=${Math.max(...validCandleCounts)})`);
 
             // ========== DETAILED REFINEMENT ==========
             const refined=[];
@@ -1110,16 +1110,8 @@ jobs:
                 let regime="meanrevert", slopeDir=0, v5Result=null;
                 try{
                   const kReg=regimeCandlesMap.get(cand.symbol);
-                  if(Array.isArray(kReg)&&kReg.length>=15){
-                    v5Result=detectV5Regime(state,cand.symbol,kReg);
-                    if(v5Result.regime==="Trending Up"){ regime="trend"; slopeDir=1; }
-                    else if(v5Result.regime==="Trending Down"){ regime="trend"; slopeDir=-1; }
-                    else if(v5Result.regime==="Volatile"){
-                      if(Math.abs(v5Result.slopePct)>v5Result.slopeThreshold){ regime="trend"; slopeDir=v5Result.slopePct>=0?1:-1; }
-                      else{ regime="meanrevert"; slopeDir=v5Result.slopePct>=0?1:-1; }
-                    } else { regime="meanrevert"; slopeDir=v5Result.slopePct>=0?1:-1; }
-                    log(`[V5-REG] ${cand.symbol} ${v5Result.regime} (${v5Result.candidate}) ${v5Result.confirmed?'✓':'⏳'} ${v5Result.detail}`);
-                  } else { log(`[V5-REG] ${cand.symbol} insufficient data — fallback meanrevert`); }
+                  if(Array.isArray(kReg)&&kReg.length>=15){   v5Result=detectV5Regime(state,cand.symbol,kReg);   if(v5Result.regime==="Trending Up"){ regime="trend"; slopeDir=1; }   else if(v5Result.regime==="Trending Down"){ regime="trend"; slopeDir=-1; }   else if(v5Result.regime==="Volatile"){     if(Math.abs(v5Result.slopePct)>v5Result.slopeThreshold){ regime="trend"; slopeDir=v5Result.slopePct>=0?1:-1; }     else{ regime="meanrevert"; slopeDir=v5Result.slopePct>=0?1:-1; }   } else { regime="meanrevert"; slopeDir=v5Result.slopePct>=0?1:-1; }   log(`[V5-REG] ${cand.symbol} ${v5Result.regime} (${v5Result.candidate}) ${v5Result.confirmed?'✓':'⏳'} ${v5Result.detail}`); } else {   log(`[V5-REG] ${cand.symbol} insufficient data (got ${Array.isArray(kReg)?kReg.length:0} candles, need >=15, limit requested=${REG_LIMIT}) — fallback meanrevert`); }
+
                 }catch(e){ log(`[V5-REG] ${cand.symbol} error:`,e?.message||e); regime="meanrevert"; slopeDir=0; }
 
                 // Ranging gate
