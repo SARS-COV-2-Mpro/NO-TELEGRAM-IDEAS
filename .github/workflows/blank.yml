@@ -1137,7 +1137,10 @@ jobs:
                   forcedSide=slopeDir>0?"long":"short";
                   if(!slopeConfirmed){ log(`[DIR] ${cand.symbol} slope/edge conflict — skipping`); continue; }
                 
-                } else {   if(fundingScore>0.4) forcedSide="long"; // High negative funding -> squeeze -> long   else if(fundingScore<-0.4) forcedSide="short";   // FADE the edge: if it just pumped (dirEdge > 0), we SHORT the top.   else forcedSide=dirEdge>=0?"short":"long";  }
+                } else { 
+                if(fundingScore>0.4) forcedSide="long"; // High negative funding -> squeeze -> long
+                else if(fundingScore<-0.4) forcedSide="short";  
+                else forcedSide=dirEdge>=0?"short":"long";  }
             
                 log(`[DIR] ${cand.symbol} regime=${regime} edge=${dirEdge.toFixed(3)} → ${forcedSide}`);
 
