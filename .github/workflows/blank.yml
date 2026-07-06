@@ -552,18 +552,14 @@ jobs:
               if (!data?.result?.list || data.result.list.length < 2) return null;
               const list = data.result.list;
               // Bybit returns newest first
-              const current = +list[0]?.openInterestValue || 0;
-              const prev1h  = +list[1]?.openInterestValue || 0;
-              const prev2h  = list[2] ? +list[2]?.openInterestValue : prev1h;
-              const oiDelta1h = prev1h > 0 ? ((current - prev1h) / prev1h) : 0;
-              const oiDelta2h = prev2h > 0 ? ((current - prev2h) / prev2h) : 0;
+              const currentContracts = +list[0]?.openInterest || 0;
+              const prev1hContracts  = +list[1]?.openInterest || 0;
+              const prev2hContracts  = list[2] ? +list[2]?.openInterest : prev1hContracts;
               const result = {
                 symbol,
-                currentOI_USD: current,
-                prev1hOI_USD: prev1h,
-                oiDelta1hPct: Math.abs(oiDelta1h) * 100,
-                oiDelta2hPct: Math.abs(oiDelta2h) * 100,
-                oiDelta1hRaw: oiDelta1h,
+                currentContracts,
+                prev1hContracts,
+                prev2hContracts,
                 ts: Date.now()
               };
               setCached(cache.bybit, cacheKey, result);
@@ -631,15 +627,32 @@ jobs:
               ]);
               if (!ticker) return null;
               const vol1hPct = Math.abs(ticker.price1hPcnt) * 100;
+              const mid = ticker.markPrice || ticker.lastPrice;
+
+              let oi_delta_pct = 0, oi_delta_1h_pct = 0;
+              let current_oi_usd = ticker.openInterestValue;
+
+              if (oiHist && mid > 0) {
+                const currentOI  = oiHist.currentContracts * mid;
+                const prev1hOI   = oiHist.prev1hContracts  * mid;
+                const prev2hOI   = oiHist.prev2hContracts * mid;
+                const oiDelta1h  = prev1hOI > 0 ? ((currentOI - prev1hOI) / prev1hOI) : 0;
+                const oiDelta2h  = prev2hOI > 0 ? ((currentOI - prev2hOI) / prev2hOI) : 0;
+                oi_delta_1h_pct  = Math.abs(oiDelta1h) * 100;
+                const oi_delta_2h_pct  = Math.abs(oiDelta2h) * 100;
+                oi_delta_pct     = Math.max(oi_delta_1h_pct, oi_delta_2h_pct);
+                current_oi_usd   = currentOI;
+              }
+
               return {
                 symbol,
                 vol_1h_pct: vol1hPct,
                 price_change_1h: ticker.price1hPcnt,
                 funding_rate: Math.abs(ticker.fundingRate),
                 funding_rate_raw: ticker.fundingRate,
-                oi_delta_pct: Math.max(oiHist?.oiDelta1hPct || 0, oiHist?.oiDelta2hPct || 0),
-                oi_delta_1h_pct: oiHist?.oiDelta1hPct || 0,
-                current_oi_usd: oiHist?.currentOI_USD || ticker.openInterestValue || 0,
+                oi_delta_pct,
+                oi_delta_1h_pct,
+                current_oi_usd,
                 volume_1h_usd: ticker.turnover24h / 24, // estimate 1h from 24h
                 turnover_24h: ticker.turnover24h,
                 mark_price: ticker.markPrice || ticker.lastPrice,
