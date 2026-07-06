@@ -84,10 +84,10 @@ jobs:
       GIT_SHA: ${{ github.sha }}
 
     steps:
-      - name: Setup Node 20
+      - name: Setup Node 24
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
 
       - name: Run pusher (always-push + clear logs)
         shell: bash
