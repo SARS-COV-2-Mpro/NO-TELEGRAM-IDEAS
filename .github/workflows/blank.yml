@@ -820,9 +820,10 @@ jobs:
                 // ── ATR REALITY CHECK ──
                 if(v5Result&&v5Result.atrPercent<ATR_MIN_PCT){ log(`[ATR-GATE] ${cand.symbol} skipped: 3min ATR=${v5Result.atrPercent.toFixed(2)}% < ${ATR_MIN_PCT}% minimum`); continue; }
 
-                // ── REGIME MISCLASSIFICATION GUARD ──
-                const suspiciousRegime=v5Result&&v5Result.atrPercent>4.0&&regime==="meanrevert";
-                if(suspiciousRegime){ log(`[REG-GATE] ${cand.symbol} skipped: ATR=${v5Result.atrPercent.toFixed(2)}% too high for meanrevert — likely misclassified`); continue; }
+               
+                // ── REGIME MISCLASSIFICATION GUARD ── 
+                const suspiciousRegime=v5Result&&v5Result.atrPercent>4.0&&regime==="meanrevert"; if(suspiciousRegime){ log(`[REG-GATE] ${cand.symbol} skipped: ATR=${v5Result.atrPercent.toFixed(2)}% too high for meanrevert — likely misclassified`); continue; }  // ── EXTREME VOLATILITY GATE (trend mode) ── const extremeVolTrend=v5Result&&v5Result.atrPercent>4.5&&regime==="trend"; if(extremeVolTrend){ log(`[VOL-EXTREME] ${cand.symbol} skipped: ATR=${v5Result.atrPercent.toFixed(2)}% too extreme even for trend — late entry risk`); continue; }
+
 
                 // ── REGIME LAG COMPENSATION ──
                 const regimeLagRisk=v5Result&&regime==="meanrevert"&&Math.abs(v5Result.slopePct)>0.20;
