@@ -1063,7 +1063,7 @@ jobs:
             const MAX_DETAILED=30;
             const topCandidates=allMetrics.slice(0,MAX_DETAILED);
             const btcMetrics=allMetrics.find(m=>m.symbol==="BTCUSDT");
-            const btcUp1h=btcMetrics?(btcMetrics.price_change_1h>0):true;
+            const btcUp1h=btcMetrics?(btcMetrics.price_change_1h>0):true; const btcCrash=btcMetrics?Math.abs(btcMetrics.price_change_1h)>0.05:false; if(btcCrash){   log(`🚨 BTC CIRCUIT BREAKER: BTC moved ${(btcMetrics.price_change_1h*100).toFixed(2)}% in 1h — skipping all LONG ideas`); }
 
             // ========== BATCH PRE-FETCH REGIME CANDLES (BYBIT) ==========
             log("📉 Pre-fetching regime candles...");
@@ -1102,7 +1102,7 @@ jobs:
                 const sideSlipS=slipFromDepth(depth,mid,"short",NOTIONAL);
                 const slipL=sideSlipL?.slip_bps??Math.round(spreadBps/2);
                 const slipS=sideSlipS?.slip_bps??Math.round(spreadBps/2);
-                const costLong=COST_BPS+slipL, costShort=COST_BPS+slipS;
+                const costLong=COST_BPS+slipL, costShort=COST_BPS+slipS; // Liquidity gate: if spread is too wide, effective SL is much tighter than intended if(spreadBps>20){   log(`[LIQ-GATE] ${cand.symbol} skipped: spread=${spreadBps}bps too wide (max 20bps)`);   continue; } // Depth gate: if not enough liquidity within 1% to fill our order if(depth1pUSD<10000){   log(`[LIQ-GATE] ${cand.symbol} skipped: depth1p=$${Math.round(depth1pUSD)} too thin`);   continue; }
                 const d1=depthWithinPctUSD(depth,mid,0.01);
                 const depth1pUSD=(d1.asksUSD||0)+(d1.bidsUSD||0);
 
@@ -1115,7 +1115,7 @@ jobs:
                 }catch(e){ log(`[V5-REG] ${cand.symbol} error:`,e?.message||e); regime="meanrevert"; slopeDir=0; }
 
                 // Ranging gate
-                if(v5Result&&v5Result.regime==="Ranging"){ log(`[V5-GATE] ${cand.symbol} SKIP: Ranging`); continue; }
+                if(v5Result&&v5Result.regime==="Ranging"){ log(`[V5-GATE] ${cand.symbol} SKIP: Ranging`); continue; } // Misclassification guard: if ATR is extreme but regime says Choppy, treat as dangerous const suspiciousRegime=v5Result&&v5Result.atrPercent>4.0&&regime==="meanrevert"; if(suspiciousRegime){   log(`[REG-GATE] ${cand.symbol} skipped: ATR=${v5Result.atrPercent.toFixed(2)}% too high for meanrevert label`);   continue; } // Misclassification guard: if ATR is extreme but regime says Choppy, treat as dangerous const suspiciousRegime=v5Result&&v5Result.atrPercent>4.0&&regime==="meanrevert"; if(suspiciousRegime){   log(`[REG-GATE] ${cand.symbol} skipped: ATR=${v5Result.atrPercent.toFixed(2)}% too high for meanrevert label`);   continue; }
 
                 // ========== STEP 2: DIRECTION ==========
                 const priceMom1h=cand.price_change_1h||0;
@@ -1123,7 +1123,7 @@ jobs:
                 const momScore=Math.tanh(Math.abs(priceMom1h)/0.02)*momDirection;
                 const oiDir=Math.sign(cand.oi_delta_pct||0)*momDirection;
                 const oiScore=Math.tanh((cand.oi_delta_pct||0)/10)*oiDir;
-                const fundingScore=-Math.sign(cand.funding_rate_raw||0)*Math.tanh(Math.abs(cand.funding_rate_raw||0)/0.001);
+                const fundingScore=-Math.sign(cand.funding_rate_raw||0)*Math.tanh(Math.abs(cand.funding_rate_raw||0)/0.001); // Funding manipulation gate: funding > 0.5% per 8h is abnormal — cap its influence const fundingExtreme=Math.abs(cand.funding_rate_raw||0)>0.005; if(fundingExtreme){   log(`[FUND-GATE] ${cand.symbol} WARNING: extreme funding=${(cand.funding_rate_raw*100).toFixed(3)}% — reducing weight`); } const fundingWeight=fundingExtreme?0.05:0.20; const dirEdge=(momScore*0.40+oiScore*0.25+fundingScore*fundingWeight+btcRegimeScore*0.15)*(0.5+0.5*volConfirm); // Funding manipulation gate: funding > 0.5% per 8h is abnormal — cap its influence const fundingExtreme=Math.abs(cand.funding_rate_raw||0)>0.005; if(fundingExtreme){   log(`[FUND-GATE] ${cand.symbol} WARNING: extreme funding=${(cand.funding_rate_raw*100).toFixed(3)}% — reducing weight`); } const fundingWeight=fundingExtreme?0.05:0.20; const dirEdge=(momScore*0.40+oiScore*0.25+fundingScore*fundingWeight+btcRegimeScore*0.15)*(0.5+0.5*volConfirm);
                 const volConfirm=Math.tanh((cand.volume_1h_usd||0)/IDEAL_VOLUME_1H_USD);
                 const btcRegimeScore=btcUp1h?0.1:-0.1;
                 const dirEdge=(momScore*0.40+oiScore*0.25+fundingScore*0.20+btcRegimeScore*0.15)*(0.5+0.5*volConfirm);
@@ -1142,7 +1142,7 @@ jobs:
                 else if(fundingScore<-0.4) forcedSide="short";  
                 else forcedSide=dirEdge>=0?"short":"long";  }
             
-                log(`[DIR] ${cand.symbol} regime=${regime} edge=${dirEdge.toFixed(3)} → ${forcedSide}`);
+                log(`[DIR] ${cand.symbol} regime=${regime} edge=${dirEdge.toFixed(3)} → ${forcedSide}`); if(Math.abs(dirEdge) < 0.15){   log(`[EDGE-GATE] ${cand.symbol} skipped: edge=${dirEdge.toFixed(3)} too weak (min 0.15)`);   continue; }
 
                 // ========== STEP 4: PROBABILITIES ==========
                 const pBase=0.45+0.35*Math.tanh(cand.vol_1h_pct/3);
@@ -1158,7 +1158,7 @@ jobs:
                 const MAX_SL_BPS=80;
                 let chosen=null;
 
-                if(forcedSide==="long"&&DIRECTION!=="short"){
+                if(btcCrash && forcedSide==="long"){   log(`[BTC-GATE] ${cand.symbol} skipped: no longs during BTC crash`);   continue; } if(forcedSide==="long"&&DIRECTION!=="short"){
                   let tp=Math.round(atr_bps*LONG_BOUNCE_TP_ATR), sl=Math.round(atr_bps*LONG_BOUNCE_SL_ATR);
                   sl=Math.min(sl,MAX_SL_BPS); tp=Math.max(tp,Math.round(sl*1.5));
                   const evLCB=Math.round(pLong_lcb*tp-(1-pLong_lcb)*sl-costLong);
@@ -1189,7 +1189,7 @@ jobs:
                 const finalConf=Math.round(baseConf*spreadMult*depthMult*slipMult*oiMult*evMult*btcMult*fundingAlignBonus);
                 const reasons=reasonBuilder({ vol_1h_pct:cand.vol_1h_pct, funding_rate:cand.funding_rate, oi_delta_pct:cand.oi_delta_pct, volume_1h_usd:cand.volume_1h_usd, basis_bps:cand.basis_bps });
 
-                                if(cand.vol_1h_pct < 2.0){                   log(`[VOL-GATE] ${cand.symbol} skipped: vol1h=${cand.vol_1h_pct.toFixed(2)}% < 2.0% minimum`);                   continue;                 }                 refined.push({
+                                if(cand.vol_1h_pct < DYNAMIC_VOL_GATE){   log(`[VOL-GATE] ${cand.symbol} skipped: vol1h=${cand.vol_1h_pct.toFixed(2)}% < ${DYNAMIC_VOL_GATE}%`);   continue; } // Pump and dump gate: extreme vol spike + extreme OI spike = likely manipulation const isPumpDump=cand.vol_1h_pct>15&&cand.oi_delta_pct>25; if(isPumpDump){   log(`[PND-GATE] ${cand.symbol} skipped: suspicious vol=${cand.vol_1h_pct.toFixed(1)}% + oi_delta=${cand.oi_delta_pct.toFixed(1)}%`);   continue; }                 refined.push({
                 
                   symbol:cand.symbol, base:cand.base, quote:cand.quote,
                   side:chosen.side, p_lcb:+chosen.p_lcb.toFixed(3), p_raw:+chosen.p_raw.toFixed(3),
@@ -1221,7 +1221,7 @@ jobs:
 
             // Final selection
             refined.sort((a,b)=>b.confidence-a.confidence);
-            const TARGET_TOP_N=Math.max(1,TOP_N||3);
+            const TARGET_TOP_N=medianVol<1.0?1:medianVol<1.5?2:Math.max(1,TOP_N||3); log(`📊 Dynamic TOP_N=${TARGET_TOP_N} (market median vol=${medianVol.toFixed(2)}%)`);
             const selected=[];
             for(const cand of refined){
               if(selected.length>=TARGET_TOP_N) break;
