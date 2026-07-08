@@ -822,7 +822,7 @@ jobs:
                 }catch(e){ log(`[V5-REG] ${cand.symbol} error:`,e?.message||e); regime="meanrevert"; slopeDir=0; }
 
                 // ── RANGING GATE ──
-                if(v5Result&&v5Result.regime==="Ranging"){ log(`[V5-GATE] ${cand.symbol} SKIP: Ranging`); continue; }                  // ── ATR REALITY CHECK ──                 if(v5Result&&v5Result.atrPercent<0.7){                   log(`[ATR-GATE] ${cand.symbol} skipped: 3min ATR=${v5Result.atrPercent.toFixed(2)}% too small for targets`);                   continue;                 }                  // ── REGIME MISCLASSIFICATION GUARD ──                 const suspiciousRegime=v5Result&&v5Result.atrPercent>4.0&&regime==="meanrevert";                 if(suspiciousRegime){ log(`[REG-GATE] ${cand.symbol} skipped: ATR=${v5Result.atrPercent.toFixed(2)}% too high for meanrevert — likely misclassified`); continue; }
+                if(v5Result&&v5Result.regime==="Ranging"){ log(`[V5-GATE] ${cand.symbol} SKIP: Ranging`); continue; }                  // ── ATR REALITY CHECK ──                 if(v5Result&&v5Result.atrPercent<0.80){                   log(`[ATR-GATE] ${cand.symbol} skipped: 3min ATR=${v5Result.atrPercent.toFixed(2)}% too small for targets`);                   continue;                 }                  // ── REGIME MISCLASSIFICATION GUARD ──                 const suspiciousRegime=v5Result&&v5Result.atrPercent>4.0&&regime==="meanrevert";                 if(suspiciousRegime){ log(`[REG-GATE] ${cand.symbol} skipped: ATR=${v5Result.atrPercent.toFixed(2)}% too high for meanrevert — likely misclassified`); continue; }
 
                
                 // ── DIRECTION CALCULATION ──
