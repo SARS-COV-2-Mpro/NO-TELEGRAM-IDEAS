@@ -1189,7 +1189,8 @@ jobs:
                 const finalConf=Math.round(baseConf*spreadMult*depthMult*slipMult*oiMult*evMult*btcMult*fundingAlignBonus);
                 const reasons=reasonBuilder({ vol_1h_pct:cand.vol_1h_pct, funding_rate:cand.funding_rate, oi_delta_pct:cand.oi_delta_pct, volume_1h_usd:cand.volume_1h_usd, basis_bps:cand.basis_bps });
 
-                refined.push({
+                                if(cand.vol_1h_pct < 2.0){                   log(`[VOL-GATE] ${cand.symbol} skipped: vol1h=${cand.vol_1h_pct.toFixed(2)}% < 2.0% minimum`);                   continue;                 }                 refined.push({
+                
                   symbol:cand.symbol, base:cand.base, quote:cand.quote,
                   side:chosen.side, p_lcb:+chosen.p_lcb.toFixed(3), p_raw:+chosen.p_raw.toFixed(3),
                   exp_bps:chosen.ev_bps, exp_lcb_bps:chosen.exp_lcb_bps,
