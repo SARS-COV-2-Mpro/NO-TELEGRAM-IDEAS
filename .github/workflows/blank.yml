@@ -1286,7 +1286,7 @@ jobs:
             // Size scaling on high vol
             try{
               const maxVolPick=Math.max(...picks.map(p=>p.predicted?.vol_1h_pct||1));
-              if(maxVolPick>5){ const scale=clamp(5/maxVolPick,0.4,1); picks=picks.map(p=>({...p,size_bps:Math.max(4,Math.round(p.size_bps*scale))})); log("[gha] High volatility detected, scaling sizes by",scale.toFixed(2)); }
+              if(maxVolPick>5){ const scale=clamp(5/maxVolPick,0.65,1); picks=picks.map(p=>({...p,size_bps:Math.max(4,Math.round(p.size_bps*scale))})); log("[gha] High volatility detected, scaling sizes by",scale.toFixed(2)); }
             }catch(e){ log("[gha] Portfolio risk adjustment warn",e?.message||e); }
 
             // Update state
