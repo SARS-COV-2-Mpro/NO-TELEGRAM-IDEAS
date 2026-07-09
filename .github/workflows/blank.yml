@@ -1189,6 +1189,16 @@ jobs:
                   mtfStats.confirmed++;
                 }
 
+                // GATE: Drop if our side has < 50% win probability after MTF check
+                const winProbAfterMTF = cand.side === "long" ? mtf.long_prob_pct : mtf.short_prob_pct;
+                if(winProbAfterMTF < 50) {
+                  log(`[MTF-NEG-EV] ${cand.symbol}: win_prob=${winProbAfterMTF}% < 50% — dropping`);
+                  mtfStats.dropped_low_prob++;
+                  continue;
+                }
+
+                // ── ATTACH MTF DATA ──
+
                 // ── ATTACH MTF DATA ──
                 cand.mtf = {
                   long_prob_pct:  mtf.long_prob_pct,
