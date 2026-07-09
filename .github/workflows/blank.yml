@@ -1139,6 +1139,17 @@ jobs:
                 const d1=depthWithinPctUSD(depth,mid,0.01);
                 const depth1pUSD=(d1.asksUSD||0)+(d1.bidsUSD||0);
 
+                // ★ FIX 1: Hard skip coins crashing today
+                const change24h = cand.price_change_24h || 0;
+                if(change24h < -0.15) {
+                  log(`[CRASH-GATE] ${cand.symbol} HARD SKIP: ${(change24h*100).toFixed(1)}% today — possible exploit/dump`);
+                  continue;
+                }
+                if(change24h > 0.40) {
+                  log(`[PUMP-GATE] ${cand.symbol} HARD SKIP: +${(change24h*100).toFixed(1)}% today — likely dump incoming`);
+                  continue;
+                }
+
                 let liquidityPenalty=1.0;
                 if(spreadBps>MAX_SPREAD_BPS){
                   if(spreadBps>30){ log(`[LIQ-GATE] ${cand.symbol} skipped: spread=${spreadBps}bps (hard limit)`); continue; }
@@ -1193,6 +1204,15 @@ jobs:
                   log(`[ATR-WARN] ${cand.symbol} ATR=${v5Result.atrPercent.toFixed(2)}% penalty=${atrPenalty.toFixed(2)}`);
                 }
 
+                // ★ FIX 3: Skip coins with collapsed volume
+                const vol24h = cand.turnover_24h || 0;
+                const vol1hUsd = cand.volume_1h_usd || 0;
+                const expectedHourlyVol = vol24h / 24;
+                if(expectedHourlyVol > 100000 && vol1hUsd < expectedHourlyVol * 0.05) {
+                  log(`[VOL-COLLAPSE] ${cand.symbol} SKIP: vol1h=$${Math.round(vol1hUsd)} << expected $${Math.round(expectedHourlyVol)}`);
+                  continue;
+                }
+
                 const kReg=regimeCandlesMap.get(cand.symbol);
                 const regCloses=kReg?kReg.map(c=>+c[4]):[];
                 const bbPos=bbPosition(regCloses,20,2.0);
@@ -1214,7 +1234,6 @@ jobs:
                 log(`[DIR] ${cand.symbol} regime=${regime} edge=${dirEdge.toFixed(3)} BB=${bbPos.toFixed(2)} ADX=${adxValue.toFixed(0)} → ${forcedSide.toUpperCase()}`);
                 for(const r of dirResult.reasons.slice(0,3)) log(`  └─ ${r}`);
 
-                // ★ GAP FIX 1: Don't short coins with massive volatility unless ADX confirms
                 const shortingRocket = forcedSide === "short"
                   && (cand.vol_1h_pct > 3.0)
                   && adxValue < 25;
@@ -1223,7 +1242,6 @@ jobs:
                   log(`[ROCKET-WARN] ${cand.symbol} shorting volatile coin with weak ADX=${adxValue.toFixed(0)} — penalizing`);
                 }
 
-                // ★ GAP FIX 1b: Require minimum ADX for trend trades
                 const trendWithWeakADX = regime === "trend" && adxValue < 20;
                 if(trendWithWeakADX) {
                   liquidityPenalty *= 0.60;
@@ -1321,6 +1339,26 @@ jobs:
             log(`🔍 Refined ${refined.length} candidates`);
 
             refined.sort((a,b)=>b.confidence-a.confidence);
+            
+            // ★ FIX 2: Enforce long/short balance
+            const refinedLongs  = refined.filter(r => r.side === "long");
+            const refinedShorts = refined.filter(r => r.side === "short");
+            log(`📊 Refined pool: ${refinedLongs.length} longs, ${refinedShorts.length} shorts`);
+            const balancedPool = [];
+            const topLongs  = refinedLongs.slice(0, 2);
+            const topShorts = refinedShorts.slice(0, 2);
+            for(const c of [...topLongs, ...topShorts]) {
+              balancedPool.push(c);
+            }
+            balancedPool.sort((a,b) => b.confidence - a.confidence);
+            const useBalanced = topLongs.length > 0 && topShorts.length > 0;
+            if(useBalanced) {
+              log(`✅ Balanced pool: ${topLongs.length} longs + ${topShorts.length} shorts`);
+            } else {
+              log(`⚠️ Cannot balance: only ${topLongs.length > 0 ? "LONGS" : "SHORTS"} available`);
+            }
+            if(useBalanced) refined.unshift(...balancedPool.filter(c => !refined.slice(0,4).includes(c)));
+
             const TARGET_TOP_N=Math.max(2, DYNAMIC_TOP_N);
 
             let selected=[];
@@ -1402,7 +1440,6 @@ jobs:
                 }
 
                 // ── GATE 3: OVERRIDE DIRECTION ──
-                // ★ NEW: If MTF wants to flip but confidence < 40%, KEEP original direction
                 if(mtf.overridden && mtf.confidence_pct < 40) {
                   log(`[MTF-KEEP-ORIG] ${cand.symbol}: MTF wants to flip but conf=${mtf.confidence_pct}% < 40% — keeping original ${cand.side.toUpperCase()}`);
                   cand.mtf_overridden = false;
@@ -1429,7 +1466,6 @@ jobs:
                   continue;
                 }
 
-                // override if MTF disagrees AND has enough confidence
                 if(mtf.overridden && mtf.confidence_pct >= MTF_OVERRIDE_MIN_CONF) {
                   log(`[MTF-OVERRIDE] ${cand.symbol}: ${cand.side} → ${mtf.final_side} (conf=${mtf.confidence_pct}% prob=${mtf.final_side==="long"?mtf.long_prob_pct:mtf.short_prob_pct}%)`);
                   const newSide  = mtf.final_side;
@@ -1449,7 +1485,6 @@ jobs:
                   mtfStats.confirmed++;
                 }
 
-                // GATE: Drop if our side has < 50% win probability after MTF check
                 const winProbAfterMTF = cand.side === "long" ? mtf.long_prob_pct : mtf.short_prob_pct;
                 if(winProbAfterMTF < 50) {
                   log(`[MTF-NEG-EV] ${cand.symbol}: win_prob=${winProbAfterMTF}% < 50% — dropping`);
@@ -1469,7 +1504,6 @@ jobs:
                   detail:         mtf.detail
                 };
 
-                // ★ GAP FIX 2: Drop if MTF volume strongly contradicts direction
                 const volSignal = cand.mtf?.signals?.find(s => s.name === "volume_direction");
                 const volScore = volSignal?.score || 0;
                 const volumeStronglyAgainst =
@@ -1481,7 +1515,6 @@ jobs:
                   continue;
                 }
 
-                // ── CONFIDENCE ADJUSTMENT BASED ON MTF ALIGNMENT ──
                 const mtfAlignBonus = (!mtf.overridden && mtf.confidence_pct >= 60) ?  1.08
                                     : (!mtf.overridden && mtf.confidence_pct >= 40) ?  1.03
                                     :  mtf.overridden                               ?  0.92
@@ -1612,7 +1645,7 @@ jobs:
 
             const ideaLogs=picks.map(p=>({ symbol:p.symbol_full, side:p.side, flipped:p.predicted?.flipped||false, confidence:p.confidence, hedge_confidence:p.predicted?.hedge_confidence||0, vol_1h_pct:+(p.predicted?.vol_1h_pct||0).toFixed(2), funding_rate:+(p.predicted?.funding_rate||0).toFixed(5), oi_delta_pct:+(p.predicted?.oi_delta_pct||0).toFixed(1), volume_1h_usd:Math.round((p.predicted?.volume_1h_usd||0)/1e6)+"M", reasons:p.reasons_text, p_cal:+p.p_lcb.toFixed(3), ev_bps:p.ev_bps, idea_id:p.idea_id, mtf_long_prob:p.mtf_analysis?.long_prob_pct??null, mtf_short_prob:p.mtf_analysis?.short_prob_pct??null, mtf_confidence:p.mtf_analysis?.confidence_pct??null, mtf_overridden:p.mtf_overridden||false, mtf_reasons:p.mtf_analysis?.reasons?.slice(0,3)||[] }));
 
-            const meta={ origin:"github_actions", reason, exchange:"bybit_futures", execution_exchange:"bybit_futures", strategy:STRATEGY_NAME, model_version:MODEL_VERSION, schema_version:SCHEMA_VERSION, git_sha:GIT_SHA, config_hash:CONFIG_HASH, counts:{ bybit_universe:bybitSymbols.length, metrics_fetched:allMetrics.length, refined:refined.length, selected_pre_mtf:selected.length, selected_post_mtf:finalSelected.length, mtf_stats:mtfStats, final_picks:picks.length }, dd_gate:{ pnl24_bps, peak_dd_bps, throttle }, tod:{ active:S_H!=null&&E_H!=null, start:S_H, end:E_H }, heartbeat:{ mismatches:0, zombies:0 }, tier:selectionTier, idea_logs:ideaLogs, calibration_health:calibHealth, market_health:{ median_vol:+medianVol.toFixed(2), dynamic_vol_gate:DYNAMIC_VOL_GATE, dynamic_top_n:DYNAMIC_TOP_N, btc_crash:btcCrash, alt_crash:altCrash, alt_pump:altPump, macro_bull:isMacroBull, macro_bear:isMacroBear, fetch_ratio:+fetchRatio.toFixed(3) }, extras:{ v2_ideas:picksV2, features_requested:["maker_join","post_only","futures","hedge_trading","bybit_execution","mtf_direction_analysis_v2","smart_direction_engine","always_trade","gap_fix_rocket_adx","gap_fix_vol_conflict"] } };
+            const meta={ origin:"github_actions", reason, exchange:"bybit_futures", execution_exchange:"bybit_futures", strategy:STRATEGY_NAME, model_version:MODEL_VERSION, schema_version:SCHEMA_VERSION, git_sha:GIT_SHA, config_hash:CONFIG_HASH, counts:{ bybit_universe:bybitSymbols.length, metrics_fetched:allMetrics.length, refined:refined.length, selected_pre_mtf:selected.length, selected_post_mtf:finalSelected.length, mtf_stats:mtfStats, final_picks:picks.length }, dd_gate:{ pnl24_bps, peak_dd_bps, throttle }, tod:{ active:S_H!=null&&E_H!=null, start:S_H, end:E_H }, heartbeat:{ mismatches:0, zombies:0 }, tier:selectionTier, idea_logs:ideaLogs, calibration_health:calibHealth, market_health:{ median_vol:+medianVol.toFixed(2), dynamic_vol_gate:DYNAMIC_VOL_GATE, dynamic_top_n:DYNAMIC_TOP_N, btc_crash:btcCrash, alt_crash:altCrash, alt_pump:altPump, macro_bull:isMacroBull, macro_bear:isMacroBear, fetch_ratio:+fetchRatio.toFixed(3) }, extras:{ v2_ideas:picksV2, features_requested:["maker_join","post_only","futures","hedge_trading","bybit_execution","mtf_direction_analysis_v2","smart_direction_engine","always_trade","gap_fix_rocket_adx","gap_fix_vol_conflict","gap_fix_crash_gate","gap_fix_balance","gap_fix_vol_collapse"] } };
 
             const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta, top_n:picks.length||0, ideas:picks||[] };
             log(`pushing ${picks.length} ideas (${selectionTier}) to ${PUSH_URL}`);
