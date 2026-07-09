@@ -1041,7 +1041,7 @@ jobs:
                 } else {
                   if(fundingScore>0.4) forcedSide="long";
                   else if(fundingScore<-0.4) forcedSide="short";
-                  else forcedSide=dirEdge>=0?"short":"long";
+                  else forcedSide=dirEdge>=0?"long":"short";
                 }
 
                 log(`[DIR] ${cand.symbol} regime=${regime} edge=${dirEdge.toFixed(3)} → ${forcedSide}`);
