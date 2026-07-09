@@ -613,6 +613,225 @@ jobs:
           function buildAuditOutputs(state){ const lastNClosed=(state.closed||[]).slice(-5000); const closedAudit=lastNClosed.map(x=>JSON.stringify(x)).join("\n"); return { closedAudit, disagreements:"", tradesCsv:"" }; }
 
           // ================================================================
+          // MTF DIRECTION ANALYSIS ENGINE
+          // ================================================================
+          async function runMTFDirectionAnalysis(symbol, originalSide, markPrice) {
+            log(`\n🔬 [MTF] Starting deep direction analysis for ${symbol}...`);
+            const result = {
+              symbol,
+              original_side: originalSide,
+              final_side: originalSide,
+              overridden: false,
+              long_prob_pct: 50,
+              short_prob_pct: 50,
+              confidence_pct: 0,
+              signals: [],
+              reasons: [],
+              detail: ""
+            };
+
+            try {
+              // fetch 1min(30 candles=30min), 5min(24 candles=2h), 15min(16 candles=4h) in parallel
+              const [k1m, k5m, k15m] = await Promise.all([
+                fetchBybitKlines(symbol, 1,  30),
+                fetchBybitKlines(symbol, 5,  24),
+                fetchBybitKlines(symbol, 15, 16)
+              ]);
+
+              // ── SIGNAL SCORES ──
+              // each signal returns { name, score (-1 to +1), weight, reason }
+              // positive score = bullish (long), negative = bearish (short)
+              const signals = [];
+
+              // ── 1. SLOPE ALIGNMENT (all 3 timeframes) ──
+              const slope1m  = k1m  && k1m.length  >= 5  ? calcLinearRegressionSlope(k1m.map(c=>+c[4]))  : null;
+              const slope5m  = k5m  && k5m.length  >= 5  ? calcLinearRegressionSlope(k5m.map(c=>+c[4]))  : null;
+              const slope15m = k15m && k15m.length >= 5  ? calcLinearRegressionSlope(k15m.map(c=>+c[4])) : null;
+
+              if(slope5m !== null && slope15m !== null) {
+                const dir5m  = Math.sign(slope5m);
+                const dir15m = Math.sign(slope15m);
+                const aligned = dir5m === dir15m;
+                const score = aligned ? clamp((slope5m + slope15m) / 2 / 0.15, -1, 1) : 0;
+                const reason = aligned
+                  ? `5m slope ${slope5m.toFixed(3)}% and 15m slope ${slope15m.toFixed(3)}% both ${dir5m > 0 ? "BULLISH" : "BEARISH"}`
+                  : `5m slope ${slope5m.toFixed(3)}% CONFLICTS with 15m slope ${slope15m.toFixed(3)}%`;
+                signals.push({ name:"slope_align", score, weight:0.25, reason });
+              }
+
+              if(slope1m !== null && slope5m !== null) {
+                const dir1m = Math.sign(slope1m);
+                const dir5m = Math.sign(slope5m);
+                const score = dir1m === dir5m ? clamp(slope1m / 0.10, -1, 1) : clamp(slope1m / 0.10, -1, 1) * 0.3;
+                const reason = dir1m === dir5m
+                  ? `1m momentum ${slope1m.toFixed(3)}% confirms ${dir1m > 0 ? "UP" : "DOWN"} direction`
+                  : `1m momentum ${slope1m.toFixed(3)}% diverges from 5m — entry timing uncertain`;
+                signals.push({ name:"momentum_1m", score, weight:0.15, reason });
+              }
+
+              // ── 2. RSI ANALYSIS (5min) ──
+              if(k5m && k5m.length >= 16) {
+                const closes5m = k5m.map(c => +c[4]);
+                const rsi5m = rsi(closes5m, 14);
+                if(rsi5m !== null) {
+                  let score = 0, reason = "";
+                  if(rsi5m >= 70)      { score = -0.85; reason = `5m RSI=${rsi5m.toFixed(1)} OVERBOUGHT — short pressure building`; }
+                  else if(rsi5m >= 60) { score = -0.35; reason = `5m RSI=${rsi5m.toFixed(1)} elevated — slight short bias`; }
+                  else if(rsi5m <= 30) { score =  0.85; reason = `5m RSI=${rsi5m.toFixed(1)} OVERSOLD — long bounce likely`; }
+                  else if(rsi5m <= 40) { score =  0.35; reason = `5m RSI=${rsi5m.toFixed(1)} low — slight long bias`; }
+                  else                 { score = (50 - rsi5m) / 50 * 0.2; reason = `5m RSI=${rsi5m.toFixed(1)} neutral zone`; }
+                  signals.push({ name:"rsi_5m", score, weight:0.20, reason });
+                }
+              }
+
+              // ── 3. RSI DIVERGENCE (meanrevert signal on 5min) ──
+              if(k5m && k5m.length >= 16) {
+                const closes5m = k5m.map(c => +c[4]);
+                const highs5m  = k5m.map(c => +c[2]);
+                const lows5m   = k5m.map(c => +c[3]);
+                const rsiSeries = closes5m.map((_, i) => {
+                  if(i < 14) return null;
+                  return rsi(closes5m.slice(0, i + 1), 14);
+                }).filter(r => r !== null);
+
+                if(rsiSeries.length >= 5) {
+                  const recentLows  = lows5m.slice(-5);
+                  const recentHighs = highs5m.slice(-5);
+                  const recentRsi   = rsiSeries.slice(-5);
+                  const priceNewLow = recentLows.at(-1) < Math.min(...recentLows.slice(0,-1));
+                  const priceNewHigh= recentHighs.at(-1) > Math.max(...recentHighs.slice(0,-1));
+                  const rsiRising   = recentRsi.at(-1) > recentRsi.at(-3);
+                  const rsiFalling  = recentRsi.at(-1) < recentRsi.at(-3);
+
+                  if(priceNewLow && rsiRising && recentRsi.at(-1) < 45) {
+                    signals.push({ name:"rsi_divergence", score:0.75, weight:0.15, reason:`Bullish RSI divergence: price new low but RSI ${recentRsi.at(-1).toFixed(1)} rising — reversal signal` });
+                  } else if(priceNewHigh && rsiFalling && recentRsi.at(-1) > 55) {
+                    signals.push({ name:"rsi_divergence", score:-0.75, weight:0.15, reason:`Bearish RSI divergence: price new high but RSI ${recentRsi.at(-1).toFixed(1)} falling — reversal signal` });
+                  } else {
+                    signals.push({ name:"rsi_divergence", score:0, weight:0.15, reason:"No RSI divergence detected" });
+                  }
+                }
+              }
+
+              // ── 4. VOLUME DIRECTION (5min candles) ──
+              if(k5m && k5m.length >= 8) {
+                const last8 = k5m.slice(-8);
+                let bullVol = 0, bearVol = 0;
+                for(const c of last8) {
+                  const open = +c[1], close = +c[4], vol = +c[5];
+                  if(close >= open) bullVol += vol;
+                  else              bearVol += vol;
+                }
+                const totalVol = bullVol + bearVol || 1;
+                const volRatio  = (bullVol - bearVol) / totalVol;
+                const score     = clamp(volRatio * 2, -1, 1);
+                const reason    = `Last 8×5m candles: bull_vol=${(bullVol/totalVol*100).toFixed(0)}% vs bear_vol=${(bearVol/totalVol*100).toFixed(0)}% — ${score > 0.2 ? "buyers dominant" : score < -0.2 ? "sellers dominant" : "balanced"}`;
+                signals.push({ name:"volume_dir", score, weight:0.15, reason });
+              }
+
+              // ── 5. CANDLE BODY STRUCTURE (1min — last 5 candles) ──
+              if(k1m && k1m.length >= 5) {
+                const last5 = k1m.slice(-5);
+                const dirs  = last5.map(c => Math.sign(+c[4] - +c[1]));
+                const bullCount = dirs.filter(d => d > 0).length;
+                const bearCount = dirs.filter(d => d < 0).length;
+                const score = clamp((bullCount - bearCount) / 5, -1, 1);
+                const reason = `Last 5×1m candles: ${bullCount} green, ${bearCount} red — ${bullCount >= 4 ? "strong bull momentum" : bearCount >= 4 ? "strong bear momentum" : "mixed structure"}`;
+                signals.push({ name:"candle_body_1m", score, weight:0.10, reason });
+              }
+
+              // ── 6. PRICE STRUCTURE — Higher Highs / Lower Lows (5min) ──
+              if(k5m && k5m.length >= 8) {
+                const last8highs = k5m.slice(-8).map(c => +c[2]);
+                const last8lows  = k5m.slice(-8).map(c => +c[3]);
+                const hh = last8highs.at(-1) > last8highs.at(-4);
+                const hl = last8lows.at(-1)  > last8lows.at(-4);
+                const lh = last8highs.at(-1) < last8highs.at(-4);
+                const ll = last8lows.at(-1)  < last8lows.at(-4);
+                let score = 0, reason = "";
+                if(hh && hl)       { score =  0.7; reason = "Price structure: Higher Highs + Higher Lows = UPTREND structure"; }
+                else if(lh && ll)  { score = -0.7; reason = "Price structure: Lower Highs + Lower Lows = DOWNTREND structure"; }
+                else if(hh && ll)  { score =  0.1; reason = "Price structure: HH + LL = volatile / expanding range"; }
+                else if(lh && hl)  { score = -0.1; reason = "Price structure: LH + HL = contracting range"; }
+                else               { score =  0.0; reason = "Price structure: mixed signals"; }
+                signals.push({ name:"price_structure", score, weight:0.10, reason });
+              }
+
+              // ── WEIGHTED SCORE AGGREGATION ──
+              let totalWeight = 0, weightedScore = 0;
+              for(const sig of signals) {
+                weightedScore += sig.score * sig.weight;
+                totalWeight   += sig.weight;
+              }
+              const netScore = totalWeight > 0 ? weightedScore / totalWeight : 0;
+
+              // ── PROBABILITY CALCULATION ──
+              // netScore: -1 = 100% short, +1 = 100% long
+              const rawLongProb  = clamp(0.5 + netScore * 0.5, 0.05, 0.95);
+              const rawShortProb = 1 - rawLongProb;
+
+              // ── SIGNAL AGREEMENT BONUS ──
+              const signalDirs    = signals.map(s => Math.sign(s.score));
+              const longSignals   = signalDirs.filter(d => d > 0).length;
+              const shortSignals  = signalDirs.filter(d => d < 0).length;
+              const totalSignals  = signals.length || 1;
+              const agreementRatio = Math.max(longSignals, shortSignals) / totalSignals;
+
+              // confidence = how decisive the signals are
+              const confidencePct = Math.round(clamp(Math.abs(netScore) * 100 * agreementRatio, 5, 95));
+
+              // final probabilities (rounded to integer %)
+              const longProbPct  = Math.round(rawLongProb  * 100);
+              const shortProbPct = Math.round(rawShortProb * 100);
+
+              // ── DIRECTION DECISION ──
+              const mtfSide = longProbPct >= 50 ? "long" : "short";
+              const overridden = mtfSide !== originalSide;
+
+              // ── BUILD HUMAN READABLE REASONS ──
+              const reasons = [];
+              for(const sig of signals.sort((a,b) => Math.abs(b.score * b.weight) - Math.abs(a.score * a.weight))) {
+                const dir = sig.score > 0.1 ? "📈" : sig.score < -0.1 ? "📉" : "➡️";
+                reasons.push(`${dir} [${sig.name}] ${sig.reason}`);
+              }
+
+              // ── SUMMARY LOG ──
+              log(`\n╔══════════════════════════════════════════════════════════`);
+              log(`║ 🔬 MTF DIRECTION ANALYSIS: ${symbol}`);
+              log(`║ Original side: ${originalSide.toUpperCase()} | MTF suggests: ${mtfSide.toUpperCase()}${overridden ? " ⚠️ OVERRIDE" : " ✅ CONFIRMED"}`);
+              log(`║ Long probability:  ${longProbPct}%`);
+              log(`║ Short probability: ${shortProbPct}%`);
+              log(`║ Net score: ${netScore.toFixed(3)} | Confidence: ${confidencePct}%`);
+              log(`║ Signal agreement: ${longSignals}L / ${shortSignals}S / ${totalSignals - longSignals - shortSignals}N out of ${totalSignals}`);
+              log(`╠══════════════════════════════════════════════════════════`);
+              for(const r of reasons) log(`║ ${r}`);
+              log(`╠══════════════════════════════════════════════════════════`);
+              if(overridden) {
+                log(`║ ⚠️  OVERRIDE: ${originalSide.toUpperCase()} → ${mtfSide.toUpperCase()} (MTF probability: ${mtfSide === "long" ? longProbPct : shortProbPct}%)`);
+              } else {
+                log(`║ ✅ CONFIRMED: ${originalSide.toUpperCase()} (MTF probability: ${originalSide === "long" ? longProbPct : shortProbPct}%)`);
+              }
+              log(`╚══════════════════════════════════════════════════════════\n`);
+
+              result.final_side     = mtfSide;
+              result.overridden     = overridden;
+              result.long_prob_pct  = longProbPct;
+              result.short_prob_pct = shortProbPct;
+              result.confidence_pct = confidencePct;
+              result.net_score      = +netScore.toFixed(4);
+              result.signals        = signals.map(s => ({ name:s.name, score:+s.score.toFixed(3), weight:s.weight }));
+              result.reasons        = reasons;
+              result.detail         = `score=${netScore.toFixed(3)} agree=${agreementRatio.toFixed(2)} long=${longProbPct}% short=${shortProbPct}% conf=${confidencePct}%`;
+
+            } catch(e) {
+              log(`[MTF] Error for ${symbol}:`, e?.message || e);
+              result.detail = `error: ${e?.message || e}`;
+            }
+
+            return result;
+          }
+
+          // ================================================================
           // MAIN
           // ================================================================
           let reason="ok", selectionTier="confidence";
@@ -776,25 +995,19 @@ jobs:
                 const d1=depthWithinPctUSD(depth,mid,0.01);
                 const depth1pUSD=(d1.asksUSD||0)+(d1.bidsUSD||0);
 
-                // ── LIQUIDITY GATE ──
                 if(spreadBps>20){ log(`[LIQ-GATE] ${cand.symbol} skipped: spread=${spreadBps}bps > 20bps max`); continue; }
                 if(depth1pUSD<10000){ log(`[LIQ-GATE] ${cand.symbol} skipped: depth1p=$${Math.round(depth1pUSD)} < $10,000 min`); continue; }
-
-                // ── VOL GATE ──
                 if(cand.vol_1h_pct<DYNAMIC_VOL_GATE){ log(`[VOL-GATE] ${cand.symbol} skipped: vol1h=${cand.vol_1h_pct.toFixed(2)}% < ${DYNAMIC_VOL_GATE}% minimum`); continue; }
 
-                // ── PUMP AND DUMP GATE ──
                 const isPumpDump=cand.vol_1h_pct>15&&cand.oi_delta_pct>25;
                 if(isPumpDump){ log(`[PND-GATE] ${cand.symbol} skipped: suspicious vol=${cand.vol_1h_pct.toFixed(1)}% + oi_delta=${cand.oi_delta_pct.toFixed(1)}%`); continue; }
 
-                // ── WASH TRADING DETECTION ──
                 const volToOIRatio=(cand.volume_1h_usd||0)/Math.max(1,(cand.current_oi_usd||1));
                 const isWashTrading=cand.oi_delta_pct>20&&volToOIRatio<0.02&&cand.vol_1h_pct<5;
-                if(isWashTrading){ log(`[WASH-GATE] ${cand.symbol} skipped: OI_delta=${cand.oi_delta_pct.toFixed(1)}% but vol/OI=${volToOIRatio.toFixed(4)} — possible wash trading`); continue; }
+                if(isWashTrading){ log(`[WASH-GATE] ${cand.symbol} skipped`); continue; }
 
-                // ── OI DELTA REALITY CHECK ──
                 const suspiciousOI=cand.oi_delta_pct>30&&(cand.volume_1h_usd||0)<5_000_000;
-                if(suspiciousOI){ log(`[OI-GATE] ${cand.symbol} skipped: OI_delta=${cand.oi_delta_pct.toFixed(1)}% with low volume=$${Math.round((cand.volume_1h_usd||0)/1000)}K`); continue; }
+                if(suspiciousOI){ log(`[OI-GATE] ${cand.symbol} skipped`); continue; }
 
                 // ── V5 REGIME DETECTION ──
                 let regime="meanrevert", slopeDir=0, v5Result=null;
@@ -810,25 +1023,17 @@ jobs:
                     } else { regime="meanrevert"; slopeDir=v5Result.slopePct>=0?1:-1; }
                     log(`[V5-REG] ${cand.symbol} ${v5Result.regime} (${v5Result.candidate}) ${v5Result.confirmed?'✓':'⏳'} ${v5Result.detail}`);
                   } else {
-                    log(`[V5-REG] ${cand.symbol} insufficient data (got ${Array.isArray(kReg)?kReg.length:0} candles, need >=15, limit=${REG_LIMIT}) — fallback meanrevert`);
+                    log(`[V5-REG] ${cand.symbol} insufficient data — fallback meanrevert`);
                   }
-                }catch(e){ log(`[V5-REG] ${cand.symbol} error:`,e?.message||e); regime="meanrevert"; slopeDir=0; }
+                }catch(e){ regime="meanrevert"; slopeDir=0; }
 
-                // ── RANGING GATE ──
                 if(v5Result&&v5Result.regime==="Ranging"){ log(`[V5-GATE] ${cand.symbol} SKIP: Ranging`); continue; }
+                if(v5Result&&v5Result.atrPercent<ATR_MIN_PCT){ log(`[ATR-GATE] ${cand.symbol} skipped: ATR=${v5Result.atrPercent.toFixed(2)}%`); continue; }
+                const suspiciousRegime=v5Result&&v5Result.atrPercent>4.0&&regime==="meanrevert"; if(suspiciousRegime){ log(`[REG-GATE] ${cand.symbol} skipped`); continue; }
+                const extremeVolTrend=v5Result&&v5Result.atrPercent>4.5&&regime==="trend"; if(extremeVolTrend){ log(`[VOL-EXTREME] ${cand.symbol} skipped`); continue; }
 
-                // ── ATR REALITY CHECK ──
-                if(v5Result&&v5Result.atrPercent<ATR_MIN_PCT){ log(`[ATR-GATE] ${cand.symbol} skipped: 3min ATR=${v5Result.atrPercent.toFixed(2)}% < ${ATR_MIN_PCT}% minimum`); continue; }
-
-               
-                // ── REGIME MISCLASSIFICATION GUARD ── 
-                const suspiciousRegime=v5Result&&v5Result.atrPercent>4.0&&regime==="meanrevert"; if(suspiciousRegime){ log(`[REG-GATE] ${cand.symbol} skipped: ATR=${v5Result.atrPercent.toFixed(2)}% too high for meanrevert — likely misclassified`); continue; }  // ── EXTREME VOLATILITY GATE (trend mode) ── const extremeVolTrend=v5Result&&v5Result.atrPercent>4.5&&regime==="trend"; if(extremeVolTrend){ log(`[VOL-EXTREME] ${cand.symbol} skipped: ATR=${v5Result.atrPercent.toFixed(2)}% too extreme even for trend — late entry risk`); continue; }
-
-
-                // ── REGIME LAG COMPENSATION ──
                 const regimeLagRisk=v5Result&&regime==="meanrevert"&&Math.abs(v5Result.slopePct)>0.20;
 
-                // ── DIRECTION CALCULATION ──
                 const priceMom1h=cand.price_change_1h||0;
                 const momDirection=Math.sign(priceMom1h);
                 const momScore=Math.tanh(Math.abs(priceMom1h)/0.02)*momDirection;
@@ -838,15 +1043,13 @@ jobs:
                 const volConfirm=Math.tanh((cand.volume_1h_usd||0)/IDEAL_VOLUME_1H_USD);
                 const btcRegimeScore=btcUp1h?0.1:-0.1;
 
-                // ── FUNDING MANIPULATION GUARD ──
                 const fundingDangerous=Math.abs(cand.funding_rate_raw||0)>0.01;
                 const fundingExtreme=Math.abs(cand.funding_rate_raw||0)>0.005;
-                if(fundingDangerous){ log(`[FUND-GATE] ${cand.symbol} skipped: dangerous funding=${(cand.funding_rate_raw*100).toFixed(3)}% — likely whale trap`); continue; }
-                if(fundingExtreme) log(`[FUND-GATE] ${cand.symbol} WARNING: extreme funding=${(cand.funding_rate_raw*100).toFixed(3)}% — reducing influence`);
+                if(fundingDangerous){ log(`[FUND-GATE] ${cand.symbol} skipped`); continue; }
+                if(fundingExtreme) log(`[FUND-GATE] ${cand.symbol} WARNING: extreme funding`);
                 const fundingWeight=fundingExtreme?0.05:0.20;
                 const dirEdge=(momScore*0.40+oiScore*0.25+fundingScore*fundingWeight+btcRegimeScore*0.15)*(0.5+0.5*volConfirm);
 
-                // ── SIDE SELECTION ──
                 let forcedSide=null;
                 if(DIRECTION==="long"){ forcedSide="long"; }
                 else if(DIRECTION==="short"){ forcedSide="short"; }
@@ -862,22 +1065,14 @@ jobs:
 
                 log(`[DIR] ${cand.symbol} regime=${regime} edge=${dirEdge.toFixed(3)} → ${forcedSide}`);
 
-                // ── EDGE GATE ──
-                if(Math.abs(dirEdge)<0.15){ log(`[EDGE-GATE] ${cand.symbol} skipped: edge=${dirEdge.toFixed(3)} too weak (min 0.15)`); continue; }
+                if(Math.abs(dirEdge)<0.15){ log(`[EDGE-GATE] ${cand.symbol} skipped: edge too weak`); continue; }
+                if(regimeLagRisk&&forcedSide==="long"&&v5Result.slopePct<0){ log(`[LAG-GATE] ${cand.symbol} skipped`); continue; }
+                if(regimeLagRisk&&forcedSide==="short"&&v5Result.slopePct>0){ log(`[LAG-GATE] ${cand.symbol} skipped`); continue; }
+                if((btcCrash||altCrash)&&forcedSide==="long"){ log(`[CRASH-GATE] ${cand.symbol} skipped`); continue; }
+                if(altPump&&forcedSide==="short"&&regime==="meanrevert"){ log(`[PUMP-GATE] ${cand.symbol} skipped`); continue; }
+                if(isMacroBull&&regime==="meanrevert"&&forcedSide==="short"){ log(`[MACRO-GATE] ${cand.symbol} skipped`); continue; }
+                if(isMacroBear&&regime==="meanrevert"&&forcedSide==="long"){ log(`[MACRO-GATE] ${cand.symbol} skipped`); continue; }
 
-                // ── REGIME LAG GATE ──
-                if(regimeLagRisk&&forcedSide==="long"&&v5Result.slopePct<0){ log(`[LAG-GATE] ${cand.symbol} skipped: strong negative slope=${v5Result.slopePct.toFixed(3)}% in meanrevert — possible trend lag`); continue; }
-                if(regimeLagRisk&&forcedSide==="short"&&v5Result.slopePct>0){ log(`[LAG-GATE] ${cand.symbol} skipped: strong positive slope=${v5Result.slopePct.toFixed(3)}% in meanrevert — possible trend lag`); continue; }
-
-                // ── BTC + ALTCOIN CRASH GATE ──
-                if((btcCrash||altCrash)&&forcedSide==="long"){ log(`[CRASH-GATE] ${cand.symbol} skipped: no longs during crash (btc=${btcCrash} alt=${altCrash})`); continue; }
-                if(altPump&&forcedSide==="short"&&regime==="meanrevert"){ log(`[PUMP-GATE] ${cand.symbol} skipped: no meanrevert shorts during sector pump`); continue; }
-
-                // ── MACRO TREND GATE ──
-                if(isMacroBull&&regime==="meanrevert"&&forcedSide==="short"){ log(`[MACRO-GATE] ${cand.symbol} skipped: no meanrevert shorts during macro bull`); continue; }
-                if(isMacroBear&&regime==="meanrevert"&&forcedSide==="long"){ log(`[MACRO-GATE] ${cand.symbol} skipped: no meanrevert longs during macro bear`); continue; }
-
-                // ── PROBABILITIES ──
                 const pBase=0.45+0.35*Math.tanh(cand.vol_1h_pct/3);
                 const pLong0=clamp(pBase+dirEdge*0.25,0.28,0.88);
                 const pShort0=clamp(pBase-dirEdge*0.25,0.28,0.88);
@@ -886,7 +1081,6 @@ jobs:
                 const pLong=calibrateP(state,"long",regime,pLong0), pShort=calibrateP(state,"short",regime,pShort0);
                 const pLong_lcb=wilsonLCB(pLong,nL,WILSON_Z), pShort_lcb=wilsonLCB(pShort,nS,WILSON_Z);
 
-                // ── BUILD IDEA ──
                 const atr_bps=Math.round(cand.vol_1h_pct*100);
                 const MAX_SL_BPS=80;
                 let chosen=null;
@@ -910,7 +1104,6 @@ jobs:
                 }
                 if(!chosen) continue;
 
-                // ── CONFIDENCE ──
                 const baseConf=cand.hedge_confidence;
                 const spreadMult=clamp(1-Math.max(0,(spreadBps-5))/30,0.5,1.1);
                 const depthMult=clamp(depth1pUSD/Math.max(1,DEPTH_1P_MIN_USD),0.3,1.2);
@@ -960,11 +1153,95 @@ jobs:
                 if(!haveSyms.has(c.symbol)){ selected.push(c); haveSyms.add(c.symbol); }
               }
             }
-            log(`✅ Selected ${selected.length} ideas`);
+            log(`✅ Selected ${selected.length} ideas before MTF analysis`);
 
-            const flipped=HEDGE?selected.map(orig=>({ ...orig, side:orig.side==="long"?"short":"long", flipped:true, original_idea_id:orig.symbol+"_"+orig.side })):[];
-            const selectedWithFlipped=[...selected,...flipped];
-            log(`📦 Ideas: ${selected.length} original + ${flipped.length} flipped = ${selectedWithFlipped.length} total`);
+            // ================================================================
+            // ── FINAL MTF DIRECTION ANALYSIS (new step) ──
+            // runs AFTER selection, refines/overrides direction with precision
+            // ================================================================
+            log("\n🔬 ════════════════════════════════════════════════════════");
+            log("🔬  FINAL MTF DIRECTION ANALYSIS — running for all selected ideas");
+            log("🔬 ════════════════════════════════════════════════════════\n");
+
+            const MTF_OVERRIDE_MIN_CONF = 45; // only override if MTF is confident enough
+            const MTF_DROP_MIN_PROB     = 35; // drop idea if winning prob < 35% after MTF
+
+            const selectedAfterMTF = [];
+            for(const cand of selected) {
+              try {
+                const mtf = await runMTFDirectionAnalysis(cand.symbol, cand.side, cand.mark_price);
+
+                // ── APPLY MTF RESULT ──
+                const mtfWinProb = cand.side === "long" ? mtf.long_prob_pct : mtf.short_prob_pct;
+
+                // Drop idea if MTF says very low probability for original side
+                if(mtfWinProb < MTF_DROP_MIN_PROB && mtf.confidence_pct >= MTF_OVERRIDE_MIN_CONF) {
+                  log(`[MTF-DROP] ${cand.symbol}: ${cand.side} win_prob=${mtfWinProb}% < ${MTF_DROP_MIN_PROB}% — dropping idea`);
+                  continue;
+                }
+
+                // Override direction if MTF confident and disagrees
+                if(mtf.overridden && mtf.confidence_pct >= MTF_OVERRIDE_MIN_CONF) {
+                  log(`[MTF-OVERRIDE] ${cand.symbol}: ${cand.side} → ${mtf.final_side} (MTF conf=${mtf.confidence_pct}%)`);
+
+                  // recalculate p_lcb and p_raw for new side
+                  const newSide = mtf.final_side;
+                  const newPRaw = newSide === "long"
+                    ? clamp(mtf.long_prob_pct / 100, 0.28, 0.88)
+                    : clamp(mtf.short_prob_pct / 100, 0.28, 0.88);
+                  const newPLcb = calibrateP(state, newSide, cand.regime, newPRaw);
+                  const newNCoeff = getCoeffs(state, newSide, cand.regime)?.n || 0;
+                  const newPLcbW = wilsonLCB(newPLcb, Math.max(1, Math.min(500, newNCoeff)), WILSON_Z);
+
+                  cand.side       = newSide;
+                  cand.p_raw      = +newPRaw.toFixed(3);
+                  cand.p_lcb      = +newPLcbW.toFixed(3);
+                  cand.mtf_overridden = true;
+                } else {
+                  cand.mtf_overridden = false;
+                }
+
+                // attach MTF data to candidate
+                cand.mtf = {
+                  long_prob_pct:  mtf.long_prob_pct,
+                  short_prob_pct: mtf.short_prob_pct,
+                  confidence_pct: mtf.confidence_pct,
+                  net_score:      mtf.net_score,
+                  overridden:     mtf.overridden,
+                  final_side:     mtf.final_side,
+                  signals:        mtf.signals,
+                  reasons:        mtf.reasons,
+                  detail:         mtf.detail
+                };
+
+                // boost/reduce confidence based on MTF alignment
+                const mtfAlignBonus = !mtf.overridden && mtf.confidence_pct >= 60 ?  1.08
+                                    : !mtf.overridden && mtf.confidence_pct >= 40 ?  1.03
+                                    :  mtf.overridden                              ?  0.92
+                                    :                                                 1.00;
+                cand.confidence = clamp(Math.round(cand.confidence * mtfAlignBonus), 0, 100);
+
+                selectedAfterMTF.push(cand);
+
+              } catch(e) {
+                log(`[MTF] Error processing ${cand.symbol}:`, e?.message || e);
+                cand.mtf = null;
+                selectedAfterMTF.push(cand); // keep on error
+              }
+            }
+
+            log(`\n✅ After MTF: ${selectedAfterMTF.length}/${selected.length} ideas passed`);
+            log("📋 Final ideas summary:");
+            for(const c of selectedAfterMTF) {
+              log(`   ${c.symbol} → ${c.side.toUpperCase()} | conf=${c.confidence} | long=${c.mtf?.long_prob_pct??'?'}% short=${c.mtf?.short_prob_pct??'?'}% | ${c.mtf_overridden?"⚠️ OVERRIDDEN":"✅ CONFIRMED"}`);
+            }
+
+            // ── USE selectedAfterMTF instead of selected from here ──
+            const finalSelected = selectedAfterMTF;
+
+            const flipped=HEDGE?finalSelected.map(orig=>({ ...orig, side:orig.side==="long"?"short":"long", flipped:true, original_idea_id:orig.symbol+"_"+orig.side })):[];
+            const selectedWithFlipped=[...finalSelected,...flipped];
+            log(`📦 Ideas: ${finalSelected.length} original + ${flipped.length} flipped = ${selectedWithFlipped.length} total`);
 
             const wEv=softmax(selectedWithFlipped.map(x=>x.exp_lcb_bps),20);
 
@@ -990,14 +1267,23 @@ jobs:
                 p_win:x.p_lcb, p_lcb:x.p_lcb, p_raw:x.p_raw,
                 calib_key:`side:${x.side}|regime:${x.regime}`, regime:x.regime,
                 ttl_sec:ttl, size_bps,
-                predicted:{ ts_ms:Date.now(), p_cal:x.p_lcb, ev_bps:x.exp_lcb_bps??x.exp_bps, confidence_score:x.confidence, flipped:x.flipped||false, vol_1h_pct:x.vol_1h_pct, funding_rate:x.funding_rate, oi_delta_pct:x.oi_delta_pct, volume_1h_usd:x.volume_1h_usd, basis_bps:x.basis_bps, hedge_confidence:x.hedge_confidence },
+                predicted:{
+                  ts_ms:Date.now(), p_cal:x.p_lcb, ev_bps:x.exp_lcb_bps??x.exp_bps,
+                  confidence_score:x.confidence, flipped:x.flipped||false,
+                  vol_1h_pct:x.vol_1h_pct, funding_rate:x.funding_rate,
+                  oi_delta_pct:x.oi_delta_pct, volume_1h_usd:x.volume_1h_usd,
+                  basis_bps:x.basis_bps, hedge_confidence:x.hedge_confidence,
+                  mtf_analysis: x.mtf || null
+                },
                 confidence:x.confidence, reasons:x.reasons,
                 reasons_text:(x.reasons||[]).slice(0,3).map(r=>`${r.factor}:${r.value}(${r.contribution>=0?"+":""}${r.contribution})`),
-                hedge_metrics:{ vol_1h_pct:x.vol_1h_pct, funding_rate_raw:x.funding_rate_raw, oi_delta_pct:x.oi_delta_pct, volume_1h_usd:x.volume_1h_usd, basis_bps:x.basis_bps, mark_price:x.mark_price, current_oi_usd:x.current_oi_usd }
+                hedge_metrics:{ vol_1h_pct:x.vol_1h_pct, funding_rate_raw:x.funding_rate_raw, oi_delta_pct:x.oi_delta_pct, volume_1h_usd:x.volume_1h_usd, basis_bps:x.basis_bps, mark_price:x.mark_price, current_oi_usd:x.current_oi_usd },
+                mtf_analysis: x.mtf || null,
+                mtf_overridden: x.mtf_overridden || false
               };
             });
 
-            const toV1Compat=(pv2)=>({ idea_id:pv2.idea_id, client_order_id:pv2.client_order_id, symbol:pv2.symbol, symbol_full:pv2.symbol_full, quote:pv2.quote, side:pv2.side, rank:pv2.rank, entry_policy:"smart_swing_limit", entry_type:"limit", activation:"on_fill", entry_mid:pv2.entry_mid, entry_limit:pv2.entry_limit, tp_abs:pv2.tp_abs, sl_abs:pv2.sl_abs, tp_bps:pv2.tp_bps, sl_bps:pv2.sl_bps, rrr:pv2.rrr, exp_lcb_bps:pv2.exp_lcb_bps, ev_bps:pv2.ev_bps, cost_bps:pv2.cost_bps, p_win:pv2.p_lcb, p_lcb:pv2.p_lcb, p_raw:pv2.p_raw, calib_key:pv2.calib_key, regime:pv2.regime, ttl_sec:pv2.ttl_sec, size_bps:pv2.size_bps, predicted:{ ...pv2.predicted, meta:{ strategy:STRATEGY_NAME, model_version:MODEL_VERSION, schema_version:SCHEMA_VERSION, git_sha:GIT_SHA, config_hash:CONFIG_HASH, futures_hint:{ target_exchange:pv2.target_exchange, market_type:pv2.market_type, margin_mode:pv2.margin_mode, leverage:pv2.leverage, entry_policy_override:pv2.entry_policy, exec:pv2.exec } } }, confidence:pv2.confidence, reasons:pv2.reasons, reasons_text:pv2.reasons_text, hedge_metrics:pv2.hedge_metrics });
+            const toV1Compat=(pv2)=>({ idea_id:pv2.idea_id, client_order_id:pv2.client_order_id, symbol:pv2.symbol, symbol_full:pv2.symbol_full, quote:pv2.quote, side:pv2.side, rank:pv2.rank, entry_policy:"smart_swing_limit", entry_type:"limit", activation:"on_fill", entry_mid:pv2.entry_mid, entry_limit:pv2.entry_limit, tp_abs:pv2.tp_abs, sl_abs:pv2.sl_abs, tp_bps:pv2.tp_bps, sl_bps:pv2.sl_bps, rrr:pv2.rrr, exp_lcb_bps:pv2.exp_lcb_bps, ev_bps:pv2.ev_bps, cost_bps:pv2.cost_bps, p_win:pv2.p_lcb, p_lcb:pv2.p_lcb, p_raw:pv2.p_raw, calib_key:pv2.calib_key, regime:pv2.regime, ttl_sec:pv2.ttl_sec, size_bps:pv2.size_bps, predicted:{ ...pv2.predicted, meta:{ strategy:STRATEGY_NAME, model_version:MODEL_VERSION, schema_version:SCHEMA_VERSION, git_sha:GIT_SHA, config_hash:CONFIG_HASH, futures_hint:{ target_exchange:pv2.target_exchange, market_type:pv2.market_type, margin_mode:pv2.margin_mode, leverage:pv2.leverage, entry_policy_override:pv2.entry_policy, exec:pv2.exec } } }, confidence:pv2.confidence, reasons:pv2.reasons, reasons_text:pv2.reasons_text, hedge_metrics:pv2.hedge_metrics, mtf_analysis:pv2.mtf_analysis||null, mtf_overridden:pv2.mtf_overridden||false });
 
             let picks=picksV2.map(toV1Compat);
 
@@ -1041,15 +1327,13 @@ jobs:
             }catch(e){ log("state update warn",e?.message||e); }
 
             const auditOut=buildAuditOutputs(state);
-            log("DEBUG: Pre-save: pending length=",(state.pending||[]).length);
             await saveState(persist,state,auditOut,2,true);
-            log("DEBUG: saveState call complete.");
 
-            for(const p of picks) log(`idea ${p.symbol_full} ${p.side} conf=${p.confidence} vol1h=${(p.predicted?.vol_1h_pct||0).toFixed(2)}%`);
+            for(const p of picks) log(`idea ${p.symbol_full} ${p.side} conf=${p.confidence} long=${p.mtf_analysis?.long_prob_pct??'?'}% short=${p.mtf_analysis?.short_prob_pct??'?'}% mtf_override=${p.mtf_overridden}`);
 
-            const ideaLogs=picks.map(p=>({ symbol:p.symbol_full, side:p.side, flipped:p.predicted?.flipped||false, confidence:p.confidence, hedge_confidence:p.predicted?.hedge_confidence||0, vol_1h_pct:+(p.predicted?.vol_1h_pct||0).toFixed(2), funding_rate:+(p.predicted?.funding_rate||0).toFixed(5), oi_delta_pct:+(p.predicted?.oi_delta_pct||0).toFixed(1), volume_1h_usd:Math.round((p.predicted?.volume_1h_usd||0)/1e6)+"M", reasons:p.reasons_text, p_cal:+p.p_lcb.toFixed(3), ev_bps:p.ev_bps, idea_id:p.idea_id }));
+            const ideaLogs=picks.map(p=>({ symbol:p.symbol_full, side:p.side, flipped:p.predicted?.flipped||false, confidence:p.confidence, hedge_confidence:p.predicted?.hedge_confidence||0, vol_1h_pct:+(p.predicted?.vol_1h_pct||0).toFixed(2), funding_rate:+(p.predicted?.funding_rate||0).toFixed(5), oi_delta_pct:+(p.predicted?.oi_delta_pct||0).toFixed(1), volume_1h_usd:Math.round((p.predicted?.volume_1h_usd||0)/1e6)+"M", reasons:p.reasons_text, p_cal:+p.p_lcb.toFixed(3), ev_bps:p.ev_bps, idea_id:p.idea_id, mtf_long_prob:p.mtf_analysis?.long_prob_pct??null, mtf_short_prob:p.mtf_analysis?.short_prob_pct??null, mtf_confidence:p.mtf_analysis?.confidence_pct??null, mtf_overridden:p.mtf_overridden||false, mtf_reasons:p.mtf_analysis?.reasons?.slice(0,3)||[] }));
 
-            const meta={ origin:"github_actions", reason, exchange:"bybit_futures", execution_exchange:"bybit_futures", strategy:STRATEGY_NAME, model_version:MODEL_VERSION, schema_version:SCHEMA_VERSION, git_sha:GIT_SHA, config_hash:CONFIG_HASH, counts:{ bybit_universe:bybitSymbols.length, metrics_fetched:allMetrics.length, refined:refined.length, selected:picks.length }, dd_gate:{ pnl24_bps, peak_dd_bps, throttle }, tod:{ active:S_H!=null&&E_H!=null, start:S_H, end:E_H }, heartbeat:{ mismatches:0, zombies:0 }, tier:selectionTier, idea_logs:ideaLogs, calibration_health:calibHealth, market_health:{ median_vol:+medianVol.toFixed(2), dynamic_vol_gate:DYNAMIC_VOL_GATE, dynamic_top_n:DYNAMIC_TOP_N, btc_crash:btcCrash, alt_crash:altCrash, alt_pump:altPump, macro_bull:isMacroBull, macro_bear:isMacroBear, fetch_ratio:+fetchRatio.toFixed(3) }, extras:{ v2_ideas:picksV2, features_requested:["maker_join","post_only","futures","hedge_trading","bybit_execution"] } };
+            const meta={ origin:"github_actions", reason, exchange:"bybit_futures", execution_exchange:"bybit_futures", strategy:STRATEGY_NAME, model_version:MODEL_VERSION, schema_version:SCHEMA_VERSION, git_sha:GIT_SHA, config_hash:CONFIG_HASH, counts:{ bybit_universe:bybitSymbols.length, metrics_fetched:allMetrics.length, refined:refined.length, selected_pre_mtf:selected.length, selected_post_mtf:finalSelected.length, final_picks:picks.length }, dd_gate:{ pnl24_bps, peak_dd_bps, throttle }, tod:{ active:S_H!=null&&E_H!=null, start:S_H, end:E_H }, heartbeat:{ mismatches:0, zombies:0 }, tier:selectionTier, idea_logs:ideaLogs, calibration_health:calibHealth, market_health:{ median_vol:+medianVol.toFixed(2), dynamic_vol_gate:DYNAMIC_VOL_GATE, dynamic_top_n:DYNAMIC_TOP_N, btc_crash:btcCrash, alt_crash:altCrash, alt_pump:altPump, macro_bull:isMacroBull, macro_bear:isMacroBear, fetch_ratio:+fetchRatio.toFixed(3) }, extras:{ v2_ideas:picksV2, features_requested:["maker_join","post_only","futures","hedge_trading","bybit_execution","mtf_direction_analysis"] } };
 
             const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta, top_n:picks.length||0, ideas:picks||[] };
             log(`pushing ${picks.length} ideas (${selectionTier}) to ${PUSH_URL}`);
