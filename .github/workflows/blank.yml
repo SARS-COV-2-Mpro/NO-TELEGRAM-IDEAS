@@ -198,7 +198,6 @@ jobs:
           }
 
           const DROPPABLE_STATUSES=new Set(["planned","placed","pending","queued","ready"]);
-
           const computeOBI=(depth,topN=12)=>{ if(!depth?.asks?.length||!depth?.bids?.length) return 0; const w=(i)=>Math.exp(-i*0.18); let bidNot=0,askNot=0; for(let i=0;i<Math.min(topN,depth.bids.length);i++){ const p=+depth.bids[i][0],q=+depth.bids[i][1]; if(p>0&&q>0) bidNot+=p*q*w(i); } for(let i=0;i<Math.min(topN,depth.asks.length);i++){ const p=+depth.asks[i][0],q=+depth.asks[i][1]; if(p>0&&q>0) askNot+=p*q*w(i); } return (bidNot+askNot>0)?(bidNot-askNot)/(bidNot+askNot):0; };
           const vwapFillLevels=(levels,targetUSD)=>{ let remain=targetUSD,val=0,qty=0; for(const [ps,qs] of levels){ const p=+ps,q=+qs; if(!(p>0&&q>0)) continue; const can=p*q,take=Math.min(remain,can),tq=take/p; val+=p*tq; qty+=tq; remain-=take; if(remain<=1e-6) break; } return { px:qty>0?val/qty:null, filledUSD:(targetUSD-remain) }; };
           const slipFromDepth=(depth,mid,side,notionalUSD)=>{ if(!depth?.asks?.length||!depth?.bids?.length||!(mid>0)) return { slip_bps:null, fill_prob:null }; if(side==="long"){ const buy=vwapFillLevels(depth.asks,Math.max(50,notionalUSD)); const slip=buy.px?Math.max(0,Math.round((buy.px-mid)/mid*10000)):null; const fill=Math.min(1,(buy.filledUSD||0)/Math.max(1,notionalUSD)); return { slip_bps:slip, fill_prob:+fill.toFixed(4) }; }else{ const sell=vwapFillLevels(depth.bids,Math.max(50,notionalUSD)); const slip=sell.px?Math.max(0,Math.round((mid-sell.px)/mid*10000)):null; const fill=Math.min(1,(sell.filledUSD||0)/Math.max(1,notionalUSD)); return { slip_bps:slip, fill_prob:+fill.toFixed(4) }; } };
@@ -273,6 +272,11 @@ jobs:
           const WEIGHT_FUNDING=0.25;
           const WEIGHT_OI_DELTA=0.20;
           const WEIGHT_VOLUME=0.15;
+
+          // ── MTF GATE THRESHOLDS ──
+          const MTF_OVERRIDE_MIN_CONF = 35;  // override direction if MTF confidence >= this
+          const MTF_DROP_MIN_PROB     = 40;  // drop if winning side prob < this (no conf requirement)
+          const MTF_COINFLIP_GATE     = 55;  // drop if neither side reaches this probability
 
           const CONFIG_HASH=(()=>{ try{ const knobs={ DIRECTION,MR_BREAKOUT_DC_N,MR_BREAKOUT_RET15_ATR,MR_LOCKOUT_SEC,MAX_COST_BPS_HARD,MIN_VOL_1H_USD,DEPTH_1P_MIN_USD,LONG_EDGE_MULT_MIN,LONG_BOUNCE_SL_ATR,LONG_BOUNCE_TP_ATR,TOP_N,MAX_SPREAD_BPS,EXP_LCB_MIN_BPS_BASE,COST_BPS,NOTIONAL,DEPTH_LIMIT,OBI_TOPN,MIN_TF_ALIGN,TF_WEIGHTS,IDEAL_VOL_1H_PCT,IDEAL_FUNDING_RATE,IDEAL_OI_DELTA_PCT,IDEAL_VOLUME_1H_USD,WEIGHT_VOL_1H,WEIGHT_FUNDING,WEIGHT_OI_DELTA,WEIGHT_VOLUME,REG_INTERVAL:process.env.REG_INTERVAL,REG_LIMIT:process.env.REG_LIMIT,REG_SLOPE_THRESHOLD:process.env.REG_SLOPE_THRESHOLD,SLOPE_EXIT_RATIO:process.env.SLOPE_EXIT_RATIO,REG_RANGING_THRESHOLD:process.env.REG_RANGING_THRESHOLD,REG_RANGE_THRESHOLD:process.env.REG_RANGE_THRESHOLD,ATR_VOLATILE_THRESHOLD:process.env.ATR_VOLATILE_THRESHOLD,REG_CONFIRM_BARS:process.env.REG_CONFIRM_BARS,MIN_ALT_SCORE:process.env.MIN_ALT_SCORE,ATR_MIN_PCT }; return hashObj(knobs); }catch{ return "cfg-unknown"; } })();
 
@@ -609,7 +613,6 @@ jobs:
 
           const calibrateP=(state,side,regime,pRaw)=>{ const coeff=getCoeffs(state,side,regime); if(!coeff||pRaw==null||!isFinite(pRaw)) return 0.5; const x=Math.max(-5,Math.min(5,logit(pRaw))); return sigmoid(coeff.a+coeff.b*x); };
           function getSymbolAdj(state,base){ const real=state.sym_stats_real?.[base]; const s=real||state.sym_stats?.[base]; if(!s||s.n<6) return 1.0; const winRate=s.wins/s.n; const avgPnL=s.pnl_sum/s.n; let m=1.0; if(winRate<0.4) m*=0.7; if(avgPnL<0) m*=0.8; return clamp(m,0.5,1.2); }
-
           function buildAuditOutputs(state){ const lastNClosed=(state.closed||[]).slice(-5000); const closedAudit=lastNClosed.map(x=>JSON.stringify(x)).join("\n"); return { closedAudit, disagreements:"", tradesCsv:"" }; }
 
           // ================================================================
@@ -638,12 +641,9 @@ jobs:
                 fetchBybitKlines(symbol, 15, 16)
               ]);
 
-              // ── SIGNAL SCORES ──
-              // each signal returns { name, score (-1 to +1), weight, reason }
-              // positive score = bullish (long), negative = bearish (short)
               const signals = [];
 
-              // ── 1. SLOPE ALIGNMENT (all 3 timeframes) ──
+              // ── 1. SLOPE ALIGNMENT (5min + 15min primary direction) ──
               const slope1m  = k1m  && k1m.length  >= 5  ? calcLinearRegressionSlope(k1m.map(c=>+c[4]))  : null;
               const slope5m  = k5m  && k5m.length  >= 5  ? calcLinearRegressionSlope(k5m.map(c=>+c[4]))  : null;
               const slope15m = k15m && k15m.length >= 5  ? calcLinearRegressionSlope(k15m.map(c=>+c[4])) : null;
@@ -659,6 +659,7 @@ jobs:
                 signals.push({ name:"slope_align", score, weight:0.25, reason });
               }
 
+              // ── 2. 1MIN MOMENTUM ──
               if(slope1m !== null && slope5m !== null) {
                 const dir1m = Math.sign(slope1m);
                 const dir5m = Math.sign(slope5m);
@@ -669,7 +670,7 @@ jobs:
                 signals.push({ name:"momentum_1m", score, weight:0.15, reason });
               }
 
-              // ── 2. RSI ANALYSIS (5min) ──
+              // ── 3. RSI ANALYSIS (5min) ──
               if(k5m && k5m.length >= 16) {
                 const closes5m = k5m.map(c => +c[4]);
                 const rsi5m = rsi(closes5m, 14);
@@ -684,7 +685,7 @@ jobs:
                 }
               }
 
-              // ── 3. RSI DIVERGENCE (meanrevert signal on 5min) ──
+              // ── 4. RSI DIVERGENCE ──
               if(k5m && k5m.length >= 16) {
                 const closes5m = k5m.map(c => +c[4]);
                 const highs5m  = k5m.map(c => +c[2]);
@@ -698,10 +699,10 @@ jobs:
                   const recentLows  = lows5m.slice(-5);
                   const recentHighs = highs5m.slice(-5);
                   const recentRsi   = rsiSeries.slice(-5);
-                  const priceNewLow = recentLows.at(-1) < Math.min(...recentLows.slice(0,-1));
-                  const priceNewHigh= recentHighs.at(-1) > Math.max(...recentHighs.slice(0,-1));
-                  const rsiRising   = recentRsi.at(-1) > recentRsi.at(-3);
-                  const rsiFalling  = recentRsi.at(-1) < recentRsi.at(-3);
+                  const priceNewLow  = recentLows.at(-1)  < Math.min(...recentLows.slice(0,-1));
+                  const priceNewHigh = recentHighs.at(-1) > Math.max(...recentHighs.slice(0,-1));
+                  const rsiRising    = recentRsi.at(-1) > recentRsi.at(-3);
+                  const rsiFalling   = recentRsi.at(-1) < recentRsi.at(-3);
 
                   if(priceNewLow && rsiRising && recentRsi.at(-1) < 45) {
                     signals.push({ name:"rsi_divergence", score:0.75, weight:0.15, reason:`Bullish RSI divergence: price new low but RSI ${recentRsi.at(-1).toFixed(1)} rising — reversal signal` });
@@ -713,7 +714,7 @@ jobs:
                 }
               }
 
-              // ── 4. VOLUME DIRECTION (5min candles) ──
+              // ── 5. VOLUME DIRECTION (5min) ──
               if(k5m && k5m.length >= 8) {
                 const last8 = k5m.slice(-8);
                 let bullVol = 0, bearVol = 0;
@@ -723,13 +724,13 @@ jobs:
                   else              bearVol += vol;
                 }
                 const totalVol = bullVol + bearVol || 1;
-                const volRatio  = (bullVol - bearVol) / totalVol;
-                const score     = clamp(volRatio * 2, -1, 1);
-                const reason    = `Last 8×5m candles: bull_vol=${(bullVol/totalVol*100).toFixed(0)}% vs bear_vol=${(bearVol/totalVol*100).toFixed(0)}% — ${score > 0.2 ? "buyers dominant" : score < -0.2 ? "sellers dominant" : "balanced"}`;
+                const volRatio = (bullVol - bearVol) / totalVol;
+                const score    = clamp(volRatio * 2, -1, 1);
+                const reason   = `Last 8×5m candles: bull_vol=${(bullVol/totalVol*100).toFixed(0)}% vs bear_vol=${(bearVol/totalVol*100).toFixed(0)}% — ${score > 0.2 ? "buyers dominant" : score < -0.2 ? "sellers dominant" : "balanced"}`;
                 signals.push({ name:"volume_dir", score, weight:0.15, reason });
               }
 
-              // ── 5. CANDLE BODY STRUCTURE (1min — last 5 candles) ──
+              // ── 6. CANDLE BODY STRUCTURE (1min last 5) ──
               if(k1m && k1m.length >= 5) {
                 const last5 = k1m.slice(-5);
                 const dirs  = last5.map(c => Math.sign(+c[4] - +c[1]));
@@ -740,7 +741,7 @@ jobs:
                 signals.push({ name:"candle_body_1m", score, weight:0.10, reason });
               }
 
-              // ── 6. PRICE STRUCTURE — Higher Highs / Lower Lows (5min) ──
+              // ── 7. PRICE STRUCTURE HH/LL (5min) ──
               if(k5m && k5m.length >= 8) {
                 const last8highs = k5m.slice(-8).map(c => +c[2]);
                 const last8lows  = k5m.slice(-8).map(c => +c[3]);
@@ -766,29 +767,23 @@ jobs:
               const netScore = totalWeight > 0 ? weightedScore / totalWeight : 0;
 
               // ── PROBABILITY CALCULATION ──
-              // netScore: -1 = 100% short, +1 = 100% long
               const rawLongProb  = clamp(0.5 + netScore * 0.5, 0.05, 0.95);
               const rawShortProb = 1 - rawLongProb;
 
-              // ── SIGNAL AGREEMENT BONUS ──
-              const signalDirs    = signals.map(s => Math.sign(s.score));
-              const longSignals   = signalDirs.filter(d => d > 0).length;
-              const shortSignals  = signalDirs.filter(d => d < 0).length;
-              const totalSignals  = signals.length || 1;
+              // ── SIGNAL AGREEMENT ──
+              const signalDirs   = signals.map(s => Math.sign(s.score));
+              const longSignals  = signalDirs.filter(d => d > 0).length;
+              const shortSignals = signalDirs.filter(d => d < 0).length;
+              const totalSignals = signals.length || 1;
               const agreementRatio = Math.max(longSignals, shortSignals) / totalSignals;
 
-              // confidence = how decisive the signals are
               const confidencePct = Math.round(clamp(Math.abs(netScore) * 100 * agreementRatio, 5, 95));
+              const longProbPct   = Math.round(rawLongProb  * 100);
+              const shortProbPct  = Math.round(rawShortProb * 100);
+              const mtfSide       = longProbPct >= 50 ? "long" : "short";
+              const overridden    = mtfSide !== originalSide;
 
-              // final probabilities (rounded to integer %)
-              const longProbPct  = Math.round(rawLongProb  * 100);
-              const shortProbPct = Math.round(rawShortProb * 100);
-
-              // ── DIRECTION DECISION ──
-              const mtfSide = longProbPct >= 50 ? "long" : "short";
-              const overridden = mtfSide !== originalSide;
-
-              // ── BUILD HUMAN READABLE REASONS ──
+              // ── HUMAN READABLE REASONS ──
               const reasons = [];
               for(const sig of signals.sort((a,b) => Math.abs(b.score * b.weight) - Math.abs(a.score * a.weight))) {
                 const dir = sig.score > 0.1 ? "📈" : sig.score < -0.1 ? "📉" : "➡️";
@@ -807,9 +802,9 @@ jobs:
               for(const r of reasons) log(`║ ${r}`);
               log(`╠══════════════════════════════════════════════════════════`);
               if(overridden) {
-                log(`║ ⚠️  OVERRIDE: ${originalSide.toUpperCase()} → ${mtfSide.toUpperCase()} (MTF probability: ${mtfSide === "long" ? longProbPct : shortProbPct}%)`);
+                log(`║ ⚠️  MTF OVERRIDE: ${originalSide.toUpperCase()} → ${mtfSide.toUpperCase()} (prob: ${mtfSide === "long" ? longProbPct : shortProbPct}%)`);
               } else {
-                log(`║ ✅ CONFIRMED: ${originalSide.toUpperCase()} (MTF probability: ${originalSide === "long" ? longProbPct : shortProbPct}%)`);
+                log(`║ ✅ MTF CONFIRMED: ${originalSide.toUpperCase()} (prob: ${originalSide === "long" ? longProbPct : shortProbPct}%)`);
               }
               log(`╚══════════════════════════════════════════════════════════\n`);
 
@@ -838,7 +833,6 @@ jobs:
           try{
             const { state, persist }=await loadState();
 
-            // ── RUN COUNTER (with corruption guard) ──
             state.run_counter=(state.run_counter||0)+1;
             if(state.run_counter>10||state.run_counter<0){ state.run_counter=1; log("⚠️ Run counter corrupted — reset to 1"); }
             log(`🔄 Run ${state.run_counter}/6`);
@@ -859,7 +853,6 @@ jobs:
             cleanExpiredCooldowns(state);
             cleanExpiredClosedTrades(state);
 
-            // ── AUTO-EXPIRE STALE PENDING ENTRIES ──
             const nowMs2=Date.now();
             const activePending=(state.pending||[]).filter(p=>{ const ttlTs=p.ttl_ts_ms||0; return ttlTs>nowMs2; });
             if(activePending.length<(state.pending||[]).length){ log(`🗑️  Auto-expired ${(state.pending||[]).length-activePending.length} stale pending entries`); }
@@ -871,7 +864,6 @@ jobs:
             const preserved={ v:state.v||"bybit-hedge-7.0", run_counter:state.run_counter||0, cooldown:state.cooldown||{}, cooldown_side:state.cooldown_side||{}, mr_lockout:state.mr_lockout||{}, calibCoeffs:state.calibCoeffs||{}, learned_trade_keys:state.learned_trade_keys||[], calib_symbol_counts:state.calib_symbol_counts||{}, calib_last_version:state.calib_last_version||CALIB_VERSION, regime_state:state.regime_state||{}, regime_history:state.regime_history||{}, regime_last_update:state.regime_last_update||{}, pending:state.pending||[], closed:state.closed||[], equity:state.equity||[], sym_stats_real:state.sym_stats_real||{}, sym_stats:{}, calibration_holdout:[], lastReconcileTs:0 };
             Object.assign(state,preserved);
 
-            // ── COOLDOWN EXHAUSTION QUALITY FLOOR ──
             const cooldownCount=Object.keys(state.cooldown||{}).length;
             const qualityFloor=cooldownCount>=12?20:cooldownCount>=8?17:15;
             log(`♻️  Fresh cycle: ${cooldownCount} cooldowns, ${(state.closed||[]).length} closed trades, ${Object.keys(state.calibCoeffs||{}).length} calib models → min_conf=${qualityFloor}`);
@@ -879,7 +871,6 @@ jobs:
             const calibHealth=validateCalibration(state);
             if(!todOK) reason="tod_gate";
 
-            // ── PIPELINE TIMEOUT PROTECTION ──
             const PIPELINE_START=Date.now();
             const PIPELINE_TIMEOUT_MS=9*60*1000;
 
@@ -913,10 +904,9 @@ jobs:
             }
             log(`📈 Fetched metrics for ${allMetrics.length}/${bybitSymbols.length} symbols`);
 
-            // ── STALE DATA DETECTION ──
             const fetchRatio=allMetrics.length/bybitSymbols.length;
-            if(fetchRatio<0.85){ log(`⚠️ DATA QUALITY WARNING: only ${(fetchRatio*100).toFixed(1)}% fetched — proxy may be degraded`); }
-            if(fetchRatio<0.70){ log(`🚨 DATA QUALITY CRITICAL: ${(fetchRatio*100).toFixed(1)}% fetch rate — reducing TOP_N to 1`); }
+            if(fetchRatio<0.85){ log(`⚠️ DATA QUALITY WARNING: only ${(fetchRatio*100).toFixed(1)}% fetched`); }
+            if(fetchRatio<0.70){ log(`🚨 DATA QUALITY CRITICAL: ${(fetchRatio*100).toFixed(1)}% fetch rate`); }
             const DATA_QUALITY_TOP_N=fetchRatio<0.70?1:fetchRatio<0.85?2:null;
 
             allMetrics.sort((a,b)=>b.hedge_confidence-a.hedge_confidence);
@@ -926,38 +916,33 @@ jobs:
               log(`   ${i+1}. ${m.symbol} conf=${m.hedge_confidence} vol1h=${m.vol_1h_pct.toFixed(2)}% fund=${(m.funding_rate*100).toFixed(4)}% oi_delta=${m.oi_delta_pct.toFixed(1)}%`);
             }
 
-            // ── DYNAMIC MARKET HEALTH CHECK ──
             const marketVolSorted=allMetrics.slice(0,50).map(m=>m.vol_1h_pct).sort((a,b)=>a-b);
             const medianVol=marketVolSorted[Math.floor(marketVolSorted.length/2)]||0;
             const DYNAMIC_VOL_GATE=medianVol<1.0?1.0:medianVol<2.0?1.5:2.0;
             const DYNAMIC_TOP_N=DATA_QUALITY_TOP_N||(medianVol<1.0?1:medianVol<1.5?2:Math.max(1,TOP_N||3));
             log(`📊 Market median vol=${medianVol.toFixed(2)}% → VOL_GATE=${DYNAMIC_VOL_GATE}% TOP_N=${DYNAMIC_TOP_N}`);
 
-            // ── MACRO TREND DETECTION ──
             const top30Changes=allMetrics.slice(0,30).map(m=>m.price_change_1h||0);
             const bullCount=top30Changes.filter(c=>c>0.02).length;
             const bearCount=top30Changes.filter(c=>c<-0.02).length;
             const isMacroBull=bullCount>=20;
             const isMacroBear=bearCount>=20;
-            if(isMacroBull) log(`🐂 MACRO BULL DETECTED: ${bullCount}/30 top coins pumping — meanrevert shorts risky`);
-            if(isMacroBear) log(`🐻 MACRO BEAR DETECTED: ${bearCount}/30 top coins dumping — meanrevert longs risky`);
+            if(isMacroBull) log(`🐂 MACRO BULL DETECTED: ${bullCount}/30`);
+            if(isMacroBear) log(`🐻 MACRO BEAR DETECTED: ${bearCount}/30`);
 
-            // ── ALTCOIN SECTOR CRASH DETECTION ──
             const top20Alts=allMetrics.filter(m=>m.symbol!=="BTCUSDT"&&m.symbol!=="ETHUSDT").slice(0,20);
             const avgAltChange=mean(top20Alts.map(m=>m.price_change_1h||0));
             const altCrash=avgAltChange<-0.03;
             const altPump=avgAltChange>0.03;
-            if(altCrash) log(`🚨 ALTCOIN SECTOR CRASH: avg alt change=${(avgAltChange*100).toFixed(2)}% — blocking all LONG ideas`);
-            if(altPump) log(`🚀 ALTCOIN SECTOR PUMP: avg alt change=${(avgAltChange*100).toFixed(2)}% — blocking all SHORT meanrevert ideas`);
+            if(altCrash) log(`🚨 ALTCOIN SECTOR CRASH: avg=${(avgAltChange*100).toFixed(2)}%`);
+            if(altPump)  log(`🚀 ALTCOIN SECTOR PUMP: avg=${(avgAltChange*100).toFixed(2)}%`);
 
             const MAX_DETAILED=30;
             const topCandidates=allMetrics.slice(0,MAX_DETAILED);
             const btcMetrics=allMetrics.find(m=>m.symbol==="BTCUSDT");
             const btcUp1h=btcMetrics?(btcMetrics.price_change_1h>0):true;
-
-            // ── BTC CIRCUIT BREAKER ──
             const btcCrash=btcMetrics?Math.abs(btcMetrics.price_change_1h)>0.05:false;
-            if(btcCrash){ log(`🚨 BTC CIRCUIT BREAKER: BTC moved ${(btcMetrics.price_change_1h*100).toFixed(2)}% in 1h — blocking all LONG ideas`); }
+            if(btcCrash) log(`🚨 BTC CIRCUIT BREAKER: BTC moved ${(btcMetrics.price_change_1h*100).toFixed(2)}%`);
 
             log("📉 Pre-fetching regime candles...");
             const REG_INTERVAL=Number(process.env.REG_INTERVAL||"3");
@@ -976,7 +961,7 @@ jobs:
             }
             const validCandleCounts=[...regimeCandlesMap.values()].map(v=>Array.isArray(v)?v.length:0);
             const sufficientCount=validCandleCounts.filter(len=>len>=15).length;
-            log(`📉 Regime candles: ${sufficientCount}/${topCandidates.length} symbols have sufficient data (avg=${Math.round(mean(validCandleCounts))} candles, min=${Math.min(...validCandleCounts)}, max=${Math.max(...validCandleCounts)})`);
+            log(`📉 Regime candles: ${sufficientCount}/${topCandidates.length} symbols have sufficient data`);
 
             // ========== DETAILED REFINEMENT ==========
             const refined=[];
@@ -995,21 +980,18 @@ jobs:
                 const d1=depthWithinPctUSD(depth,mid,0.01);
                 const depth1pUSD=(d1.asksUSD||0)+(d1.bidsUSD||0);
 
-                if(spreadBps>20){ log(`[LIQ-GATE] ${cand.symbol} skipped: spread=${spreadBps}bps > 20bps max`); continue; }
-                if(depth1pUSD<10000){ log(`[LIQ-GATE] ${cand.symbol} skipped: depth1p=$${Math.round(depth1pUSD)} < $10,000 min`); continue; }
-                if(cand.vol_1h_pct<DYNAMIC_VOL_GATE){ log(`[VOL-GATE] ${cand.symbol} skipped: vol1h=${cand.vol_1h_pct.toFixed(2)}% < ${DYNAMIC_VOL_GATE}% minimum`); continue; }
+                if(spreadBps>20){ log(`[LIQ-GATE] ${cand.symbol} skipped: spread=${spreadBps}bps`); continue; }
+                if(depth1pUSD<10000){ log(`[LIQ-GATE] ${cand.symbol} skipped: depth1p=$${Math.round(depth1pUSD)}`); continue; }
+                if(cand.vol_1h_pct<DYNAMIC_VOL_GATE){ log(`[VOL-GATE] ${cand.symbol} skipped: vol1h=${cand.vol_1h_pct.toFixed(2)}%`); continue; }
 
                 const isPumpDump=cand.vol_1h_pct>15&&cand.oi_delta_pct>25;
-                if(isPumpDump){ log(`[PND-GATE] ${cand.symbol} skipped: suspicious vol=${cand.vol_1h_pct.toFixed(1)}% + oi_delta=${cand.oi_delta_pct.toFixed(1)}%`); continue; }
-
+                if(isPumpDump){ log(`[PND-GATE] ${cand.symbol} skipped`); continue; }
                 const volToOIRatio=(cand.volume_1h_usd||0)/Math.max(1,(cand.current_oi_usd||1));
                 const isWashTrading=cand.oi_delta_pct>20&&volToOIRatio<0.02&&cand.vol_1h_pct<5;
                 if(isWashTrading){ log(`[WASH-GATE] ${cand.symbol} skipped`); continue; }
-
                 const suspiciousOI=cand.oi_delta_pct>30&&(cand.volume_1h_usd||0)<5_000_000;
                 if(suspiciousOI){ log(`[OI-GATE] ${cand.symbol} skipped`); continue; }
 
-                // ── V5 REGIME DETECTION ──
                 let regime="meanrevert", slopeDir=0, v5Result=null;
                 try{
                   const kReg=regimeCandlesMap.get(cand.symbol);
@@ -1031,7 +1013,6 @@ jobs:
                 if(v5Result&&v5Result.atrPercent<ATR_MIN_PCT){ log(`[ATR-GATE] ${cand.symbol} skipped: ATR=${v5Result.atrPercent.toFixed(2)}%`); continue; }
                 const suspiciousRegime=v5Result&&v5Result.atrPercent>4.0&&regime==="meanrevert"; if(suspiciousRegime){ log(`[REG-GATE] ${cand.symbol} skipped`); continue; }
                 const extremeVolTrend=v5Result&&v5Result.atrPercent>4.5&&regime==="trend"; if(extremeVolTrend){ log(`[VOL-EXTREME] ${cand.symbol} skipped`); continue; }
-
                 const regimeLagRisk=v5Result&&regime==="meanrevert"&&Math.abs(v5Result.slopePct)>0.20;
 
                 const priceMom1h=cand.price_change_1h||0;
@@ -1046,7 +1027,7 @@ jobs:
                 const fundingDangerous=Math.abs(cand.funding_rate_raw||0)>0.01;
                 const fundingExtreme=Math.abs(cand.funding_rate_raw||0)>0.005;
                 if(fundingDangerous){ log(`[FUND-GATE] ${cand.symbol} skipped`); continue; }
-                if(fundingExtreme) log(`[FUND-GATE] ${cand.symbol} WARNING: extreme funding`);
+                if(fundingExtreme) log(`[FUND-GATE] ${cand.symbol} WARNING`);
                 const fundingWeight=fundingExtreme?0.05:0.20;
                 const dirEdge=(momScore*0.40+oiScore*0.25+fundingScore*fundingWeight+btcRegimeScore*0.15)*(0.5+0.5*volConfirm);
 
@@ -1065,7 +1046,7 @@ jobs:
 
                 log(`[DIR] ${cand.symbol} regime=${regime} edge=${dirEdge.toFixed(3)} → ${forcedSide}`);
 
-                if(Math.abs(dirEdge)<0.15){ log(`[EDGE-GATE] ${cand.symbol} skipped: edge too weak`); continue; }
+                if(Math.abs(dirEdge)<0.15){ log(`[EDGE-GATE] ${cand.symbol} skipped`); continue; }
                 if(regimeLagRisk&&forcedSide==="long"&&v5Result.slopePct<0){ log(`[LAG-GATE] ${cand.symbol} skipped`); continue; }
                 if(regimeLagRisk&&forcedSide==="short"&&v5Result.slopePct>0){ log(`[LAG-GATE] ${cand.symbol} skipped`); continue; }
                 if((btcCrash||altCrash)&&forcedSide==="long"){ log(`[CRASH-GATE] ${cand.symbol} skipped`); continue; }
@@ -1135,14 +1116,13 @@ jobs:
 
             log(`🔍 Refined ${refined.length} candidates`);
 
-            // ── FINAL SELECTION WITH CONFIDENCE GATE ──
             refined.sort((a,b)=>b.confidence-a.confidence);
             const TARGET_TOP_N=DYNAMIC_TOP_N;
             const MIN_CONF_TO_TRADE=qualityFloor;
             const selected=[];
             for(const cand of refined){
               if(selected.length>=TARGET_TOP_N) break;
-              if(cand.confidence<MIN_CONF_TO_TRADE){ log(`[CONF-GATE] ${cand.symbol} skipped: conf=${cand.confidence} < ${MIN_CONF_TO_TRADE}`); continue; }
+              if(cand.confidence<MIN_CONF_TO_TRADE){ log(`[CONF-GATE] ${cand.symbol} skipped: conf=${cand.confidence}`); continue; }
               if(!selected.some(s=>s.base===cand.base)) selected.push(cand);
             }
             if(selected.length<TARGET_TOP_N){
@@ -1156,52 +1136,60 @@ jobs:
             log(`✅ Selected ${selected.length} ideas before MTF analysis`);
 
             // ================================================================
-            // ── FINAL MTF DIRECTION ANALYSIS (new step) ──
-            // runs AFTER selection, refines/overrides direction with precision
+            // ── FINAL MTF DIRECTION ANALYSIS ──
             // ================================================================
             log("\n🔬 ════════════════════════════════════════════════════════");
             log("🔬  FINAL MTF DIRECTION ANALYSIS — running for all selected ideas");
             log("🔬 ════════════════════════════════════════════════════════\n");
 
-            const MTF_OVERRIDE_MIN_CONF = 45; // only override if MTF is confident enough
-            const MTF_DROP_MIN_PROB     = 35; // drop idea if winning prob < 35% after MTF
-
             const selectedAfterMTF = [];
+            let mtfStats = { dropped_coinflip:0, dropped_low_prob:0, overridden:0, confirmed:0 };
+
             for(const cand of selected) {
               try {
                 const mtf = await runMTFDirectionAnalysis(cand.symbol, cand.side, cand.mark_price);
 
-                // ── APPLY MTF RESULT ──
                 const mtfWinProb = cand.side === "long" ? mtf.long_prob_pct : mtf.short_prob_pct;
+                const mtfMaxProb = Math.max(mtf.long_prob_pct, mtf.short_prob_pct);
 
-                // Drop idea if MTF says very low probability for original side
-                if(mtfWinProb < MTF_DROP_MIN_PROB && mtf.confidence_pct >= MTF_OVERRIDE_MIN_CONF) {
-                  log(`[MTF-DROP] ${cand.symbol}: ${cand.side} win_prob=${mtfWinProb}% < ${MTF_DROP_MIN_PROB}% — dropping idea`);
+                // ── GATE 1: COIN FLIP — neither side has conviction ──
+                // drop regardless of MTF confidence
+                if(mtfMaxProb < MTF_COINFLIP_GATE) {
+                  log(`[MTF-COINFLIP] ${cand.symbol}: max_prob=${mtfMaxProb}% < ${MTF_COINFLIP_GATE}% — no conviction, dropping`);
+                  mtfStats.dropped_coinflip++;
                   continue;
                 }
 
-                // Override direction if MTF confident and disagrees
-                if(mtf.overridden && mtf.confidence_pct >= MTF_OVERRIDE_MIN_CONF) {
-                  log(`[MTF-OVERRIDE] ${cand.symbol}: ${cand.side} → ${mtf.final_side} (MTF conf=${mtf.confidence_pct}%)`);
-
-                  // recalculate p_lcb and p_raw for new side
-                  const newSide = mtf.final_side;
-                  const newPRaw = newSide === "long"
-                    ? clamp(mtf.long_prob_pct / 100, 0.28, 0.88)
-                    : clamp(mtf.short_prob_pct / 100, 0.28, 0.88);
-                  const newPLcb = calibrateP(state, newSide, cand.regime, newPRaw);
-                  const newNCoeff = getCoeffs(state, newSide, cand.regime)?.n || 0;
-                  const newPLcbW = wilsonLCB(newPLcb, Math.max(1, Math.min(500, newNCoeff)), WILSON_Z);
-
-                  cand.side       = newSide;
-                  cand.p_raw      = +newPRaw.toFixed(3);
-                  cand.p_lcb      = +newPLcbW.toFixed(3);
-                  cand.mtf_overridden = true;
-                } else {
-                  cand.mtf_overridden = false;
+                // ── GATE 2: OUR SIDE HAS LOW PROBABILITY ──
+                // drop regardless of MTF confidence — probability is the truth
+                if(mtfWinProb < MTF_DROP_MIN_PROB) {
+                  log(`[MTF-DROP] ${cand.symbol}: ${cand.side} win_prob=${mtfWinProb}% < ${MTF_DROP_MIN_PROB}% — dropping (MTF strongly disagrees)`);
+                  mtfStats.dropped_low_prob++;
+                  continue;
                 }
 
-                // attach MTF data to candidate
+                // ── GATE 3: OVERRIDE DIRECTION ──
+                // override if MTF disagrees AND has enough confidence
+                if(mtf.overridden && mtf.confidence_pct >= MTF_OVERRIDE_MIN_CONF) {
+                  log(`[MTF-OVERRIDE] ${cand.symbol}: ${cand.side} → ${mtf.final_side} (conf=${mtf.confidence_pct}% prob=${mtf.final_side==="long"?mtf.long_prob_pct:mtf.short_prob_pct}%)`);
+                  const newSide  = mtf.final_side;
+                  const newPRaw  = newSide === "long"
+                    ? clamp(mtf.long_prob_pct  / 100, 0.28, 0.88)
+                    : clamp(mtf.short_prob_pct / 100, 0.28, 0.88);
+                  const newPLcb  = calibrateP(state, newSide, cand.regime, newPRaw);
+                  const newN     = getCoeffs(state, newSide, cand.regime)?.n || 0;
+                  const newPLcbW = wilsonLCB(newPLcb, Math.max(1, Math.min(500, newN)), WILSON_Z);
+                  cand.side           = newSide;
+                  cand.p_raw          = +newPRaw.toFixed(3);
+                  cand.p_lcb          = +newPLcbW.toFixed(3);
+                  cand.mtf_overridden = true;
+                  mtfStats.overridden++;
+                } else {
+                  cand.mtf_overridden = false;
+                  mtfStats.confirmed++;
+                }
+
+                // ── ATTACH MTF DATA ──
                 cand.mtf = {
                   long_prob_pct:  mtf.long_prob_pct,
                   short_prob_pct: mtf.short_prob_pct,
@@ -1214,29 +1202,32 @@ jobs:
                   detail:         mtf.detail
                 };
 
-                // boost/reduce confidence based on MTF alignment
-                const mtfAlignBonus = !mtf.overridden && mtf.confidence_pct >= 60 ?  1.08
-                                    : !mtf.overridden && mtf.confidence_pct >= 40 ?  1.03
-                                    :  mtf.overridden                              ?  0.92
-                                    :                                                 1.00;
+                // ── CONFIDENCE ADJUSTMENT BASED ON MTF ALIGNMENT ──
+                const mtfAlignBonus = (!mtf.overridden && mtf.confidence_pct >= 60) ?  1.08
+                                    : (!mtf.overridden && mtf.confidence_pct >= 40) ?  1.03
+                                    :  mtf.overridden                               ?  0.92
+                                    :                                                   1.00;
                 cand.confidence = clamp(Math.round(cand.confidence * mtfAlignBonus), 0, 100);
 
                 selectedAfterMTF.push(cand);
 
               } catch(e) {
-                log(`[MTF] Error processing ${cand.symbol}:`, e?.message || e);
+                log(`[MTF] Error for ${cand.symbol}:`, e?.message || e);
+                // on error keep the idea but mark MTF as null
                 cand.mtf = null;
-                selectedAfterMTF.push(cand); // keep on error
+                cand.mtf_overridden = false;
+                selectedAfterMTF.push(cand);
               }
             }
 
-            log(`\n✅ After MTF: ${selectedAfterMTF.length}/${selected.length} ideas passed`);
+            log(`\n✅ MTF Results: ${selectedAfterMTF.length}/${selected.length} passed`);
+            log(`   Dropped (coinflip): ${mtfStats.dropped_coinflip} | Dropped (low prob): ${mtfStats.dropped_low_prob} | Overridden: ${mtfStats.overridden} | Confirmed: ${mtfStats.confirmed}`);
             log("📋 Final ideas summary:");
             for(const c of selectedAfterMTF) {
-              log(`   ${c.symbol} → ${c.side.toUpperCase()} | conf=${c.confidence} | long=${c.mtf?.long_prob_pct??'?'}% short=${c.mtf?.short_prob_pct??'?'}% | ${c.mtf_overridden?"⚠️ OVERRIDDEN":"✅ CONFIRMED"}`);
+              const winProb = c.side === "long" ? c.mtf?.long_prob_pct : c.mtf?.short_prob_pct;
+              log(`   ${c.symbol} → ${c.side.toUpperCase()} | conf=${c.confidence} | long=${c.mtf?.long_prob_pct??'?'}% short=${c.mtf?.short_prob_pct??'?'}% | win_prob=${winProb??'?'}% | ${c.mtf_overridden?"⚠️ OVERRIDDEN":"✅ CONFIRMED"}`);
             }
 
-            // ── USE selectedAfterMTF instead of selected from here ──
             const finalSelected = selectedAfterMTF;
 
             const flipped=HEDGE?finalSelected.map(orig=>({ ...orig, side:orig.side==="long"?"short":"long", flipped:true, original_idea_id:orig.symbol+"_"+orig.side })):[];
@@ -1287,13 +1278,11 @@ jobs:
 
             let picks=picksV2.map(toV1Compat);
 
-            // ── SIZE SCALING ON HIGH VOL ──
             try{
               const maxVolPick=Math.max(...picks.map(p=>p.predicted?.vol_1h_pct||1));
               if(maxVolPick>5){ const scale=clamp(5/maxVolPick,0.65,1); picks=picks.map(p=>({...p,size_bps:Math.max(4,Math.round(p.size_bps*scale))})); log("[gha] High volatility detected, scaling sizes by",scale.toFixed(2)); }
             }catch(e){ log("[gha] Portfolio risk adjustment warn",e?.message||e); }
 
-            // ── PRE-PUSH LIQUIDITY RE-VERIFICATION ──
             const verifiedPicks=[];
             for(const p of picks){
               try{
@@ -1314,7 +1303,6 @@ jobs:
             picks=verifiedPicks;
             picksV2=picksV2.filter(p=>verifiedPicks.some(v=>v.idea_id===p.idea_id));
 
-            // ── UPDATE STATE ──
             try{
               const nowMs=Date.now(), ideasTs=new Date(nowMs).toISOString();
               for(const p of picks){
@@ -1329,11 +1317,14 @@ jobs:
             const auditOut=buildAuditOutputs(state);
             await saveState(persist,state,auditOut,2,true);
 
-            for(const p of picks) log(`idea ${p.symbol_full} ${p.side} conf=${p.confidence} long=${p.mtf_analysis?.long_prob_pct??'?'}% short=${p.mtf_analysis?.short_prob_pct??'?'}% mtf_override=${p.mtf_overridden}`);
+            for(const p of picks){
+              const winProb = p.side==="long" ? p.mtf_analysis?.long_prob_pct : p.mtf_analysis?.short_prob_pct;
+              log(`idea ${p.symbol_full} ${p.side} conf=${p.confidence} long=${p.mtf_analysis?.long_prob_pct??'?'}% short=${p.mtf_analysis?.short_prob_pct??'?'}% win_prob=${winProb??'?'}% mtf_override=${p.mtf_overridden}`);
+            }
 
             const ideaLogs=picks.map(p=>({ symbol:p.symbol_full, side:p.side, flipped:p.predicted?.flipped||false, confidence:p.confidence, hedge_confidence:p.predicted?.hedge_confidence||0, vol_1h_pct:+(p.predicted?.vol_1h_pct||0).toFixed(2), funding_rate:+(p.predicted?.funding_rate||0).toFixed(5), oi_delta_pct:+(p.predicted?.oi_delta_pct||0).toFixed(1), volume_1h_usd:Math.round((p.predicted?.volume_1h_usd||0)/1e6)+"M", reasons:p.reasons_text, p_cal:+p.p_lcb.toFixed(3), ev_bps:p.ev_bps, idea_id:p.idea_id, mtf_long_prob:p.mtf_analysis?.long_prob_pct??null, mtf_short_prob:p.mtf_analysis?.short_prob_pct??null, mtf_confidence:p.mtf_analysis?.confidence_pct??null, mtf_overridden:p.mtf_overridden||false, mtf_reasons:p.mtf_analysis?.reasons?.slice(0,3)||[] }));
 
-            const meta={ origin:"github_actions", reason, exchange:"bybit_futures", execution_exchange:"bybit_futures", strategy:STRATEGY_NAME, model_version:MODEL_VERSION, schema_version:SCHEMA_VERSION, git_sha:GIT_SHA, config_hash:CONFIG_HASH, counts:{ bybit_universe:bybitSymbols.length, metrics_fetched:allMetrics.length, refined:refined.length, selected_pre_mtf:selected.length, selected_post_mtf:finalSelected.length, final_picks:picks.length }, dd_gate:{ pnl24_bps, peak_dd_bps, throttle }, tod:{ active:S_H!=null&&E_H!=null, start:S_H, end:E_H }, heartbeat:{ mismatches:0, zombies:0 }, tier:selectionTier, idea_logs:ideaLogs, calibration_health:calibHealth, market_health:{ median_vol:+medianVol.toFixed(2), dynamic_vol_gate:DYNAMIC_VOL_GATE, dynamic_top_n:DYNAMIC_TOP_N, btc_crash:btcCrash, alt_crash:altCrash, alt_pump:altPump, macro_bull:isMacroBull, macro_bear:isMacroBear, fetch_ratio:+fetchRatio.toFixed(3) }, extras:{ v2_ideas:picksV2, features_requested:["maker_join","post_only","futures","hedge_trading","bybit_execution","mtf_direction_analysis"] } };
+            const meta={ origin:"github_actions", reason, exchange:"bybit_futures", execution_exchange:"bybit_futures", strategy:STRATEGY_NAME, model_version:MODEL_VERSION, schema_version:SCHEMA_VERSION, git_sha:GIT_SHA, config_hash:CONFIG_HASH, counts:{ bybit_universe:bybitSymbols.length, metrics_fetched:allMetrics.length, refined:refined.length, selected_pre_mtf:selected.length, selected_post_mtf:finalSelected.length, mtf_stats:mtfStats, final_picks:picks.length }, dd_gate:{ pnl24_bps, peak_dd_bps, throttle }, tod:{ active:S_H!=null&&E_H!=null, start:S_H, end:E_H }, heartbeat:{ mismatches:0, zombies:0 }, tier:selectionTier, idea_logs:ideaLogs, calibration_health:calibHealth, market_health:{ median_vol:+medianVol.toFixed(2), dynamic_vol_gate:DYNAMIC_VOL_GATE, dynamic_top_n:DYNAMIC_TOP_N, btc_crash:btcCrash, alt_crash:altCrash, alt_pump:altPump, macro_bull:isMacroBull, macro_bear:isMacroBear, fetch_ratio:+fetchRatio.toFixed(3) }, extras:{ v2_ideas:picksV2, features_requested:["maker_join","post_only","futures","hedge_trading","bybit_execution","mtf_direction_analysis_v2"] } };
 
             const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta, top_n:picks.length||0, ideas:picks||[] };
             log(`pushing ${picks.length} ideas (${selectionTier}) to ${PUSH_URL}`);
