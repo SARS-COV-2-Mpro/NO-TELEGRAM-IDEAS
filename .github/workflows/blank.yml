@@ -1453,25 +1453,11 @@ jobs:
                   continue;
                 }
 
-                // ── GATE 3: OVERRIDE DIRECTION
-                if(mtf.overridden && mtf.confidence_pct >= MTF_OVERRIDE_MIN_CONF) {
-                  log(`[MTF-OVERRIDE] ${cand.symbol}: ${cand.side} → ${mtf.final_side} (conf=${mtf.confidence_pct}%)`);
-                  const newSide  = mtf.final_side;
-                  const newPRaw  = newSide === "long"
-                    ? clamp(mtf.long_prob_pct  / 100, 0.28, 0.88)
-                    : clamp(mtf.short_prob_pct / 100, 0.28, 0.88);
-                  const newPLcb  = calibrateP(state, newSide, cand.regime, newPRaw);
-                  const newN     = getCoeffs(state, newSide, cand.regime)?.n || 0;
-                  const newPLcbW = wilsonLCB(newPLcb, Math.max(1, Math.min(500, newN)), WILSON_Z);
-                  cand.side           = newSide;
-                  cand.p_raw          = +newPRaw.toFixed(3);
-                  cand.p_lcb          = +newPLcbW.toFixed(3);
-                  cand.mtf_overridden = true;
-                  mtfStats.overridden++;
-                } else {
-                  cand.mtf_overridden = false;
-                  mtfStats.confirmed++;
-                }
+                
+                // ── GATE 3: OVERRIDE DIRECTION ── // ★ NEW:
+                If MTF wants to flip but confidence < 40%, KEEP original direction
+                if(mtf.overridden && mtf.confidence_pct < 40) {   log(`[MTF-KEEP-ORIG] ${cand.symbol}: MTF wants to flip but conf=${mtf.confidence_pct}% < 40% — keeping original ${cand.side.toUpperCase()}`);   cand.mtf_overridden = false;   mtfStats.confirmed++;   // check original side still has acceptable probability   const origWinProb = cand.side === "long" ? mtf.long_prob_pct : mtf.short_prob_pct;   if(origWinProb >= MTF_DROP_MIN_PROB) {     // attach MTF data and push     cand.mtf = {       long_prob_pct:  mtf.long_prob_pct,       short_prob_pct: mtf.short_prob_pct,       confidence_pct: mtf.confidence_pct,       net_score:      mtf.net_score,       overridden:     false,       final_side:     cand.side,       signals:        mtf.signals,       reasons:        mtf.reasons,       detail:         mtf.detail     };     selectedAfterMTF.push(cand);     log(`[MTF-KEEP-ORIG] ${cand.symbol}: kept ${cand.side.toUpperCase()} orig_prob=${origWinProb}%`);   } else {     log(`[MTF-DROP] ${cand.symbol}: original side prob=${origWinProb}% < ${MTF_DROP_MIN_PROB}% — dropping`);     mtfStats.dropped_low_prob++;   }   continue; }  // override if MTF disagrees AND has enough confidence if(mtf.overridden && mtf.confidence_pct >= MTF_OVERRIDE_MIN_CONF) {   log(`[MTF-OVERRIDE] ${cand.symbol}: ${cand.side} → ${mtf.final_side} (conf=${mtf.confidence_pct}% prob=${mtf.final_side==="long"?mtf.long_prob_pct:mtf.short_prob_pct}%)`);   const newSide  = mtf.final_side;   const newPRaw  = newSide === "long"     ? clamp(mtf.long_prob_pct  / 100, 0.28, 0.88)     : clamp(mtf.short_prob_pct / 100, 0.28, 0.88);   const newPLcb  = calibrateP(state, newSide, cand.regime, newPRaw);   const newN     = getCoeffs(state, newSide, cand.regime)?.n || 0;   const newPLcbW = wilsonLCB(newPLcb, Math.max(1, Math.min(500, newN)), WILSON_Z);   cand.side           = newSide;   cand.p_raw          = +newPRaw.toFixed(3);   cand.p_lcb          = +newPLcbW.toFixed(3);   cand.mtf_overridden = true;   mtfStats.overridden++; } else {   cand.mtf_overridden = false;   mtfStats.confirmed++; }
+
 
                 // GATE: Drop if our side has < 50% win probability after MTF check
                 const winProbAfterMTF = cand.side === "long" ? mtf.long_prob_pct : mtf.short_prob_pct;
