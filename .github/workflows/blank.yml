@@ -847,7 +847,7 @@ jobs:
                       rsiReason += ` + BEARISH DIVERGENCE (price new high but RSI falling ${rsiAtHigh.toFixed(0)}→${rsiNow.toFixed(0)})`;
                     }
                   }
-                  signals.push({ name:"rsi_condition", score:rsiScore, weight:0.20, reason:rsiReason });
+                  signals.push({ name:"rsi_condition", score:rsiScore, weight:0.20, reason:rsiReason, rsiValue:+rsi5m.toFixed(1) });
                 }
               }
 
@@ -892,15 +892,15 @@ jobs:
                 const hl = minRecentL > minPriorL;
                 const lh = maxRecentH < maxPriorH;
                 const ll = minRecentL < minPriorL;
-                let score = 0, reason = "";
-                if(hh && hl)       { score =  0.80; reason = "Structure: HH+HL = UPTREND (15m)"; }
-                else if(lh && ll)  { score = -0.80; reason = "Structure: LH+LL = DOWNTREND (15m)"; }
-                else if(hh && ll)  { score =  0.10; reason = "Structure: HH+LL = expanding range (volatile)"; }
-                else if(lh && hl)  { score = -0.05; reason = "Structure: LH+HL = contracting (squeeze)"; }
-                else if(hh)        { score =  0.30; reason = "Structure: HH only — weakening uptrend"; }
-                else if(ll)        { score = -0.30; reason = "Structure: LL only — weakening downtrend"; }
-                else               { score =  0.00; reason = "Structure: no clear pattern"; }
-                signals.push({ name:"price_structure", score, weight:0.20, reason });
+                let score = 0, reason = "", patternType = "no_pattern";
+                if(hh && hl)       { score =  0.80; reason = "Structure: HH+HL = UPTREND (15m)"; patternType="uptrend"; }
+                else if(lh && ll)  { score = -0.80; reason = "Structure: LH+LL = DOWNTREND (15m)"; patternType="downtrend"; }
+                else if(hh && ll)  { score =  0.10; reason = "Structure: HH+LL = expanding range (volatile)"; patternType="expanding"; }
+                else if(lh && hl)  { score = -0.05; reason = "Structure: LH+HL = contracting (squeeze)"; patternType="squeeze"; }
+                else if(hh)        { score =  0.30; reason = "Structure: HH only — weakening uptrend"; patternType="weak_uptrend"; }
+                else if(ll)        { score = -0.30; reason = "Structure: LL only — weakening downtrend"; patternType="weak_downtrend"; }
+                else               { score =  0.00; reason = "Structure: no clear pattern"; patternType="no_pattern"; }
+                signals.push({ name:"price_structure", score, weight:0.20, reason, patternType });
               }
 
               // ═══ SIGNAL 5: 1H MACRO DIRECTION (weight: 0.15) ═══
@@ -973,7 +973,7 @@ jobs:
               result.short_prob_pct = shortProbPct;
               result.confidence_pct = confidencePct;
               result.net_score      = +netScore.toFixed(4);
-              result.signals        = signals.map(s => ({ name:s.name, score:+s.score.toFixed(3), weight:s.weight }));
+              result.signals        = signals.map(s => ({ name:s.name, score:+s.score.toFixed(3), weight:s.weight, ...(s.rsiValue!=null?{rsiValue:s.rsiValue}:{}), ...(s.patternType?{patternType:s.patternType}:{}) }));
               result.reasons        = reasons;
               result.detail         = `score=${netScore.toFixed(3)} agree=${agreementRatio.toFixed(2)} long=${longProbPct}% short=${shortProbPct}% conf=${confidencePct}%`;
 
@@ -983,6 +983,102 @@ jobs:
             }
 
             return result;
+          }
+
+          // ================================================================
+          // SIGNAL CONTRADICTION CHECK
+          // ================================================================
+          function applySignalContradictionCheck(candidates){
+            const VOL_THRESH=0.15;
+            const MACRO_THRESH=0.20;
+            const RSI_HIGH=70, RSI_LOW=30;
+            const WINPROB_FLOOR=58;
+            const STRUCT_AGAINST_LONG=new Set(["downtrend","weak_downtrend","expanding"]);
+            const STRUCT_AGAINST_SHORT=new Set(["uptrend","weak_uptrend","expanding"]);
+            const survivors=[];
+
+            for(const cand of candidates){
+              const signals=cand.mtf?.signals||[];
+              const getSig=(name)=>signals.find(s=>s.name===name);
+              let strikes=0;
+              const strikeReasons=[];
+
+              // CHECK 1: Volume vs Direction
+              const volScore=getSig("volume_direction")?.score??0;
+              if(
+                (cand.side==="long"  && volScore < -VOL_THRESH) ||
+                (cand.side==="short" && volScore >  VOL_THRESH)
+              ){
+                strikes++;
+                strikeReasons.push(`volume_against(${volScore.toFixed(2)})`);
+              }
+
+              // CHECK 2: Price Structure vs Direction (categorical)
+              const structPattern=getSig("price_structure")?.patternType??"no_pattern";
+              if(
+                (cand.side==="long"  && STRUCT_AGAINST_LONG.has(structPattern))  ||
+                (cand.side==="short" && STRUCT_AGAINST_SHORT.has(structPattern))
+              ){
+                strikes++;
+                strikeReasons.push(`structure_against(${structPattern})`);
+              }
+
+              // CHECK 3: 1h Macro vs Direction
+              const macroScore=getSig("macro_1h")?.score??0;
+              if(
+                (cand.side==="long"  && macroScore <= -MACRO_THRESH) ||
+                (cand.side==="short" && macroScore >=  MACRO_THRESH)
+              ){
+                strikes++;
+                strikeReasons.push(`macro_1h_against(${macroScore.toFixed(2)})`);
+              }
+
+              // CHECK 4: RSI Extreme vs Direction
+              const rsiValue=getSig("rsi_condition")?.rsiValue??null;
+              if(rsiValue!=null){
+                if(
+                  (cand.side==="long"  && rsiValue > RSI_HIGH) ||
+                  (cand.side==="short" && rsiValue < RSI_LOW)
+                ){
+                  strikes++;
+                  strikeReasons.push(`rsi_extreme(${rsiValue})`);
+                }
+              }
+
+              // CHECK 5: Win Probability Floor
+              const winProb=cand.side==="long"
+                ? cand.mtf?.long_prob_pct
+                : cand.mtf?.short_prob_pct;
+              if((winProb??0) < WINPROB_FLOOR){
+                strikes++;
+                strikeReasons.push(`win_prob_low(${winProb}%)`);
+              }
+
+              cand.contradiction_strikes=strikes;
+              cand.contradiction_reasons=strikeReasons;
+
+              // DECISION
+              if(strikes>=3){
+                log(`[CONTRA-DROP] ${cand.symbol} ${cand.side.toUpperCase()} strikes=${strikes} [${strikeReasons.join(", ")}] — dropped`);
+                continue;
+              }
+              if(strikes===2){
+                const before=cand.confidence;
+                cand.confidence=Math.round(cand.confidence*0.65);
+                log(`[CONTRA-WARN2] ${cand.symbol} strikes=2 [${strikeReasons.join(", ")}] confidence ${before}→${cand.confidence}`);
+              } else if(strikes===1){
+                const before=cand.confidence;
+                cand.confidence=Math.round(cand.confidence*0.85);
+                log(`[CONTRA-WARN1] ${cand.symbol} strikes=1 [${strikeReasons.join(", ")}] confidence ${before}→${cand.confidence}`);
+              } else {
+                log(`[CONTRA-OK] ${cand.symbol} ${cand.side.toUpperCase()} strikes=0 — clean signal agreement`);
+              }
+
+              survivors.push(cand);
+            }
+
+            log(`[CONTRA] ${survivors.length}/${candidates.length} survived contradiction check`);
+            return survivors;
           }
 
           // ================================================================
@@ -1520,17 +1616,6 @@ jobs:
                   detail:         mtf.detail
                 };
 
-                const volSignal = cand.mtf?.signals?.find(s => s.name === "volume_direction");
-                const volScore = volSignal?.score || 0;
-                const volumeStronglyAgainst =
-                  (cand.side === "long"  && volScore < -0.60) ||
-                  (cand.side === "short" && volScore >  0.60);
-                if(volumeStronglyAgainst) {
-                  log(`[VOL-CONFLICT] ${cand.symbol}: ${cand.side} but volume strongly against (score=${volScore.toFixed(2)}) — dropping`);
-                  mtfStats.dropped_low_prob++;
-                  continue;
-                }
-
                 const mtfAlignBonus = (!mtf.overridden && mtf.confidence_pct >= 60) ?  1.08
                                     : (!mtf.overridden && mtf.confidence_pct >= 40) ?  1.03
                                     :  mtf.overridden                               ?  0.92
@@ -1596,6 +1681,10 @@ jobs:
               }
               finalSelected = selectedAfterMTF;
             }
+
+            // ── SIGNAL CONTRADICTION CHECK ──
+            finalSelected = applySignalContradictionCheck(finalSelected);
+            log(`📋 After contradiction check: ${finalSelected.length} ideas remain`);
 
             const flipped=HEDGE?finalSelected.map(orig=>({ ...orig, side:orig.side==="long"?"short":"long", flipped:true, original_idea_id:orig.symbol+"_"+orig.side })):[];
             const selectedWithFlipped=[...finalSelected,...flipped];
