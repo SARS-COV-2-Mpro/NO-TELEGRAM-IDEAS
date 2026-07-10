@@ -1,4 +1,3 @@
-0
 name: Ideas Pusher (MEXC Ultimate 7.7.7)
 
 on:
@@ -419,7 +418,7 @@ jobs:
           const WEIGHT_VOLUME=0.15;
           const WEIGHT_DIRECTION=0.20;
 
-          const MTF_OVERRIDE_MIN_CONF = 30;
+          const MTF_OVERRIDE_MIN_CONF = 35;
           const MTF_DROP_MIN_PROB     = 50;
           const MTF_COINFLIP_GATE     = 52;
 
@@ -1543,50 +1542,11 @@ jobs:
             for(const cand of selected) {
               try {
                 const mtf = await runMTFDirectionAnalysis(cand.symbol, cand.side, cand.mark_price);
-
-                const mtfWinProb = cand.side === "long" ? mtf.long_prob_pct : mtf.short_prob_pct;
-                const mtfMaxProb = Math.max(mtf.long_prob_pct, mtf.short_prob_pct);
-
-                // ── GATE 1: COIN FLIP
-                if(mtfMaxProb < MTF_COINFLIP_GATE) {
-                  log(`[MTF-COINFLIP] ${cand.symbol}: max_prob=${mtfMaxProb}% < ${MTF_COINFLIP_GATE}% — no conviction, dropping`);
-                  mtfStats.dropped_coinflip++;
-                  continue;
-                }
-
-                // ── GATE 3 FIRST: CHECK FOR OVERRIDE ──
-                if(mtf.overridden && mtf.confidence_pct < 40) {
-                  log(`[MTF-KEEP-ORIG] ${cand.symbol}: MTF wants to flip but conf=${mtf.confidence_pct}% < 40% — keeping original ${cand.side.toUpperCase()}`);
-                  const origWinProb = cand.side === "long" ? mtf.long_prob_pct : mtf.short_prob_pct;
-                  if(origWinProb < MTF_DROP_MIN_PROB) {
-                    log(`[MTF-DROP] ${cand.symbol}: original side prob=${origWinProb}% < ${MTF_DROP_MIN_PROB}% — dropping`);
-                    mtfStats.dropped_low_prob++;
-                    continue;
-                  }
-                  cand.mtf_overridden = false;
-                  mtfStats.confirmed++;
-                  cand.mtf = {
-                    long_prob_pct:mtf.long_prob_pct, short_prob_pct:mtf.short_prob_pct,
-                    confidence_pct:mtf.confidence_pct, net_score:mtf.net_score,
-                    overridden:false, final_side:cand.side,
-                    signals:mtf.signals, reasons:mtf.reasons, detail:mtf.detail
-                  };
-                  selectedAfterMTF.push(cand);
-                  log(`[MTF-KEEP-ORIG] ${cand.symbol}: kept ${cand.side.toUpperCase()} orig_prob=${origWinProb}%`);
-                  continue;
-                }
-
-                // ── GATE 2 SECOND: OUR SIDE HAS LOW PROBABILITY ──
-                if(mtfWinProb < MTF_DROP_MIN_PROB) {
-                  log(`[MTF-DROP] ${cand.symbol}: ${cand.side} win_prob=${mtfWinProb}% < ${MTF_DROP_MIN_PROB}% — dropping`);
-                  mtfStats.dropped_low_prob++;
-                  continue;
-                }
-
+                
+                // ── STEP 1: EXECUTE FLIP FIRST (before any drop gates) ──
                 if(mtf.overridden && mtf.confidence_pct >= MTF_OVERRIDE_MIN_CONF) {
-                  log(`[MTF-OVERRIDE] ${cand.symbol}: ${cand.side} → ${mtf.final_side} (conf=${mtf.confidence_pct}% prob=${mtf.final_side==="long"?mtf.long_prob_pct:mtf.short_prob_pct}%)`);
-                  const newSide  = mtf.final_side;
-                  const newPRaw  = newSide === "long"
+                  const newSide = mtf.final_side;
+                  const newPRaw = newSide === "long"
                     ? clamp(mtf.long_prob_pct  / 100, 0.28, 0.88)
                     : clamp(mtf.short_prob_pct / 100, 0.28, 0.88);
                   const newPLcb  = calibrateP(state, newSide, cand.regime, newPRaw);
@@ -1597,18 +1557,47 @@ jobs:
                   cand.p_lcb          = +newPLcbW.toFixed(3);
                   cand.mtf_overridden = true;
                   mtfStats.overridden++;
-                } else {
+                  log(`[MTF-OVERRIDE] ${cand.symbol}: flipped to ${newSide.toUpperCase()} (conf=${mtf.confidence_pct}%)`);
+                }
+                else if(mtf.overridden && mtf.confidence_pct < MTF_OVERRIDE_MIN_CONF) {
+                  // conf too low to flip — keep original side
+                  cand.mtf_overridden = false;
+                  mtfStats.confirmed++;
+                  log(`[MTF-KEEP-ORIG] ${cand.symbol}: conf=${mtf.confidence_pct}% < ${MTF_OVERRIDE_MIN_CONF}% — keeping ${cand.side.toUpperCase()}`);
+                }
+                else {
+                  // no override — MTF agreed with original side
                   cand.mtf_overridden = false;
                   mtfStats.confirmed++;
                 }
 
-                const winProbAfterMTF = cand.side === "long" ? mtf.long_prob_pct : mtf.short_prob_pct;
-                if(winProbAfterMTF < 50) {
-                  log(`[MTF-NEG-EV] ${cand.symbol}: win_prob=${winProbAfterMTF}% < 50% — dropping`);
+                // ── STEP 2: NOW check win probability (using CURRENT side, after any flip) ──
+                const currentWinProb = cand.side === "long"
+                  ? mtf.long_prob_pct
+                  : mtf.short_prob_pct;
+
+                if(currentWinProb < MTF_DROP_MIN_PROB) {
+                  log(`[MTF-DROP] ${cand.symbol}: ${cand.side} win_prob=${currentWinProb}% < ${MTF_DROP_MIN_PROB}% — dropping`);
                   mtfStats.dropped_low_prob++;
                   continue;
                 }
 
+                // ── STEP 3: COIN FLIP CHECK ──
+                const mtfMaxProb = Math.max(mtf.long_prob_pct, mtf.short_prob_pct);
+                if(mtfMaxProb < MTF_COINFLIP_GATE) {
+                  log(`[MTF-COINFLIP] ${cand.symbol}: max_prob=${mtfMaxProb}% < ${MTF_COINFLIP_GATE}% — no conviction, dropping`);
+                  mtfStats.dropped_coinflip++;
+                  continue;
+                }
+
+                // ── STEP 4: NEGATIVE EV CHECK ──
+                if(currentWinProb < 50) {
+                  log(`[MTF-NEG-EV] ${cand.symbol}: win_prob=${currentWinProb}% < 50% — dropping`);
+                  mtfStats.dropped_low_prob++;
+                  continue;
+                }
+
+                // ── STEP 5: ATTACH MTF + CONFIDENCE BONUS ──
                 cand.mtf = {
                   long_prob_pct:  mtf.long_prob_pct,
                   short_prob_pct: mtf.short_prob_pct,
