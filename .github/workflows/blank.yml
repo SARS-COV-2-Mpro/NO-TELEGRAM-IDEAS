@@ -1,3 +1,4 @@
+
 name: Ideas Pusher (MEXC Ultimate 7.7.7)
 
 on:
@@ -412,10 +413,11 @@ jobs:
           const IDEAL_FUNDING_RATE=0.0004;
           const IDEAL_OI_DELTA_PCT=10.0;
           const IDEAL_VOLUME_1H_USD=60_000_000;
-          const WEIGHT_VOL_1H=0.40;
-          const WEIGHT_FUNDING=0.25;
-          const WEIGHT_OI_DELTA=0.20;
+          const WEIGHT_VOL_1H=0.20;
+          const WEIGHT_FUNDING=0.20;
+          const WEIGHT_OI_DELTA=0.25;
           const WEIGHT_VOLUME=0.15;
+          const WEIGHT_DIRECTION=0.20;
 
           const MTF_OVERRIDE_MIN_CONF = 30;
           const MTF_DROP_MIN_PROB     = 35;
@@ -550,7 +552,8 @@ jobs:
             const fundNorm=Math.tanh((metrics.funding_rate||0)/IDEAL_FUNDING_RATE);
             const oiNorm=Math.tanh(Math.abs(metrics.oi_delta_pct||0)/IDEAL_OI_DELTA_PCT);
             const volUsdNorm=Math.tanh((metrics.volume_1h_usd||0)/IDEAL_VOLUME_1H_USD);
-            const rawScore=WEIGHT_VOL_1H*volNorm+WEIGHT_FUNDING*fundNorm+WEIGHT_OI_DELTA*oiNorm+WEIGHT_VOLUME*volUsdNorm;
+            const dirNorm=Math.tanh(Math.abs(metrics.oi_delta_pct||0)/15)*(Math.sign(metrics.oi_delta_pct||0)===Math.sign(metrics.price_change_1h||0)?1:0.3);
+            const rawScore=WEIGHT_VOL_1H*volNorm+WEIGHT_FUNDING*fundNorm+WEIGHT_OI_DELTA*oiNorm+WEIGHT_VOLUME*volUsdNorm+WEIGHT_DIRECTION*dirNorm;
             return clamp(Math.round(rawScore*100),0,100);
           }
 
@@ -1074,8 +1077,8 @@ jobs:
 
             const marketVolSorted=allMetrics.slice(0,50).map(m=>m.vol_1h_pct).sort((a,b)=>a-b);
             const medianVol=marketVolSorted[Math.floor(marketVolSorted.length/2)]||0;
-            const DYNAMIC_VOL_GATE=medianVol<1.0?1.0:medianVol<2.0?1.5:2.0;
-            const DYNAMIC_TOP_N=DATA_QUALITY_TOP_N||(medianVol<1.0?1:medianVol<1.5?2:Math.max(1,TOP_N||4));
+            const DYNAMIC_VOL_GATE=0.3; // ★ FIX: always accept anything with tiny movement
+            const DYNAMIC_TOP_N=Math.max(6, TOP_N||6); // ★ FIX: always evaluate at least 6
             log(`📊 Market median vol=${medianVol.toFixed(2)}% → VOL_GATE=${DYNAMIC_VOL_GATE}% TOP_N=${DYNAMIC_TOP_N}`);
 
             const top30Changes=allMetrics.slice(0,30).map(m=>m.price_change_1h||0);
@@ -1139,7 +1142,7 @@ jobs:
                 const d1=depthWithinPctUSD(depth,mid,0.01);
                 const depth1pUSD=(d1.asksUSD||0)+(d1.bidsUSD||0);
 
-                // ★ FIX 1: Hard skip coins crashing today
+                // ★ CRASH/PUMP GATE
                 const change24h = cand.price_change_24h || 0;
                 if(change24h < -0.15) {
                   log(`[CRASH-GATE] ${cand.symbol} HARD SKIP: ${(change24h*100).toFixed(1)}% today — possible exploit/dump`);
@@ -1164,8 +1167,8 @@ jobs:
 
                 let volPenalty=1.0;
                 if(cand.vol_1h_pct<DYNAMIC_VOL_GATE){
-                  if(cand.vol_1h_pct<0.3){ log(`[VOL-GATE] ${cand.symbol} skipped: vol1h=${cand.vol_1h_pct.toFixed(2)}% (dead)`); continue; }
-                  volPenalty=clamp(cand.vol_1h_pct/DYNAMIC_VOL_GATE, 0.4, 1.0);
+                  if(cand.vol_1h_pct<0.05){ log(`[VOL-GATE] ${cand.symbol} skipped: vol1h=${cand.vol_1h_pct.toFixed(2)}% (completely dead)`); continue; }
+                  volPenalty=clamp(cand.vol_1h_pct/2.0, 0.50, 1.0); // ★ FIX: softer penalty, never kill low-vol coins
                   log(`[VOL-WARN] ${cand.symbol} vol=${cand.vol_1h_pct.toFixed(2)}% penalty=${volPenalty.toFixed(2)}`);
                 }
 
@@ -1230,6 +1233,16 @@ jobs:
 
                 if(DIRECTION==="long") forcedSide="long";
                 else if(DIRECTION==="short") forcedSide="short";
+                
+                // ★ NEW: Direction-aware daily filter
+                if(change24h < -0.08 && forcedSide === "long") {
+                  log(`[DAILY-CRASH] ${cand.symbol} SKIP: longing a coin down ${(change24h*100).toFixed(1)}% today`);
+                  continue;
+                }
+                if(change24h > 0.15 && forcedSide === "short") {
+                  log(`[DAILY-PUMP] ${cand.symbol} SKIP: shorting a coin up +${(change24h*100).toFixed(1)}% today`);
+                  continue;
+                }
 
                 log(`[DIR] ${cand.symbol} regime=${regime} edge=${dirEdge.toFixed(3)} BB=${bbPos.toFixed(2)} ADX=${adxValue.toFixed(0)} → ${forcedSide.toUpperCase()}`);
                 for(const r of dirResult.reasons.slice(0,3)) log(`  └─ ${r}`);
@@ -1409,6 +1422,18 @@ jobs:
               usedBases.add(refined[0].base);
             }
 
+            // ★ FIX: Expand pool if not enough selected
+            if(selected.length < TARGET_TOP_N && refined.length > 0){
+              log(`⚠️ Only ${selected.length} selected — expanding pool from full refined list`);
+              for(const cand of refined){
+                if(selected.length >= TARGET_TOP_N) break;
+                if(selected.some(s=>s.symbol===cand.symbol)) continue;
+                if(usedBases.has(cand.base)) continue;
+                selected.push(cand);
+                usedBases.add(cand.base);
+                log(`[POOL-EXPAND] Added ${cand.symbol} conf=${cand.confidence}`);
+              }
+            }
             log(`✅ Selected ${selected.length} ideas before MTF analysis (target=${TARGET_TOP_N})`);
 
             log("\n🔬 ════════════════════════════════════════════════════════");
@@ -1539,7 +1564,30 @@ jobs:
               log(`   ${c.symbol} → ${c.side.toUpperCase()} | conf=${c.confidence} | long=${c.mtf?.long_prob_pct??'?'}% short=${c.mtf?.short_prob_pct??'?'}% | win_prob=${winProb??'?'}% | ${c.mtf_overridden?"⚠️ OVERRIDDEN":"✅ CONFIRMED"}`);
             }
 
-            const finalSelected = selectedAfterMTF;
+            // ★ FIX: ALWAYS PUSH — if MTF killed everything, pick best from original selected
+            let finalSelected = selectedAfterMTF;
+            if(finalSelected.length === 0 && selected.length > 0){
+              log(`🚨 MTF killed all trades — FORCE PICKING best available`);
+              // Sort by best win probability regardless of side
+              const ranked = selected.map(c => {
+                // Run quick score: use existing dir_analysis data
+                const fakeWinProb = Math.max(
+                  c.dir_analysis?.dir_edge > 0 ? 55 : 45,
+                  c.confidence
+                );
+                return { ...c, force_win_prob: fakeWinProb };
+              }).sort((a,b) => b.force_win_prob - a.force_win_prob);
+
+              // Pick top 2 best available
+              const forcePicks = ranked.slice(0, 2);
+              for(const fp of forcePicks){
+                fp.mtf = null;
+                fp.mtf_overridden = false;
+                fp.force_picked = true;
+                log(`[FORCE-PICK] ${fp.symbol} ${fp.side.toUpperCase()} conf=${fp.confidence} — best available in bad market`);
+              }
+              finalSelected = forcePicks;
+            }
 
             const flipped=HEDGE?finalSelected.map(orig=>({ ...orig, side:orig.side==="long"?"short":"long", flipped:true, original_idea_id:orig.symbol+"_"+orig.side })):[];
             const selectedWithFlipped=[...finalSelected,...flipped];
