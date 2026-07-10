@@ -418,7 +418,7 @@ jobs:
           const WEIGHT_VOLUME=0.15;
           const WEIGHT_DIRECTION=0.20;
 
-          const MTF_OVERRIDE_MIN_CONF = 35;
+          const MTF_OVERRIDE_MIN_CONF = 45;
           const MTF_DROP_MIN_PROB     = 50;
           const MTF_COINFLIP_GATE     = 52;
 
@@ -992,7 +992,7 @@ jobs:
             const VOL_THRESH=0.15;
             const MACRO_THRESH=0.20;
             const RSI_HIGH=70, RSI_LOW=30;
-            const WINPROB_FLOOR=58;
+            const WINPROB_FLOOR=55;
             const STRUCT_AGAINST_LONG=new Set(["downtrend","weak_downtrend","expanding"]);
             const STRUCT_AGAINST_SHORT=new Set(["uptrend","weak_uptrend","expanding"]);
             const survivors=[];
@@ -1338,12 +1338,9 @@ jobs:
                   log(`[DAILY-CRASH] ${cand.symbol} SKIP: longing a coin down ${(change24h*100).toFixed(1)}% today`);
                   continue;
                 }
-                if(change24h > 0.15 && forcedSide === "short") {
-                  log(`[DAILY-PUMP] ${cand.symbol} SKIP: shorting a coin up +${(change24h*100).toFixed(1)}% today`);
-                  continue;
-                }
-
-                log(`[DIR] ${cand.symbol} regime=${regime} edge=${dirEdge.toFixed(3)} BB=${bbPos.toFixed(2)} ADX=${adxValue.toFixed(0)} → ${forcedSide.toUpperCase()}`);
+                if(change24h > 0.10 && forcedSide === "short") {   log(`[DAILY-PUMP] ${cand.symbol} SKIP: shorting a coin up +${(change24h*100).toFixed(1)}% today`);   continue; }
+                
+                if(Math.abs(change24h) > 0.30 && forcedSide === "short") {   log(`[DAILY-RANGE-GATE] ${cand.symbol} SKIP: shorting coin with ${(change24h*100).toFixed(1)}% daily range`);   continue; } log(`[DIR] ${cand.symbol} regime=${regime} edge=${dirEdge.toFixed(3)} BB=${bbPos.toFixed(2)} ADX=${adxValue.toFixed(0)} → ${forcedSide.toUpperCase()}`);
                 for(const r of dirResult.reasons.slice(0,3)) log(`  └─ ${r}`);
 
                 const shortingRocket = forcedSide === "short"
