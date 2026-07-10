@@ -1,4 +1,4 @@
-b
+part1 /2:
 name: Ideas Pusher (MEXC Ultimate 7.7.7)
 
 on:
@@ -420,10 +420,10 @@ jobs:
           const WEIGHT_DIRECTION=0.20;
 
           const MTF_OVERRIDE_MIN_CONF = 30;
-          const MTF_DROP_MIN_PROB     = 35;
+          const MTF_DROP_MIN_PROB     = 50;
           const MTF_COINFLIP_GATE     = 52;
 
-          const CONFIG_HASH=(()=>{ try{ const knobs={ DIRECTION,MR_BREAKOUT_DC_N,MR_BREAKOUT_RET15_ATR,MR_LOCKOUT_SEC,MAX_COST_BPS_HARD,MIN_VOL_1H_USD,DEPTH_1P_MIN_USD,LONG_EDGE_MULT_MIN,LONG_BOUNCE_SL_ATR,LONG_BOUNCE_TP_ATR,TOP_N,MAX_SPREAD_BPS,EXP_LCB_MIN_BPS_BASE,COST_BPS,NOTIONAL,DEPTH_LIMIT,OBI_TOPN,MIN_TF_ALIGN,TF_WEIGHTS,IDEAL_VOL_1H_PCT,IDEAL_FUNDING_RATE,IDEAL_OI_DELTA_PCT,IDEAL_VOLUME_1H_USD,WEIGHT_VOL_1H,WEIGHT_FUNDING,WEIGHT_OI_DELTA,WEIGHT_VOLUME,REG_INTERVAL:process.env.REG_INTERVAL,REG_LIMIT:process.env.REG_LIMIT,REG_SLOPE_THRESHOLD:process.env.REG_SLOPE_THRESHOLD,SLOPE_EXIT_RATIO:process.env.SLOPE_EXIT_RATIO,REG_RANGING_THRESHOLD:process.env.REG_RANGING_THRESHOLD,REG_RANGE_THRESHOLD:process.env.REG_RANGE_THRESHOLD,ATR_VOLATILE_THRESHOLD:process.env.ATR_VOLATILE_THRESHOLD,REG_CONFIRM_BARS:process.env.REG_CONFIRM_BARS,MIN_ALT_SCORE:process.env.MIN_ALT_SCORE,ATR_MIN_PCT }; return hashObj(knobs); }catch{ return "cfg-unknown"; } })();
+          const CONFIG_HASH=(()=>{ try{ const knobs={ DIRECTION,MR_BREAKOUT_DC_N,MR_BREAKOUT_RET15_ATR,MR_LOCKOUT_SEC,MAX_COST_BPS_HARD,MIN_VOL_1H_USD,DEPTH_1P_MIN_USD,LONG_EDGE_MULT_MIN,LONG_BOUNCE_SL_ATR,LONG_BOUNCE_TP_ATR,TOP_N,MAX_SPREAD_BPS,EXP_LCB_MIN_BPS_BASE,COST_BPS,NOTIONAL,DEPTH_LIMIT,OBI_TOPN,MIN_TF_ALIGN,TF_WEIGHTS,IDEAL_VOL_1H_PCT,IDEAL_FUNDING_RATE,IDEAL_OI_DELTA_PCT,IDEAL_VOLUME_1H_USD,WEIGHT_VOL_1H,WEIGHT_FUNDING,WEIGHT_OI_DELTA,WEIGHT_VOLUME,WEIGHT_DIRECTION,REG_INTERVAL:process.env.REG_INTERVAL,REG_LIMIT:process.env.REG_LIMIT,REG_SLOPE_THRESHOLD:process.env.REG_SLOPE_THRESHOLD,SLOPE_EXIT_RATIO:process.env.SLOPE_EXIT_RATIO,REG_RANGING_THRESHOLD:process.env.REG_RANGING_THRESHOLD,REG_RANGE_THRESHOLD:process.env.REG_RANGE_THRESHOLD,ATR_VOLATILE_THRESHOLD:process.env.ATR_VOLATILE_THRESHOLD,REG_CONFIRM_BARS:process.env.REG_CONFIRM_BARS,MIN_ALT_SCORE:process.env.MIN_ALT_SCORE,ATR_MIN_PCT }; return hashObj(knobs); }catch{ return "cfg-unknown"; } })();
 
           const PUSH_URL=process.env.WORKER_PUSH_URL||"";
           const PUSH_TOKEN=process.env.PUSH_TOKEN||"";
@@ -1095,6 +1095,8 @@ jobs:
             const altPump=avgAltChange>0.03;
             if(altCrash) log(`🚨 ALTCOIN SECTOR CRASH: avg=${(avgAltChange*100).toFixed(2)}%`);
             if(altPump)  log(`🚀 ALTCOIN SECTOR PUMP: avg=${(avgAltChange*100).toFixed(2)}%`);
+---
+paart2/2:
 
             const MAX_DETAILED=30;
             const topCandidates=allMetrics.slice(0,MAX_DETAILED);
@@ -1454,37 +1456,32 @@ jobs:
                   continue;
                 }
 
-                // ── GATE 2: OUR SIDE HAS LOW PROBABILITY
-                if(mtfWinProb < MTF_DROP_MIN_PROB) {
-                  log(`[MTF-DROP] ${cand.symbol}: ${cand.side} win_prob=${mtfWinProb}% < ${MTF_DROP_MIN_PROB}% — dropping`);
-                  mtfStats.dropped_low_prob++;
+                // ── GATE 3 FIRST: CHECK FOR OVERRIDE ──
+                if(mtf.overridden && mtf.confidence_pct < 40) {
+                  log(`[MTF-KEEP-ORIG] ${cand.symbol}: MTF wants to flip but conf=${mtf.confidence_pct}% < 40% — keeping original ${cand.side.toUpperCase()}`);
+                  const origWinProb = cand.side === "long" ? mtf.long_prob_pct : mtf.short_prob_pct;
+                  if(origWinProb < MTF_DROP_MIN_PROB) {
+                    log(`[MTF-DROP] ${cand.symbol}: original side prob=${origWinProb}% < ${MTF_DROP_MIN_PROB}% — dropping`);
+                    mtfStats.dropped_low_prob++;
+                    continue;
+                  }
+                  cand.mtf_overridden = false;
+                  mtfStats.confirmed++;
+                  cand.mtf = {
+                    long_prob_pct:mtf.long_prob_pct, short_prob_pct:mtf.short_prob_pct,
+                    confidence_pct:mtf.confidence_pct, net_score:mtf.net_score,
+                    overridden:false, final_side:cand.side,
+                    signals:mtf.signals, reasons:mtf.reasons, detail:mtf.detail
+                  };
+                  selectedAfterMTF.push(cand);
+                  log(`[MTF-KEEP-ORIG] ${cand.symbol}: kept ${cand.side.toUpperCase()} orig_prob=${origWinProb}%`);
                   continue;
                 }
 
-                // ── GATE 3: OVERRIDE DIRECTION ──
-                if(mtf.overridden && mtf.confidence_pct < 40) {
-                  log(`[MTF-KEEP-ORIG] ${cand.symbol}: MTF wants to flip but conf=${mtf.confidence_pct}% < 40% — keeping original ${cand.side.toUpperCase()}`);
-                  cand.mtf_overridden = false;
-                  mtfStats.confirmed++;
-                  const origWinProb = cand.side === "long" ? mtf.long_prob_pct : mtf.short_prob_pct;
-                  if(origWinProb >= 50) {                  // 50% ← MATCH THE SAFETY GATE
-                    cand.mtf = {
-                      long_prob_pct:  mtf.long_prob_pct,
-                      short_prob_pct: mtf.short_prob_pct,
-                      confidence_pct: mtf.confidence_pct,
-                      net_score:      mtf.net_score,
-                      overridden:     false,
-                      final_side:     cand.side,
-                      signals:        mtf.signals,
-                      reasons:        mtf.reasons,
-                      detail:         mtf.detail
-                    };
-                    selectedAfterMTF.push(cand);
-                    log(`[MTF-KEEP-ORIG] ${cand.symbol}: kept ${cand.side.toUpperCase()} orig_prob=${origWinProb}%`);
-                  } else {
-                    log(`[MTF-DROP] ${cand.symbol}: original side prob=${origWinProb}% < ${MTF_DROP_MIN_PROB}% — dropping`);
-                    mtfStats.dropped_low_prob++;
-                  }
+                // ── GATE 2 SECOND: OUR SIDE HAS LOW PROBABILITY ──
+                if(mtfWinProb < MTF_DROP_MIN_PROB) {
+                  log(`[MTF-DROP] ${cand.symbol}: ${cand.side} win_prob=${mtfWinProb}% < ${MTF_DROP_MIN_PROB}% — dropping`);
+                  mtfStats.dropped_low_prob++;
                   continue;
                 }
 
@@ -1561,29 +1558,46 @@ jobs:
               log(`   ${c.symbol} → ${c.side.toUpperCase()} | conf=${c.confidence} | long=${c.mtf?.long_prob_pct??'?'}% short=${c.mtf?.short_prob_pct??'?'}% | win_prob=${winProb??'?'}% | ${c.mtf_overridden?"⚠️ OVERRIDDEN":"✅ CONFIRMED"}`);
             }
 
-            // ★ FIX: ALWAYS PUSH — if MTF killed everything, pick best from original selected
             let finalSelected = selectedAfterMTF;
-            if(finalSelected.length === 0 && selected.length > 0){
-              log(`🚨 MTF killed all trades — FORCE PICKING best available`);
-              // Sort by best win probability regardless of side
-              const ranked = selected.map(c => {
-                // Run quick score: use existing dir_analysis data
-                const fakeWinProb = Math.max(
-                  c.dir_analysis?.dir_edge > 0 ? 55 : 45,
-                  c.confidence
-                );
-                return { ...c, force_win_prob: fakeWinProb };
-              }).sort((a,b) => b.force_win_prob - a.force_win_prob);
+            if(finalSelected.length === 0) {
+              log("🚨 MTF killed all trades — re-scanning full refined pool...");
+              const evaluated = new Set(selected.map(s => s.symbol));
+              const unevaluated = refined.filter(r => !evaluated.has(r.symbol));
 
-              // Pick top 2 best available
-              const forcePicks = ranked.slice(0, 2);
-              for(const fp of forcePicks){
-                fp.mtf = null;
-                fp.mtf_overridden = false;
-                fp.force_picked = true;
-                log(`[FORCE-PICK] ${fp.symbol} ${fp.side.toUpperCase()} conf=${fp.confidence} — best available in bad market`);
+              for(const cand of unevaluated.slice(0, 8)) {
+                try {
+                  const mtf = await runMTFDirectionAnalysis(cand.symbol, cand.side, cand.mark_price);
+                  const winProb   = cand.side === "long" ? mtf.long_prob_pct  : mtf.short_prob_pct;
+                  const flipSide  = cand.side === "long" ? "short" : "long";
+                  const flipProb  = cand.side === "long" ? mtf.short_prob_pct : mtf.long_prob_pct;
+
+                  if(winProb >= 50) {
+                    cand.mtf = mtf;
+                    cand.mtf_overridden = false;
+                    selectedAfterMTF.push(cand);
+                    log(`[RESCUE] ${cand.symbol} ${cand.side.toUpperCase()} win_prob=${winProb}%`);
+                    if(selectedAfterMTF.length >= 2) break;
+                    continue;
+                  }
+                  if(flipProb >= 60) {
+                    cand.side = flipSide;
+                    cand.mtf  = mtf;
+                    cand.mtf_overridden = true;
+                    selectedAfterMTF.push(cand);
+                    log(`[RESCUE-FLIP] ${cand.symbol} → ${flipSide.toUpperCase()} win_prob=${flipProb}%`);
+                    if(selectedAfterMTF.length >= 2) break;
+                    continue;
+                  }
+                  log(`[RESCUE-SKIP] ${cand.symbol} orig=${winProb}% flip=${flipProb}% — not good enough`);
+                } catch(e) {
+                  log(`[RESCUE-ERR] ${cand.symbol}:`, e?.message || e);
+                }
               }
-              finalSelected = forcePicks;
+
+              if(selectedAfterMTF.length === 0) {
+                log("🚫 No valid trades found even after rescue scan. Market is truly dead.");
+              }
+              finalSelected = selectedAfterMTF;
             }
 
             const flipped=HEDGE?finalSelected.map(orig=>({ ...orig, side:orig.side==="long"?"short":"long", flipped:true, original_idea_id:orig.symbol+"_"+orig.side })):[];
