@@ -1,3 +1,4 @@
+
 name: Ideas Pusher (MEXC Ultimate 7.7.7)
 
 on:
@@ -86,7 +87,7 @@ jobs:
             exit 1
           fi
           set +e
-          cat > /tmp/pusher.js <<'PUSHER_END'
+          node - <<'NODE'
           (async ()=>{
           'use strict';
           const crypto = require('crypto');
@@ -1722,25 +1723,7 @@ paart2/2:
             try{ const r=await fetchWithTimeout(PUSH_URL,{ method:"POST", headers:{ "Content-Type":"application/json","Authorization":"Bearer "+PUSH_TOKEN }, body:JSON.stringify(payload) },15000); let txt=""; try{ txt=await r.text(); }catch{} log("push status",r?.status||"ERR",(txt||"").slice(0,200)); }catch(e2){ log("push failed",e2?.message||e2); }
           }
           })();
-          PUSHER_END
-          node /tmp/pusher.js
+          NODE
 
           EXIT_CODE=$?
-          set -e
-          if [[ $EXIT_CODE -ne 0 ]]; then
-            echo "[gha] pusher exited with code $EXIT_CODE — sending minimal payload"
-            raw_push_url="$(printf '%s' "${WORKER_PUSH_URL}" | tr -d '\r\n')"
-            health_url="$(printf '%s' "${raw_push_url}" | sed -E 's#/signals/push(\?.*)?$#/health#')"
-            echo "[gha] fallback health GET ${health_url}"
-            http_code_h=$(curl -g -sS -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${PUSH_TOKEN}" --max-time 8 "${health_url}" || true)
-            echo "[gha] fallback health status ${http_code_h}"
-            now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-            payload='{"ts":"'"${now}"'","mode":"normal","source":"external_pusher","meta":{"origin":"github_actions","reason":"fallback_node_error","exchange":"bybit_futures"},"top_n":0,"ideas":[]}'
-            echo "[gha] pushing 0 ideas to ${raw_push_url}"
-            mkdir -p /tmp
-            : > /tmp/push_resp.txt
-            http_code=$(curl -g -sS -o /tmp/push_resp.txt -w "%{http_code}" -X POST -H "Content-Type: application/json" -H "Authorization: Bearer ${PUSH_TOKEN}" --data-raw "${payload}" --max-time 12 "${raw_push_url}" || true)
-            body="$(head -c 400 /tmp/push_resp.txt || true)"
-            echo "[gha] push status ${http_code} ${body}"
-            exit 0
-          fi
+          node scripts/pusher.js
