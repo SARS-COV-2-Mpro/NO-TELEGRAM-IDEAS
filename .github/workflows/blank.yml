@@ -87,7 +87,7 @@ jobs:
             exit 1
           fi
           set +e
-          node - <<'NODE'
+          cat > /tmp/script.js <<'NODE_EOF'
           (async ()=>{
           'use strict';
           const crypto = require('crypto');
@@ -1723,7 +1723,8 @@ paart2/2:
             try{ const r=await fetchWithTimeout(PUSH_URL,{ method:"POST", headers:{ "Content-Type":"application/json","Authorization":"Bearer "+PUSH_TOKEN }, body:JSON.stringify(payload) },15000); let txt=""; try{ txt=await r.text(); }catch{} log("push status",r?.status||"ERR",(txt||"").slice(0,200)); }catch(e2){ log("push failed",e2?.message||e2); }
           }
           })();
-          NODE
+          NODE_EOF
+          node /tmp/script.js
 
           EXIT_CODE=$?
           set -e
