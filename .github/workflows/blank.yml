@@ -1445,7 +1445,7 @@ jobs:
                   cand.mtf_overridden = false;
                   mtfStats.confirmed++;
                   const origWinProb = cand.side === "long" ? mtf.long_prob_pct : mtf.short_prob_pct;
-                  if(origWinProb >= MTF_DROP_MIN_PROB) {
+                  if(origWinProb >= 50) {                  // 50% ← MATCH THE SAFETY GATE
                     cand.mtf = {
                       long_prob_pct:  mtf.long_prob_pct,
                       short_prob_pct: mtf.short_prob_pct,
