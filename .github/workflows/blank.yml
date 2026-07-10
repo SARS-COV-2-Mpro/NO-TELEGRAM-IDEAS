@@ -1358,11 +1358,8 @@ jobs:
             const refinedShorts = refined.filter(r => r.side === "short");
             log(`📊 Refined pool: ${refinedLongs.length} longs, ${refinedShorts.length} shorts`);
             const balancedPool = [];
-            const topLongs  = refinedLongs.slice(0, 2);
-            const topShorts = refinedShorts.slice(0, 2);
-            for(const c of [...topLongs, ...topShorts]) {
-              balancedPool.push(c);
-            }
+            const topLongs  = refinedLongs.slice(0, 2); const topShorts = refinedShorts.slice(0, 2); // ★ FIX: Force minimum 1 short always if(topShorts.length === 0 && refinedShorts.length > 0){   topShorts.push(refinedShorts[0]);   log(`⚠️ Forced 1 short into pool: ${refinedShorts[0].symbol}`); } // ★ FIX: Force minimum 1 long always if(topLongs.length === 0 && refinedLongs.length > 0){   topLongs.push(refinedLongs[0]);   log(`⚠️ Forced 1 long into pool: ${refinedLongs[0].symbol}`); } for(const c of [...topLongs, ...topShorts]) {   balancedPool.push(c); }
+
             balancedPool.sort((a,b) => b.confidence - a.confidence);
             const useBalanced = topLongs.length > 0 && topShorts.length > 0;
             if(useBalanced) {
