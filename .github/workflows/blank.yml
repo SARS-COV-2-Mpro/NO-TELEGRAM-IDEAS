@@ -412,20 +412,16 @@ jobs:
           const IDEAL_FUNDING_RATE=0.0004;
           const IDEAL_OI_DELTA_PCT=10.0;
           const IDEAL_VOLUME_1H_USD=60_000_000;
-          
-          // ★ FIX 1: Adjust confidence weights
-          const WEIGHT_VOL_1H=0.20;
-          const WEIGHT_FUNDING=0.20;
-          const WEIGHT_OI_DELTA=0.25;
+          const WEIGHT_VOL_1H=0.40;
+          const WEIGHT_FUNDING=0.25;
+          const WEIGHT_OI_DELTA=0.20;
           const WEIGHT_VOLUME=0.15;
-          const WEIGHT_DIRECTION=0.20;
 
           const MTF_OVERRIDE_MIN_CONF = 30;
-          // ★ FIX 0: Set minimum win probability to 50%
-          const MTF_DROP_MIN_PROB     = 50;
+          const MTF_DROP_MIN_PROB     = 35;
           const MTF_COINFLIP_GATE     = 52;
 
-          const CONFIG_HASH=(()=>{ try{ const knobs={ DIRECTION,MR_BREAKOUT_DC_N,MR_BREAKOUT_RET15_ATR,MR_LOCKOUT_SEC,MAX_COST_BPS_HARD,MIN_VOL_1H_USD,DEPTH_1P_MIN_USD,LONG_EDGE_MULT_MIN,LONG_BOUNCE_SL_ATR,LONG_BOUNCE_TP_ATR,TOP_N,MAX_SPREAD_BPS,EXP_LCB_MIN_BPS_BASE,COST_BPS,NOTIONAL,DEPTH_LIMIT,OBI_TOPN,MIN_TF_ALIGN,TF_WEIGHTS,IDEAL_VOL_1H_PCT,IDEAL_FUNDING_RATE,IDEAL_OI_DELTA_PCT,IDEAL_VOLUME_1H_USD,WEIGHT_VOL_1H,WEIGHT_FUNDING,WEIGHT_OI_DELTA,WEIGHT_VOLUME,WEIGHT_DIRECTION,REG_INTERVAL:process.env.REG_INTERVAL,REG_LIMIT:process.env.REG_LIMIT,REG_SLOPE_THRESHOLD:process.env.REG_SLOPE_THRESHOLD,SLOPE_EXIT_RATIO:process.env.SLOPE_EXIT_RATIO,REG_RANGING_THRESHOLD:process.env.REG_RANGING_THRESHOLD,REG_RANGE_THRESHOLD:process.env.REG_RANGE_THRESHOLD,ATR_VOLATILE_THRESHOLD:process.env.ATR_VOLATILE_THRESHOLD,REG_CONFIRM_BARS:process.env.REG_CONFIRM_BARS,MIN_ALT_SCORE:process.env.MIN_ALT_SCORE,ATR_MIN_PCT }; return hashObj(knobs); }catch{ return "cfg-unknown"; } })();
+          const CONFIG_HASH=(()=>{ try{ const knobs={ DIRECTION,MR_BREAKOUT_DC_N,MR_BREAKOUT_RET15_ATR,MR_LOCKOUT_SEC,MAX_COST_BPS_HARD,MIN_VOL_1H_USD,DEPTH_1P_MIN_USD,LONG_EDGE_MULT_MIN,LONG_BOUNCE_SL_ATR,LONG_BOUNCE_TP_ATR,TOP_N,MAX_SPREAD_BPS,EXP_LCB_MIN_BPS_BASE,COST_BPS,NOTIONAL,DEPTH_LIMIT,OBI_TOPN,MIN_TF_ALIGN,TF_WEIGHTS,IDEAL_VOL_1H_PCT,IDEAL_FUNDING_RATE,IDEAL_OI_DELTA_PCT,IDEAL_VOLUME_1H_USD,WEIGHT_VOL_1H,WEIGHT_FUNDING,WEIGHT_OI_DELTA,WEIGHT_VOLUME,REG_INTERVAL:process.env.REG_INTERVAL,REG_LIMIT:process.env.REG_LIMIT,REG_SLOPE_THRESHOLD:process.env.REG_SLOPE_THRESHOLD,SLOPE_EXIT_RATIO:process.env.SLOPE_EXIT_RATIO,REG_RANGING_THRESHOLD:process.env.REG_RANGING_THRESHOLD,REG_RANGE_THRESHOLD:process.env.REG_RANGE_THRESHOLD,ATR_VOLATILE_THRESHOLD:process.env.ATR_VOLATILE_THRESHOLD,REG_CONFIRM_BARS:process.env.REG_CONFIRM_BARS,MIN_ALT_SCORE:process.env.MIN_ALT_SCORE,ATR_MIN_PCT }; return hashObj(knobs); }catch{ return "cfg-unknown"; } })();
 
           const PUSH_URL=process.env.WORKER_PUSH_URL||"";
           const PUSH_TOKEN=process.env.PUSH_TOKEN||"";
@@ -548,15 +544,13 @@ jobs:
             }catch(e){ log(`fetchGoldenMetrics error for ${symbol}:`,e?.message||e); return null; }
           }
 
-          // ★ FIX 1: Updated confidence calculation
           function calculateHedgeConfidence(metrics){
             if(!metrics) return 0;
             const volNorm=Math.tanh((metrics.vol_1h_pct||0)/IDEAL_VOL_1H_PCT);
             const fundNorm=Math.tanh((metrics.funding_rate||0)/IDEAL_FUNDING_RATE);
             const oiNorm=Math.tanh(Math.abs(metrics.oi_delta_pct||0)/IDEAL_OI_DELTA_PCT);
             const volUsdNorm=Math.tanh((metrics.volume_1h_usd||0)/IDEAL_VOLUME_1H_USD);
-            const dirNorm=Math.tanh(Math.abs(metrics.oi_delta_pct||0)/15)*(Math.sign(metrics.oi_delta_pct||0)===Math.sign(metrics.price_change_1h||0)?1:0.3);
-            const rawScore=WEIGHT_VOL_1H*volNorm+WEIGHT_FUNDING*fundNorm+WEIGHT_OI_DELTA*oiNorm+WEIGHT_VOLUME*volUsdNorm+WEIGHT_DIRECTION*dirNorm;
+            const rawScore=WEIGHT_VOL_1H*volNorm+WEIGHT_FUNDING*fundNorm+WEIGHT_OI_DELTA*oiNorm+WEIGHT_VOLUME*volUsdNorm;
             return clamp(Math.round(rawScore*100),0,100);
           }
 
@@ -1145,7 +1139,7 @@ jobs:
                 const d1=depthWithinPctUSD(depth,mid,0.01);
                 const depth1pUSD=(d1.asksUSD||0)+(d1.bidsUSD||0);
 
-                // ★ CRASH/PUMP GATE
+                // ★ FIX 1: Hard skip coins crashing today
                 const change24h = cand.price_change_24h || 0;
                 if(change24h < -0.15) {
                   log(`[CRASH-GATE] ${cand.symbol} HARD SKIP: ${(change24h*100).toFixed(1)}% today — possible exploit/dump`);
@@ -1171,8 +1165,7 @@ jobs:
                 let volPenalty=1.0;
                 if(cand.vol_1h_pct<DYNAMIC_VOL_GATE){
                   if(cand.vol_1h_pct<0.3){ log(`[VOL-GATE] ${cand.symbol} skipped: vol1h=${cand.vol_1h_pct.toFixed(2)}% (dead)`); continue; }
-                  // ★ FIX 2: Don't penalize moderate volatility so harshly
-                  volPenalty=clamp(cand.vol_1h_pct/DYNAMIC_VOL_GATE, 0.70, 1.0);
+                  volPenalty=clamp(cand.vol_1h_pct/DYNAMIC_VOL_GATE, 0.4, 1.0);
                   log(`[VOL-WARN] ${cand.symbol} vol=${cand.vol_1h_pct.toFixed(2)}% penalty=${volPenalty.toFixed(2)}`);
                 }
 
@@ -1211,6 +1204,7 @@ jobs:
                   log(`[ATR-WARN] ${cand.symbol} ATR=${v5Result.atrPercent.toFixed(2)}% penalty=${atrPenalty.toFixed(2)}`);
                 }
 
+                // ★ FIX 3: Skip coins with collapsed volume
                 const vol24h = cand.turnover_24h || 0;
                 const vol1hUsd = cand.volume_1h_usd || 0;
                 const expectedHourlyVol = vol24h / 24;
@@ -1239,16 +1233,6 @@ jobs:
 
                 log(`[DIR] ${cand.symbol} regime=${regime} edge=${dirEdge.toFixed(3)} BB=${bbPos.toFixed(2)} ADX=${adxValue.toFixed(0)} → ${forcedSide.toUpperCase()}`);
                 for(const r of dirResult.reasons.slice(0,3)) log(`  └─ ${r}`);
-
-                // ★ FIX 3: Direction-aware daily filter
-                if(change24h < -0.08 && forcedSide === "long") {
-                  log(`[DAILY-CRASH] ${cand.symbol} SKIP: longing a coin down ${(change24h*100).toFixed(1)}% today`);
-                  continue;
-                }
-                if(change24h > 0.15 && forcedSide === "short") {
-                  log(`[DAILY-PUMP] ${cand.symbol} SKIP: shorting a coin up +${(change24h*100).toFixed(1)}% today`);
-                  continue;
-                }
 
                 const shortingRocket = forcedSide === "short"
                   && (cand.vol_1h_pct > 3.0)
@@ -1356,6 +1340,7 @@ jobs:
 
             refined.sort((a,b)=>b.confidence-a.confidence);
             
+            // ★ FIX 2: Enforce long/short balance
             const refinedLongs  = refined.filter(r => r.side === "long");
             const refinedShorts = refined.filter(r => r.side === "short");
             log(`📊 Refined pool: ${refinedLongs.length} longs, ${refinedShorts.length} shorts`);
@@ -1447,39 +1432,37 @@ jobs:
                   continue;
                 }
 
-                // ★ FIX 0: This block now correctly handles the < 50% check and removes the 'continue' bug
-                // ── GATE 3: OVERRIDE DIRECTION ──
-                if(mtf.overridden && mtf.confidence_pct < 40) {
-                  log(`[MTF-KEEP-ORIG] ${cand.symbol}: MTF wants to flip but conf=${mtf.confidence_pct}% < 40% — keeping original ${cand.side.toUpperCase()}`);
-                  const origWinProb = cand.side === "long" ? mtf.long_prob_pct : mtf.short_prob_pct;
-                  if (origWinProb < MTF_DROP_MIN_PROB) { // MTF_DROP_MIN_PROB is now 50
-                      log(`[MTF-DROP] ${cand.symbol}: original side prob=${origWinProb}% < ${MTF_DROP_MIN_PROB}% — dropping`);
-                      mtfStats.dropped_low_prob++;
-                      continue; // Drop and move to next candidate
-                  }
-                  // If we are here, it means origWinProb >= 50, so we keep it.
-                  cand.mtf_overridden = false;
-                  mtfStats.confirmed++;
-                  cand.mtf = {
-                    long_prob_pct:  mtf.long_prob_pct,
-                    short_prob_pct: mtf.short_prob_pct,
-                    confidence_pct: mtf.confidence_pct,
-                    net_score:      mtf.net_score,
-                    overridden:     false,
-                    final_side:     cand.side,
-                    signals:        mtf.signals,
-                    reasons:        mtf.reasons,
-                    detail:         mtf.detail
-                  };
-                  selectedAfterMTF.push(cand);
-                  log(`[MTF-KEEP-ORIG] ${cand.symbol}: kept ${cand.side.toUpperCase()} orig_prob=${origWinProb}%`);
-                  continue; // This is now safe, as we've fully processed this candidate
-                }
-
-                // ── GATE 2: OUR SIDE HAS LOW PROBABILITY (This now catches all non-override paths)
+                // ── GATE 2: OUR SIDE HAS LOW PROBABILITY
                 if(mtfWinProb < MTF_DROP_MIN_PROB) {
                   log(`[MTF-DROP] ${cand.symbol}: ${cand.side} win_prob=${mtfWinProb}% < ${MTF_DROP_MIN_PROB}% — dropping`);
                   mtfStats.dropped_low_prob++;
+                  continue;
+                }
+
+                // ── GATE 3: OVERRIDE DIRECTION ──
+                if(mtf.overridden && mtf.confidence_pct < 40) {
+                  log(`[MTF-KEEP-ORIG] ${cand.symbol}: MTF wants to flip but conf=${mtf.confidence_pct}% < 40% — keeping original ${cand.side.toUpperCase()}`);
+                  cand.mtf_overridden = false;
+                  mtfStats.confirmed++;
+                  const origWinProb = cand.side === "long" ? mtf.long_prob_pct : mtf.short_prob_pct;
+                  if(origWinProb >= 50) {                  // 50% ← MATCH THE SAFETY GATE
+                    cand.mtf = {
+                      long_prob_pct:  mtf.long_prob_pct,
+                      short_prob_pct: mtf.short_prob_pct,
+                      confidence_pct: mtf.confidence_pct,
+                      net_score:      mtf.net_score,
+                      overridden:     false,
+                      final_side:     cand.side,
+                      signals:        mtf.signals,
+                      reasons:        mtf.reasons,
+                      detail:         mtf.detail
+                    };
+                    selectedAfterMTF.push(cand);
+                    log(`[MTF-KEEP-ORIG] ${cand.symbol}: kept ${cand.side.toUpperCase()} orig_prob=${origWinProb}%`);
+                  } else {
+                    log(`[MTF-DROP] ${cand.symbol}: original side prob=${origWinProb}% < ${MTF_DROP_MIN_PROB}% — dropping`);
+                    mtfStats.dropped_low_prob++;
+                  }
                   continue;
                 }
 
@@ -1500,6 +1483,13 @@ jobs:
                 } else {
                   cand.mtf_overridden = false;
                   mtfStats.confirmed++;
+                }
+
+                const winProbAfterMTF = cand.side === "long" ? mtf.long_prob_pct : mtf.short_prob_pct;
+                if(winProbAfterMTF < 50) {
+                  log(`[MTF-NEG-EV] ${cand.symbol}: win_prob=${winProbAfterMTF}% < 50% — dropping`);
+                  mtfStats.dropped_low_prob++;
+                  continue;
                 }
 
                 cand.mtf = {
