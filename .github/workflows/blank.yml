@@ -1066,6 +1066,10 @@ jobs:
                 const before=cand.confidence;
                 cand.confidence=Math.round(cand.confidence*0.65);
                 log(`[CONTRA-WARN2] ${cand.symbol} strikes=2 [${strikeReasons.join(", ")}] confidence ${before}→${cand.confidence}`);
+                if(cand.confidence<12){
+                  log(`[CONTRA-DROP] ${cand.symbol} post-penalty confidence=${cand.confidence} below floor=12 — dropped`);
+                  continue;
+                }
               } else if(strikes===1){
                 const before=cand.confidence;
                 cand.confidence=Math.round(cand.confidence*0.85);
@@ -1757,10 +1761,17 @@ jobs:
                 const freshDepthUSD=(fd1.asksUSD||0)+(fd1.bidsUSD||0);
                 const freshSpread=freshDepth?.asks?.[0]&&freshDepth?.bids?.[0]?
                   Math.round((+freshDepth.asks[0][0]-+freshDepth.bids[0][0])/(freshMid||1)*10000):99;
-                if(freshDepthUSD<8000||freshSpread>25){
-                  log(`[PRE-PUSH-LIQ] ${p.symbol_full} dropped: depth=$${Math.round(freshDepthUSD)} spread=${freshSpread}bps`);
+                const positionUSD=NOTIONAL;
+                const depthBuffer=3.0;
+                const minDepthRequired=Math.max(positionUSD*depthBuffer,4000);
+                const SPREAD_HARD_KILL=30;
+                const depthOK=freshDepthUSD>=minDepthRequired;
+                const spreadOK=freshSpread<=SPREAD_HARD_KILL;
+                if(!depthOK||!spreadOK){
+                  log(`[PRE-PUSH-LIQ] ${p.symbol_full} dropped: depth=$${Math.round(freshDepthUSD)} (need $${Math.round(minDepthRequired)}) spread=${freshSpread}bps (limit=${SPREAD_HARD_KILL}bps)`);
                   continue;
                 }
+                log(`[PRE-PUSH-LIQ-OK] ${p.symbol_full} passed: depth=$${Math.round(freshDepthUSD)} spread=${freshSpread}bps`);
                 verifiedPicks.push(p);
               }catch(e){ verifiedPicks.push(p); }
             }
