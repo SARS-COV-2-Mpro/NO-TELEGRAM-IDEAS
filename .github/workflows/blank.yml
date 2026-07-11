@@ -1122,10 +1122,8 @@ jobs:
               cand.contradiction_reasons=strikeReasons;
 
               // DECISION
-              if(strikes>=3){
-                log(`[CONTRA-DROP] ${cand.symbol} ${cand.side.toUpperCase()} strikes=${strikes} [${strikeReasons.join(", ")}] — dropped`);
-                continue;
-              }
+              if(strikes >= 2 && strikeReasons.some(r => r.includes("win_prob_low"))) {   log(`[CONTRA-DROP] ${cand.symbol} ${cand.side.toUpperCase()} win_prob strike at 2 strikes — hard drop`);   continue; } if(strikes>=3){   log(`[CONTRA-DROP] ${cand.symbol} ${cand.side.toUpperCase()} strikes=${strikes} [${strikeReasons.join(", ")}] — dropped`);   continue; }
+
               if(strikes===2){
                 const hasVolumeContra = strikeReasons.some(r => r.includes("volume_against"));
                 const hasLowWinProb = strikeReasons.some(r => r.includes("win_prob_low"));
@@ -1722,8 +1720,9 @@ jobs:
                   const bbPos = cand.dir_analysis?.bb_pos ?? 0.5;
                   const rsiValue = mtf.signals?.find(s => s.name === "rsi_condition")?.rsiValue ?? null;
                   
-                  if((isMeanRevert && origSide === "short" && newSide === "long" && bbPos > 0.80 && rsiValue && rsiValue > 65) ||
-                     (isMeanRevert && origSide === "long" && newSide === "short" && bbPos < 0.20 && rsiValue && rsiValue < 35)) {
+                  if((isMeanRevert && origSide === "short" && newSide === "long" && bbPos > 0.70 && rsiValue && rsiValue > 60) ||
+
+                     (isMeanRevert && origSide === "long" && newSide === "short" && bbPos < 0.40 && (cand.funding_rate_raw < -0.001 || (rsiValue && rsiValue < 40)))) {
                     log(`[MTF-REGIME-BLOCK] ${cand.symbol}: mean-revert signal protected from override — keeping ${origSide.toUpperCase()}`);
                     cand.mtf_overridden = false;
                     mtfStats.confirmed++;
@@ -1752,9 +1751,8 @@ jobs:
                 }
 
                 // ★ FIX: Use original p_raw for win prob if MTF override was rejected.
-                const currentWinProb = cand._kept_original
-                  ? Math.round(cand.p_raw * 100)
-                  : (cand.side === "long" ? mtf.long_prob_pct : mtf.short_prob_pct);
+                const mtfWinProb = cand.side === "long" ? mtf.long_prob_pct : mtf.short_prob_pct; const currentWinProb = cand._kept_original   ? Math.min(Math.round(cand.p_raw * 100), mtfWinProb)   : mtfWinProb;
+
 
                 if(currentWinProb < MTF_DROP_MIN_PROB) {
                   log(`[MTF-DROP] ${cand.symbol}: ${cand.side} win_prob=${currentWinProb}% < ${MTF_DROP_MIN_PROB}% — dropping`);
