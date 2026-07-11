@@ -387,6 +387,23 @@ jobs:
           const DEPTH_LIMIT=Number(process.env.BYBIT_DEPTH_LIMIT||"50");
           const OBI_TOPN=Number(process.env.OBI_TOPN||"12");
           const COOLDOWN_MS=3*60*60*1000;
+
+          function isOnCooldown(state, symbol, side, regime){
+            const now = Date.now();
+            const globalCd = state.cooldown?.[symbol] || 0;
+            if(now - globalCd < COOLDOWN_MS * 0.5) return true;
+            const sideKey = `${symbol}_${side}_${regime}`;
+            const sideCd = state.cooldown_side_regime?.[sideKey] || 0;
+            if(now - sideCd < COOLDOWN_MS) return true;
+            return false;
+          }
+
+          function setCooldown(state, symbol, side, regime){
+            const now = Date.now();
+            state.cooldown[symbol] = now;
+            if(!state.cooldown_side_regime) state.cooldown_side_regime = {};
+            state.cooldown_side_regime[`${symbol}_${side}_${regime}`] = now;
+          }
           const DD_24H_LIMIT_BPS=-150, DD_PEAK_LIMIT_BPS=-300;
           const WILSON_Z=1.34, TARGET_PORT_RISK_BPS=52;
           const TTL_MIN=540, TTL_MAX=7200;
@@ -560,7 +577,7 @@ jobs:
 
           async function loadState(){
             const token=process.env.GIST_TOKEN, id=process.env.GIST_ID;
-            const init={ v:"bybit-hedge-7.0", run_counter:0, cooldown:{}, cooldown_side:{}, pending:[], equity:[], closed:[], mr_lockout:{}, sym_stats:{}, sym_stats_real:{}, calibCoeffs:{}, lastReconcileTs:0, calibration_holdout:[], learned_trade_keys:[], calib_symbol_counts:{}, calib_last_version:CALIB_VERSION, regime_state:{}, regime_history:{}, regime_last_update:{} };
+            const init={ v:"bybit-hedge-7.0", run_counter:0, cooldown:{}, cooldown_side:{}, cooldown_side_regime:{}, pending:[], equity:[], closed:[], mr_lockout:{}, sym_stats:{}, sym_stats_real:{}, calibCoeffs:{}, lastReconcileTs:0, calibration_holdout:[], learned_trade_keys:[], calib_symbol_counts:{}, calib_last_version:CALIB_VERSION, regime_state:{}, regime_history:{}, regime_last_update:{} };
             if(!token||!id) return { state:init, persist:null };
             try{
               const r=await fetchWithTimeout(`https://api.github.com/gists/${id}`,{ headers:{ Authorization:`Bearer ${token}`,"Accept":"application/vnd.github+json","User-Agent":UA } });
@@ -569,7 +586,7 @@ jobs:
               const g=await r.json();
               const c=g.files?.["state.json"]?.content;
               const s=c?JSON.parse(c):init;
-              if(!s.cooldown)s.cooldown={}; if(!s.cooldown_side)s.cooldown_side={}; if(!Array.isArray(s.pending))s.pending=[]; if(!Array.isArray(s.closed))s.closed=[]; if(!Array.isArray(s.equity))s.equity=[]; if(!s.mr_lockout)s.mr_lockout={}; if(!s.sym_stats)s.sym_stats={}; if(!s.sym_stats_real)s.sym_stats_real={}; if(!s.calibCoeffs)s.calibCoeffs={}; if(!Array.isArray(s.calibration_holdout))s.calibration_holdout=[]; if(!s.lastReconcileTs)s.lastReconcileTs=0; if(!Array.isArray(s.learned_trade_keys))s.learned_trade_keys=[]; if(!s.calib_symbol_counts)s.calib_symbol_counts={}; if(s.run_counter==null)s.run_counter=0; if(!s.regime_state)s.regime_state={}; if(!s.regime_history)s.regime_history={}; if(!s.regime_last_update)s.regime_last_update={};
+              if(!s.cooldown)s.cooldown={}; if(!s.cooldown_side)s.cooldown_side={}; if(!s.cooldown_side_regime)s.cooldown_side_regime={}; if(!Array.isArray(s.pending))s.pending=[]; if(!Array.isArray(s.closed))s.closed=[]; if(!Array.isArray(s.equity))s.equity=[]; if(!s.mr_lockout)s.mr_lockout={}; if(!s.sym_stats)s.sym_stats={}; if(!s.sym_stats_real)s.sym_stats_real={}; if(!s.calibCoeffs)s.calibCoeffs={}; if(!Array.isArray(s.calibration_holdout))s.calibration_holdout=[]; if(!s.lastReconcileTs)s.lastReconcileTs=0; if(!Array.isArray(s.learned_trade_keys))s.learned_trade_keys=[]; if(!s.calib_symbol_counts)s.calib_symbol_counts={}; if(s.run_counter==null)s.run_counter=0; if(!s.regime_state)s.regime_state={}; if(!s.regime_history)s.regime_history={}; if(!s.regime_last_update)s.regime_last_update={};
               if(s.calib_last_version!==CALIB_VERSION){ log(`🔄 Calibration version change: ${s.calib_last_version} → ${CALIB_VERSION}`); s.calibCoeffs={}; s.calib_last_version=CALIB_VERSION; }
               return { state:s, persist:{ id, token, etag } };
             }catch(e){ log("loadState warn",e?.message||e); return { state:init, persist:null }; }
@@ -661,7 +678,8 @@ jobs:
             if(state.cooldown) for(const [base,ts] of Object.entries(state.cooldown)) if(now-ts>=COOLDOWN_MS) delete state.cooldown[base];
             if(state.cooldown_side) for(const [base,obj] of Object.entries(state.cooldown_side)) if(now-(obj.ts_ms||0)>=COOLDOWN_MS) delete state.cooldown_side[base];
             if(state.mr_lockout) for(const [sym,expiry] of Object.entries(state.mr_lockout)) if(now>=expiry) delete state.mr_lockout[sym];
-            log(`🧹 Cleaned cooldowns: ${Object.keys(state.cooldown||{}).length} base, ${Object.keys(state.cooldown_side||{}).length} side`);
+            if(state.cooldown_side_regime) for(const [key,ts] of Object.entries(state.cooldown_side_regime)) if(now-ts>=COOLDOWN_MS) delete state.cooldown_side_regime[key];
+            log(`🧹 Cleaned cooldowns: ${Object.keys(state.cooldown||{}).length} base, ${Object.keys(state.cooldown_side||{}).length} side, ${Object.keys(state.cooldown_side_regime||{}).length} side_regime`);
           }
 
           function cleanExpiredClosedTrades(state){
@@ -775,9 +793,9 @@ jobs:
             try {
               const [k1m, k5m, k15m, k1h] = await Promise.all([
                 fetchBybitKlines(symbol, 1,  30),
-                fetchBybitKlines(symbol, 5,  48),
-                fetchBybitKlines(symbol, 15, 32),
-                fetchBybitKlines(symbol, 60, 24)
+                fetchBybitKlines(symbol, 5,  96),
+                fetchBybitKlines(symbol, 15, 64),
+                fetchBybitKlines(symbol, 60, 48)
               ]);
 
               const signals = [];
@@ -993,11 +1011,12 @@ jobs:
             const MACRO_THRESH=0.20;
             const RSI_HIGH=70, RSI_LOW=30;
             const WINPROB_FLOOR=55;
-            const STRUCT_AGAINST_LONG=new Set(["downtrend","weak_downtrend","expanding"]);
-            const STRUCT_AGAINST_SHORT=new Set(["uptrend","weak_uptrend","expanding"]);
             const survivors=[];
 
             for(const cand of candidates){
+              const isMeanRevert = cand.regime === "meanrevert";
+              const STRUCT_AGAINST_LONG = isMeanRevert ? new Set([]) : new Set(["downtrend","weak_downtrend"]);
+              const STRUCT_AGAINST_SHORT = isMeanRevert ? new Set([]) : new Set(["uptrend","weak_uptrend"]);
               const signals=cand.mtf?.signals||[];
               const getSig=(name)=>signals.find(s=>s.name===name);
               let strikes=0;
@@ -1033,15 +1052,24 @@ jobs:
                 strikeReasons.push(`macro_1h_against(${macroScore.toFixed(2)})`);
               }
 
-              // CHECK 4: RSI Extreme vs Direction
+              // CHECK 4: RSI Extreme vs Direction (regime-aware)
               const rsiValue=getSig("rsi_condition")?.rsiValue??null;
               if(rsiValue!=null){
-                if(
-                  (cand.side==="long"  && rsiValue > RSI_HIGH) ||
-                  (cand.side==="short" && rsiValue < RSI_LOW)
-                ){
-                  strikes++;
-                  strikeReasons.push(`rsi_extreme(${rsiValue})`);
+                if(!isMeanRevert){
+                  if(
+                    (cand.side==="long"  && rsiValue > RSI_HIGH) ||
+                    (cand.side==="short" && rsiValue < RSI_LOW)
+                  ){
+                    strikes++;
+                    strikeReasons.push(`rsi_extreme(${rsiValue})`);
+                  }
+                } else {
+                  if(
+                    (cand.side==="long"  && rsiValue < RSI_LOW) ||
+                    (cand.side==="short" && rsiValue > RSI_HIGH)
+                  ){
+                    log(`[CONTRA-MR-CONFIRM] ${cand.symbol} RSI=${rsiValue} confirms mean-revert ${cand.side}`);
+                  }
                 }
               }
 
@@ -1084,6 +1112,61 @@ jobs:
             log(`[CONTRA] ${survivors.length}/${candidates.length} survived contradiction check`);
             return survivors;
           }
+          
+          async function refreshSignalBeforePush(cand, state){
+            try{
+              const freshTicker = await fetchBybitTicker(cand.symbol_full);
+              if(!freshTicker) return cand;
+
+              const freshPrice = freshTicker.markPrice || freshTicker.lastPrice;
+              const originalPrice = cand.entry_mid;
+              if(!originalPrice || !freshPrice) return cand;
+
+              const priceDrift = Math.abs(freshPrice - originalPrice) / originalPrice; // fraction
+
+              // Use RAW atr_bps stored on candidate (not reverse-engineered from clamped sl_bps)
+              const atrFraction = (cand.atr_bps || 50) / 10000; // atr_bps is in bps, convert to fraction
+
+              // Threshold = 1.2x ATR (not 0.8x) — avoids dropping normal noise on high-ATR coins
+              if(priceDrift > atrFraction * 1.2){
+                log(`[STALE-SIGNAL] ${cand.symbol_full} price drifted ${(priceDrift*100).toFixed(3)}% since analysis (ATR=${(atrFraction*100).toFixed(2)}%) — dropping`);
+                return null;
+              }
+
+              const fresh1hChange = freshTicker.price1hPcnt || 0;
+              if(cand.side === "long" && fresh1hChange < -0.03){
+                log(`[STALE-DIRECTION] ${cand.symbol_full} LONG signal but ${(fresh1hChange*100).toFixed(1)}% in last hour — dropping`);
+                return null;
+              }
+              if(cand.side === "short" && fresh1hChange > 0.03){
+                log(`[STALE-DIRECTION] ${cand.symbol_full} SHORT signal but +${(fresh1hChange*100).toFixed(1)}% in last hour — dropping`);
+                return null;
+              }
+
+              const slF = cand.sl_bps / 10000;
+              const tpF = cand.tp_bps / 10000;
+              const entryOffset = Math.max(0.0005, slF * 0.15);
+
+              if(cand.side === "long"){
+                cand.entry_mid   = freshPrice;
+                cand.entry_limit = freshPrice * (1 - entryOffset);
+                cand.tp_abs      = cand.entry_limit * (1 + tpF);
+                cand.sl_abs      = cand.entry_limit * (1 - slF);
+              } else {
+                cand.entry_mid   = freshPrice;
+                cand.entry_limit = freshPrice * (1 + entryOffset);
+                cand.tp_abs      = cand.entry_limit * (1 - tpF);
+                cand.sl_abs      = cand.entry_limit * (1 + slF);
+              }
+
+              log(`[SIGNAL-FRESH] ${cand.symbol_full} ${originalPrice.toFixed(6)} → ${freshPrice.toFixed(6)} drift=${(priceDrift*100).toFixed(3)}%`);
+              return cand;
+
+            }catch(e){
+              log(`[REFRESH-ERR] ${cand.symbol_full}:`, e?.message||e);
+              return cand;
+            }
+          }
 
           // ================================================================
           // MAIN
@@ -1120,7 +1203,7 @@ jobs:
             if(state.regime_state&&Object.keys(state.regime_state).length>300){ const sorted=Object.entries(state.regime_last_update||{}).sort((a,b)=>b[1]-a[1]).slice(0,300).map(x=>x[0]); const keep={}; for(const sym of sorted) keep[sym]=state.regime_state[sym]; state.regime_state=keep; }
             if(state.regime_history&&Object.keys(state.regime_history).length>100){ const sorted=Object.entries(state.regime_last_update||{}).sort((a,b)=>b[1]-a[1]).slice(0,100).map(x=>x[0]); const keep={}; for(const sym of sorted) if(state.regime_history[sym]) keep[sym]=state.regime_history[sym]; state.regime_history=keep; }
 
-            const preserved={ v:state.v||"bybit-hedge-7.0", run_counter:state.run_counter||0, cooldown:state.cooldown||{}, cooldown_side:state.cooldown_side||{}, mr_lockout:state.mr_lockout||{}, calibCoeffs:state.calibCoeffs||{}, learned_trade_keys:state.learned_trade_keys||[], calib_symbol_counts:state.calib_symbol_counts||{}, calib_last_version:state.calib_last_version||CALIB_VERSION, regime_state:state.regime_state||{}, regime_history:state.regime_history||{}, regime_last_update:state.regime_last_update||{}, pending:state.pending||[], closed:state.closed||[], equity:state.equity||[], sym_stats_real:state.sym_stats_real||{}, sym_stats:{}, calibration_holdout:[], lastReconcileTs:0 };
+            const preserved={ v:state.v||"bybit-hedge-7.0", run_counter:state.run_counter||0, cooldown:state.cooldown||{}, cooldown_side:state.cooldown_side||{}, cooldown_side_regime:state.cooldown_side_regime||{}, mr_lockout:state.mr_lockout||{}, calibCoeffs:state.calibCoeffs||{}, learned_trade_keys:state.learned_trade_keys||[], calib_symbol_counts:state.calib_symbol_counts||{}, calib_last_version:state.calib_last_version||CALIB_VERSION, regime_state:state.regime_state||{}, regime_history:state.regime_history||{}, regime_last_update:state.regime_last_update||{}, pending:state.pending||[], closed:state.closed||[], equity:state.equity||[], sym_stats_real:state.sym_stats_real||{}, sym_stats:{}, calibration_holdout:[], lastReconcileTs:0 };
             Object.assign(state,preserved);
 
             const cooldownCount=Object.keys(state.cooldown||{}).length;
@@ -1142,7 +1225,7 @@ jobs:
             const throttle=(pnl24_bps<=DD_24H_LIMIT_BPS)||(peak_dd_bps<=DD_PEAK_LIMIT_BPS);
 
             log("📊 Fetching golden metrics for all symbols...");
-            const BATCH_SIZE=15, BATCH_DELAY=300;
+            const BATCH_SIZE=25, BATCH_DELAY=200;
             const allMetrics=[];
 
             for(let i=0;i<bybitSymbols.length;i+=BATCH_SIZE){
@@ -1150,8 +1233,8 @@ jobs:
               const batch=bybitSymbols.slice(i,i+BATCH_SIZE);
               const batchResults=await Promise.all(batch.map(async(sym)=>{
                 try{
-                  const lastTs=state.cooldown?.[sym.symbol]||state.cooldown?.[sym.base]||0;
-                  if(lastTs&&(Date.now()-lastTs)<COOLDOWN_MS) return null;
+                  const globalCd=state.cooldown?.[sym.symbol]||0;
+                  if(globalCd&&(Date.now()-globalCd)<COOLDOWN_MS*0.5) return null;
                   const metrics=await fetchGoldenMetrics(sym.symbol);
                   if(!metrics) return null;
                   return { ...sym, ...metrics, hedge_confidence:calculateHedgeConfidence(metrics) };
@@ -1196,7 +1279,9 @@ jobs:
             if(altPump)  log(`🚀 ALTCOIN SECTOR PUMP: avg=${(avgAltChange*100).toFixed(2)}%`);
 
             const MAX_DETAILED=30;
-            const topCandidates=allMetrics.slice(0,MAX_DETAILED);
+            const preFiltered=allMetrics.filter(m=>m.vol_1h_pct>=0.05);
+            log(`📊 Pre-filter: ${allMetrics.length} → ${preFiltered.length} (removed dead/zero-vol coins)`);
+            const topCandidates=preFiltered.slice(0,MAX_DETAILED);
             const btcMetrics=allMetrics.find(m=>m.symbol==="BTCUSDT");
             const btcUp1h=btcMetrics?(btcMetrics.price_change_1h>0):true;
             const btcCrash=btcMetrics?Math.abs(btcMetrics.price_change_1h)>0.05:false;
@@ -1258,9 +1343,10 @@ jobs:
                   liquidityPenalty*=clamp(1-(spreadBps-MAX_SPREAD_BPS)/20, 0.5, 1.0);
                   log(`[LIQ-WARN] ${cand.symbol} spread=${spreadBps}bps penalty=${liquidityPenalty.toFixed(2)}`);
                 }
-                if(depth1pUSD<DEPTH_1P_MIN_USD){
-                  if(depth1pUSD<5000){ log(`[LIQ-GATE] ${cand.symbol} skipped: depth1p=$${Math.round(depth1pUSD)} (hard limit)`); continue; }
-                  liquidityPenalty*=clamp(depth1pUSD/DEPTH_1P_MIN_USD, 0.5, 1.0);
+                const scaledDepthMin = Math.max(NOTIONAL * 1.5, 2500);
+                if(depth1pUSD<scaledDepthMin){
+                  if(depth1pUSD<1500){ log(`[LIQ-GATE] ${cand.symbol} skipped: depth1p=$${Math.round(depth1pUSD)} (hard limit)`); continue; }
+                  liquidityPenalty*=clamp(depth1pUSD/scaledDepthMin, 0.5, 1.0);
                   log(`[LIQ-WARN] ${cand.symbol} depth1p=$${Math.round(depth1pUSD)} penalty=${liquidityPenalty.toFixed(2)}`);
                 }
 
@@ -1447,23 +1533,35 @@ jobs:
 
             log(`🔍 Refined ${refined.length} candidates`);
 
-            refined.sort((a,b)=>b.confidence-a.confidence);
-            
-            // ★ FIX 2: Enforce long/short balance
+            // ★ Edge-ranked pool selection (replaces hard 2L+2S cap)
             const refinedLongs  = refined.filter(r => r.side === "long");
             const refinedShorts = refined.filter(r => r.side === "short");
             log(`📊 Refined pool: ${refinedLongs.length} longs, ${refinedShorts.length} shorts`);
-            const balancedPool = [];
-            const topLongs  = refinedLongs.slice(0, 2); const topShorts = refinedShorts.slice(0, 2); // ★ FIX: Force minimum 1 short always if(topShorts.length === 0 && refinedShorts.length > 0){   topShorts.push(refinedShorts[0]);   log(`⚠️ Forced 1 short into pool: ${refinedShorts[0].symbol}`); } // ★ FIX: Force minimum 1 long always if(topLongs.length === 0 && refinedLongs.length > 0){   topLongs.push(refinedLongs[0]);   log(`⚠️ Forced 1 long into pool: ${refinedLongs[0].symbol}`); } for(const c of [...topLongs, ...topShorts]) {   balancedPool.push(c); }
 
-            balancedPool.sort((a,b) => b.confidence - a.confidence);
-            const useBalanced = topLongs.length > 0 && topShorts.length > 0;
-            if(useBalanced) {
-              log(`✅ Balanced pool: ${topLongs.length} longs + ${topShorts.length} shorts`);
-            } else {
-              log(`⚠️ Cannot balance: only ${topLongs.length > 0 ? "LONGS" : "SHORTS"} available`);
+            const edgeRanked = [...refined].sort((a,b) =>
+              (b.confidence * Math.abs(b.dir_analysis?.dir_edge || 0.01)) -
+              (a.confidence * Math.abs(a.dir_analysis?.dir_edge || 0.01))
+            );
+            // Note: [...refined] creates a new array but retains the SAME object
+            // references as in `refined`, so reference equality (.includes) below is valid.
+
+            const DYNAMIC_TOP_N_LOCAL = Math.max(6, TOP_N||6);
+            const topByEdge = edgeRanked.slice(0, DYNAMIC_TOP_N_LOCAL);
+            const hasLong  = topByEdge.some(c => c.side === "long");
+            const hasShort = topByEdge.some(c => c.side === "short");
+
+            if(!hasShort && refinedShorts.length > 0){
+              topByEdge.push(refinedShorts[0]);
+              log(`⚠️ Soft balance: added 1 short ${refinedShorts[0].symbol}`);
             }
-            if(useBalanced) refined.unshift(...balancedPool.filter(c => !refined.slice(0,4).includes(c)));
+            if(!hasLong && refinedLongs.length > 0){
+              topByEdge.push(refinedLongs[0]);
+              log(`⚠️ Soft balance: added 1 long ${refinedLongs[0].symbol}`);
+            }
+
+            log(`✅ Edge-ranked pool: ${topByEdge.filter(c=>c.side==="long").length} longs + ${topByEdge.filter(c=>c.side==="short").length} shorts`);
+            refined.sort((a,b)=>b.confidence-a.confidence);
+            refined.unshift(...topByEdge.filter(c => !refined.slice(0,4).includes(c)));
 
             const TARGET_TOP_N=Math.max(2, DYNAMIC_TOP_N);
 
@@ -1497,12 +1595,17 @@ jobs:
 
             if(selected.length<TARGET_TOP_N){
               log(`⚠️ Only ${selected.length}/${TARGET_TOP_N} passed quality floor (conf>=${MIN_CONF_TO_TRADE}). Relaxing...`);
-              const RELAXED_CONF=Math.max(3, Math.floor(MIN_CONF_TO_TRADE*0.4));
+              const RELAXED_CONF=Math.max(10, Math.floor(MIN_CONF_TO_TRADE*0.65));
               for(const cand of refined){
                 if(selected.length>=TARGET_TOP_N) break;
                 if(usedBases.has(cand.base)) continue;
                 if(selected.some(s=>s.symbol===cand.symbol)) continue;
                 if(cand.confidence<RELAXED_CONF) continue;
+                const candATR = cand.atr_bps ? (cand.atr_bps/100) : 0;
+                if(candATR < 0.25){
+                  log(`[RELAXED-ATR-SKIP] ${cand.symbol} ATR=${candATR.toFixed(2)}% too dead`);
+                  continue;
+                }
                 selected.push(cand);
                 usedBases.add(cand.base);
                 log(`[RELAXED] ${cand.symbol} conf=${cand.confidence} (relaxed floor=${RELAXED_CONF})`);
@@ -1726,11 +1829,12 @@ jobs:
                 hedge_metrics:{ vol_1h_pct:x.vol_1h_pct, funding_rate_raw:x.funding_rate_raw, oi_delta_pct:x.oi_delta_pct, volume_1h_usd:x.volume_1h_usd, basis_bps:x.basis_bps, mark_price:x.mark_price, current_oi_usd:x.current_oi_usd },
                 mtf_analysis: x.mtf || null,
                 mtf_overridden: x.mtf_overridden || false,
-                dir_analysis: x.dir_analysis || null
+                dir_analysis: x.dir_analysis || null,
+                atr_bps: x.atr_bps // Pass through for refresh logic
               };
             });
 
-            const toV1Compat=(pv2)=>({ idea_id:pv2.idea_id, client_order_id:pv2.client_order_id, symbol:pv2.symbol, symbol_full:pv2.symbol_full, quote:pv2.quote, side:pv2.side, rank:pv2.rank, entry_policy:"smart_swing_limit", entry_type:"limit", activation:"on_fill", entry_mid:pv2.entry_mid, entry_limit:pv2.entry_limit, tp_abs:pv2.tp_abs, sl_abs:pv2.sl_abs, tp_bps:pv2.tp_bps, sl_bps:pv2.sl_bps, rrr:pv2.rrr, exp_lcb_bps:pv2.exp_lcb_bps, ev_bps:pv2.ev_bps, cost_bps:pv2.cost_bps, p_win:pv2.p_lcb, p_lcb:pv2.p_lcb, p_raw:pv2.p_raw, calib_key:pv2.calib_key, regime:pv2.regime, ttl_sec:pv2.ttl_sec, size_bps:pv2.size_bps, predicted:{ ...pv2.predicted, meta:{ strategy:STRATEGY_NAME, model_version:MODEL_VERSION, schema_version:SCHEMA_VERSION, git_sha:GIT_SHA, config_hash:CONFIG_HASH, futures_hint:{ target_exchange:pv2.target_exchange, market_type:pv2.market_type, margin_mode:pv2.margin_mode, leverage:pv2.leverage, entry_policy_override:pv2.entry_policy, exec:pv2.exec } } }, confidence:pv2.confidence, reasons:pv2.reasons, reasons_text:pv2.reasons_text, hedge_metrics:pv2.hedge_metrics, mtf_analysis:pv2.mtf_analysis||null, mtf_overridden:pv2.mtf_overridden||false, dir_analysis:pv2.dir_analysis||null });
+            const toV1Compat=(pv2)=>({ idea_id:pv2.idea_id, client_order_id:pv2.client_order_id, symbol:pv2.symbol, symbol_full:pv2.symbol_full, quote:pv2.quote, side:pv2.side, rank:pv2.rank, entry_policy:"smart_swing_limit", entry_type:"limit", activation:"on_fill", entry_mid:pv2.entry_mid, entry_limit:pv2.entry_limit, tp_abs:pv2.tp_abs, sl_abs:pv2.sl_abs, tp_bps:pv2.tp_bps, sl_bps:pv2.sl_bps, rrr:pv2.rrr, exp_lcb_bps:pv2.exp_lcb_bps, ev_bps:pv2.ev_bps, cost_bps:pv2.cost_bps, p_win:pv2.p_lcb, p_lcb:pv2.p_lcb, p_raw:pv2.p_raw, calib_key:pv2.calib_key, regime:pv2.regime, ttl_sec:pv2.ttl_sec, size_bps:pv2.size_bps, predicted:{ ...pv2.predicted, meta:{ strategy:STRATEGY_NAME, model_version:MODEL_VERSION, schema_version:SCHEMA_VERSION, git_sha:GIT_SHA, config_hash:CONFIG_HASH, futures_hint:{ target_exchange:pv2.target_exchange, market_type:pv2.market_type, margin_mode:pv2.margin_mode, leverage:pv2.leverage, entry_policy_override:pv2.entry_policy, exec:pv2.exec } } }, confidence:pv2.confidence, reasons:pv2.reasons, reasons_text:pv2.reasons_text, hedge_metrics:pv2.hedge_metrics, mtf_analysis:pv2.mtf_analysis||null, mtf_overridden:pv2.mtf_overridden||false, dir_analysis:pv2.dir_analysis||null, atr_bps: pv2.atr_bps });
 
             let picks=picksV2.map(toV1Compat);
 
@@ -1738,6 +1842,17 @@ jobs:
               const maxVolPick=Math.max(...picks.map(p=>p.predicted?.vol_1h_pct||1));
               if(maxVolPick>5){ const scale=clamp(5/maxVolPick,0.65,1); picks=picks.map(p=>({...p,size_bps:Math.max(4,Math.round(p.size_bps*scale))})); log("[gha] High volatility detected, scaling sizes by",scale.toFixed(2)); }
             }catch(e){ log("[gha] Portfolio risk adjustment warn",e?.message||e); }
+
+            // ★ LIVE SIGNAL REFRESH before push
+            const refreshedPicksV2 = [];
+            for(const p of picksV2){
+              const fresh = await refreshSignalBeforePush(p, state);
+              if(fresh) refreshedPicksV2.push(fresh);
+            }
+            const droppedCount = picksV2.length - refreshedPicksV2.length;
+            if(droppedCount>0) log(`⚠️ Signal refresh dropped ${droppedCount} stale picks`);
+            picksV2 = refreshedPicksV2;
+            picks = picksV2.map(toV1Compat);
 
             const verifiedPicks=[];
             for(const p of picks){
@@ -1749,9 +1864,9 @@ jobs:
                 const freshSpread=freshDepth?.asks?.[0]&&freshDepth?.bids?.[0]?
                   Math.round((+freshDepth.asks[0][0]-+freshDepth.bids[0][0])/(freshMid||1)*10000):99;
                 const positionUSD=NOTIONAL;
-                const depthBuffer=3.0;
-                const minDepthRequired=Math.max(positionUSD*depthBuffer,4000);
-                const SPREAD_HARD_KILL=30;
+                const depthBuffer=1.5;
+                const minDepthRequired=Math.max(positionUSD*depthBuffer,2500);
+                const SPREAD_HARD_KILL=positionUSD<500?40:25;
                 const depthOK=freshDepthUSD>=minDepthRequired;
                 const spreadOK=freshSpread<=SPREAD_HARD_KILL;
                 if(!depthOK||!spreadOK){
@@ -1772,6 +1887,7 @@ jobs:
                 state.cooldown[p.symbol_full]=nowMs;
                 state.cooldown[p.symbol]=nowMs;
                 state.cooldown_side[p.symbol_full]={ side:p.side, ts_ms:nowMs };
+                setCooldown(state, p.symbol_full, p.side, p.regime);
                 state.pending.push({ ts:ideasTs, ts_ms:nowMs, ttl_ts_ms:nowMs+p.ttl_sec*1000, symbolFull:p.symbol_full, flipped:p.predicted?.flipped||false, base:p.symbol, quote:p.quote, side:p.side, entry_limit:p.entry_limit, tp_abs:p.tp_abs, sl_abs:p.sl_abs, hold_sec:p.ttl_sec, tp_bps:p.tp_bps, sl_bps:p.sl_bps, cost_bps:p.cost_bps, tier:"confidence", p_lcb:p.p_lcb, p_raw:p.p_raw, calib_key:p.calib_key, predicted:p.predicted, regime:p.regime, decision_context:{ source:"bybit_futures", golden_metrics:p.hedge_metrics }, notional_usd:NOTIONAL, size_bps:p.size_bps, idea_id:p.idea_id, client_order_id:p.client_order_id, hedge_metrics:p.hedge_metrics, status:"planned", entry_ts_ms:null, entry_price:null, qty:null });
               }
               if(state.pending.length>550) state.pending=state.pending.slice(-550);
