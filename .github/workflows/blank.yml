@@ -1,9 +1,4 @@
-// ---------------------------------------------------------------------------
-//
-// Bybit Ideas Pusher v7.7.8 (Corrected)
-// This version incorporates fixes for all identified critical and significant bugs.
-//
-// ---------------------------------------------------------------------------
+
 name: Ideas Pusher (MEXC Ultimate 7.7.8 - Corrected)
 
 on:
