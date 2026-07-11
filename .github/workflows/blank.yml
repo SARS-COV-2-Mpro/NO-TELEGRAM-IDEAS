@@ -1,4 +1,3 @@
-
 name: Ideas Pusher (MEXC Ultimate 7.7.8 - Corrected)
 
 on:
@@ -46,6 +45,8 @@ jobs:
       MR_LOCKOUT_SEC: ${{ vars.MR_LOCKOUT_SEC }}
       MAX_COST_BPS_HARD: ${{ vars.MAX_COST_BPS_HARD }}
       MIN_VOL_1H_USD: ${{ vars.MIN_VOL_1H_USD }}
+      TOP_NNN: ${{ vars.TOP_NNN }}
+      MIN_PUSH_DEPTH_USD: ${{ vars.MIN_PUSH_DEPTH_USD }}
       DEPTH_1P_MIN_USD: ${{ vars.DEPTH_1P_MIN_USD }}
       NO_LONG_DOWN_ENABLE: ${{ vars.NO_LONG_DOWN_ENABLE }}
       LONG_DOWN_RSI_CUTOFF: ${{ vars.LONG_DOWN_RSI_CUTOFF }}
@@ -442,6 +443,8 @@ jobs:
           const LONG_BOUNCE_SL_ATR=Number(process.env.LONG_BOUNCE_SL_ATR||"0.55");
           const LONG_BOUNCE_TP_ATR=Number(process.env.LONG_BOUNCE_TP_ATR||"1.80");
           const ATR_MIN_PCT=Number(process.env.ATR_MIN_PCT||"0.40");
+          const TOP_NNN=Number(process.env.TOP_NNN||"99");
+          const MIN_PUSH_DEPTH_USD=Number(process.env.MIN_PUSH_DEPTH_USD||"8000");
 
           const IDEAL_VOL_1H_PCT=2.0;
           const IDEAL_FUNDING_RATE=0.0004;
@@ -1212,6 +1215,202 @@ jobs:
           }
 
           // ================================================================
+          // TOP_NNN SCORING FUNCTION
+          // ================================================================
+          function scoreIdeaForPush(p) {
+            // ── HARD DISQUALIFIERS (instant zero, no appeal) ──
+            const winProb = p.side === "long"
+              ? (p.mtf_analysis?.long_prob_pct  ?? 0)
+              : (p.mtf_analysis?.short_prob_pct ?? 0);
+            const freshDepth = p._fresh_depth_usd ?? 0;
+            const mtfOverridden = p.mtf_overridden === true;
+            const mtfConf = p.mtf_analysis?.confidence_pct ?? 0;
+
+            if (mtfOverridden && mtfConf < 65) {
+              log(`[TOP_NNN-DQ] ${p.symbol_full}: MTF overridden + conf=${mtfConf}% < 65% → score=0`);
+              return 0;
+            }
+            if (winProb < 58) {
+              log(`[TOP_NNN-DQ] ${p.symbol_full}: win_prob=${winProb}% < 58% → score=0`);
+              return 0;
+            }
+            if (freshDepth < MIN_PUSH_DEPTH_USD) {
+              log(`[TOP_NNN-DQ] ${p.symbol_full}: depth=$${Math.round(freshDepth)} < $${MIN_PUSH_DEPTH_USD} → score=0`);
+              return 0;
+            }
+
+            const signals = p.mtf_analysis?.signals || [];
+            const getSig = (name) => signals.find(s => s.name === name);
+
+            // ── STAGE 1: CRITICAL (65% of total score) ──
+            let criticalScore = 0;
+
+            // Rank 1 — MTF Signal Agreement (how many of 5 signals agree with final side)
+            const finalSide = p.side;
+            const agreeCount = signals.filter(s =>
+              (finalSide === "long"  && s.score > 0.05) ||
+              (finalSide === "short" && s.score < -0.05)
+            ).length;
+            const totalSigs = signals.length || 1;
+            const agreementRatio = agreeCount / totalSigs;
+            // 4+/5 = 1.0, 3/5 = 0.6, 2/5 = 0.2, <2 = 0
+            const mtfAgreementScore =
+              agreeCount >= 4 ? 1.0 :
+              agreeCount === 3 ? 0.6 :
+              agreeCount === 2 ? 0.2 : 0.0;
+            criticalScore += mtfAgreementScore * 0.25; // weight within critical block
+
+            // Rank 2 — All TFs Aligned
+            const slopeSig = getSig("multi_tf_slope");
+            const allTFAligned = slopeSig?.reason?.includes("All TFs aligned") ?? false;
+            const tfConflict   = slopeSig?.reason?.includes("TF conflict") ?? false;
+            const tfAlignScore = allTFAligned ? 1.0 : tfConflict ? 0.0 : 0.4;
+            criticalScore += tfAlignScore * 0.20;
+
+            // Rank 3 — MTF Override Status
+            // CONFIRMED + high conf = best, OVERRIDE with low conf = worst
+            let overrideScore;
+            if (!mtfOverridden && mtfConf >= 65)       overrideScore = 1.0;
+            else if (!mtfOverridden && mtfConf >= 45)  overrideScore = 0.75;
+            else if (!mtfOverridden)                   overrideScore = 0.50;
+            else if (mtfOverridden && mtfConf >= 65)   overrideScore = 0.35;
+            else                                       overrideScore = 0.0; // already disqualified above but safe
+            criticalScore += overrideScore * 0.20;
+
+            // Normalize critical block to 0–1 then apply 65% weight
+            const criticalMax = 0.25 + 0.20 + 0.20; // = 0.65
+            const criticalNorm = criticalScore / criticalMax;
+            const stage1 = criticalNorm * 0.65;
+
+            // ── STAGE 2: HIGH TIER (25% of total score) ──
+            let highScore = 0;
+
+            // Rank 4 — RSI Extreme
+            const rsiSig = getSig("rsi_condition");
+            const rsiVal = rsiSig?.rsiValue ?? 50;
+            const rsiScore =
+              (rsiVal <= 25 || rsiVal >= 75) ? 1.0 :
+              (rsiVal <= 35 || rsiVal >= 65) ? 0.6 :
+              (rsiVal >= 45 && rsiVal <= 55) ? 0.0 : 0.3;
+            highScore += rsiScore * 0.05;
+
+            // Rank 5 — Price Structure
+            const structSig = getSig("price_structure");
+            const pattern = structSig?.patternType ?? "no_pattern";
+            const structScore =
+              (pattern === "uptrend"   && finalSide === "long")  ? 1.0 :
+              (pattern === "downtrend" && finalSide === "short") ? 1.0 :
+              (pattern === "weak_uptrend"   && finalSide === "long")  ? 0.6 :
+              (pattern === "weak_downtrend" && finalSide === "short") ? 0.6 :
+              (pattern === "squeeze" || pattern === "expanding") ? 0.2 :
+              (pattern === "uptrend"   && finalSide === "short") ? 0.0 :
+              (pattern === "downtrend" && finalSide === "long")  ? 0.0 : 0.3;
+            highScore += structScore * 0.05;
+
+            // Rank 6 — Win Probability (already >= 58 to reach here)
+            const winProbScore = clamp((winProb - 58) / (85 - 58), 0, 1);
+            highScore += winProbScore * 0.05;
+
+            // Rank 7 — ATR Value
+            const atrPct = (p.atr_bps ?? 0) / 100;
+            const atrScore =
+              atrPct >= 1.5 ? 1.0 :
+              atrPct >= 1.0 ? 0.7 :
+              atrPct >= 0.5 ? 0.4 : 0.1;
+            highScore += atrScore * 0.05;
+
+            // Rank 8 — Contradiction Strikes
+            const strikes = p.contradiction_strikes ?? 0;
+            const strikeScore = strikes === 0 ? 1.0 : strikes === 1 ? 0.5 : 0.1;
+            highScore += strikeScore * 0.05;
+
+            const highMax = 0.05 * 5; // = 0.25
+            const highNorm = highScore / highMax;
+            const stage2 = highNorm * 0.25;
+
+            // ── STAGE 3: MEDIUM + LOW TIER (10% of total score) ──
+            let secondaryScore = 0;
+
+            // Rank 9 — Volume Direction
+            const volSig = getSig("volume_direction");
+            const volScore2 = volSig
+              ? ((finalSide === "long" && volSig.score > 0) || (finalSide === "short" && volSig.score < 0)
+                ? clamp(Math.abs(volSig.score), 0, 1) : 0)
+              : 0.5;
+            secondaryScore += volScore2 * 0.012;
+
+            // Rank 10 — Macro 1H
+            const macroSig = getSig("macro_1h");
+            const macroAligned = macroSig
+              ? ((finalSide === "long" && macroSig.score > 0) || (finalSide === "short" && macroSig.score < 0))
+              : false;
+            secondaryScore += (macroAligned ? clamp(Math.abs(macroSig?.score ?? 0), 0, 1) : 0) * 0.012;
+
+            // Rank 11 — Depth
+            const depthScore = clamp((freshDepth - MIN_PUSH_DEPTH_USD) / 40000, 0, 1);
+            secondaryScore += depthScore * 0.012;
+
+            // Rank 12 — Confidence Score
+            const confScore = clamp((p.confidence - 15) / 60, 0, 1);
+            secondaryScore += confScore * 0.010;
+
+            // Rank 13 — Signal Drift (lower drift = better)
+            // drift stored as fraction in _price_drift if available
+            const drift = p._price_drift ?? 0;
+            const driftScore = clamp(1 - drift / 0.005, 0, 1);
+            secondaryScore += driftScore * 0.008;
+
+            // Rank 14 — CONTRA-MR-CONFIRM (bonus for MR trades with RSI confirmation)
+            const isMR = p.regime === "meanrevert";
+            const mrConfirm = isMR && (
+              (finalSide === "long"  && rsiVal <= 35) ||
+              (finalSide === "short" && rsiVal >= 65)
+            );
+            secondaryScore += (mrConfirm ? 1.0 : 0.0) * 0.008;
+
+            // Rank 15 — Spread
+            const spreadBps = p._fresh_spread_bps ?? 30;
+            const spreadScore = clamp(1 - (spreadBps - 5) / 35, 0, 1);
+            secondaryScore += spreadScore * 0.006;
+
+            // Rank 16 — ATR Penalty (from dir_analysis)
+            const atrPenalty = p.dir_analysis?.penalties?.atr ?? 1.0;
+            secondaryScore += clamp(atrPenalty, 0, 1) * 0.006;
+
+            // Rank 17 — Edge Value
+            const edgeVal = Math.abs(p.dir_analysis?.dir_edge ?? 0);
+            const edgeScore = clamp(edgeVal / 0.5, 0, 1);
+            secondaryScore += edgeScore * 0.006;
+
+            // Rank 18 — OI Delta Confirms
+            const oiDelta = p.hedge_metrics?.oi_delta_pct ?? 0;
+            const price1h  = p.hedge_metrics?.mark_price   ?? 0;
+            const oiConfirms = (oiDelta > 0 && finalSide === "long") || (oiDelta < 0 && finalSide === "short");
+            secondaryScore += (oiConfirms ? 1.0 : 0.0) * 0.006;
+
+            // Rank 19 — Regime Confirmed
+            const regConfirmed = p.dir_analysis?.regime_confirmed ?? false;
+            secondaryScore += (regConfirmed ? 1.0 : 0.5) * 0.006;
+
+            // Rank 20 — Vol Expansion
+            const volExp = p.dir_analysis?.vol_expansion ?? 1.0;
+            const volExpScore = clamp((volExp - 0.5) / 1.5, 0, 1);
+            secondaryScore += volExpScore * 0.006;
+
+            const stage3 = clamp(secondaryScore, 0, 0.10);
+
+            const totalScore = stage1 + stage2 + stage3;
+
+            log(`[TOP_NNN-SCORE] ${p.symbol_full} ${finalSide.toUpperCase()} | ` +
+                `crit=${stage1.toFixed(3)} high=${stage2.toFixed(3)} sec=${stage3.toFixed(3)} ` +
+                `TOTAL=${totalScore.toFixed(3)} | ` +
+                `agree=${agreeCount}/${totalSigs} tfAlign=${allTFAligned} ` +
+                `override=${mtfOverridden} winProb=${winProb}%`);
+
+            return totalScore;
+          }
+
+          // ================================================================
           // MAIN
           // ================================================================
           let reason="ok", selectionTier="confidence";
@@ -1958,11 +2157,12 @@ jobs:
                 mtf_analysis: x.mtf || null,
                 mtf_overridden: x.mtf_overridden || false,
                 dir_analysis: x.dir_analysis || null,
-                atr_bps: x.atr_bps
+                atr_bps: x.atr_bps,
+                contradiction_strikes: x.contradiction_strikes ?? 0
               };
             });
 
-            const toV1Compat=(pv2)=>({ idea_id:pv2.idea_id, client_order_id:pv2.client_order_id, symbol:pv2.symbol, symbol_full:pv2.symbol_full, quote:pv2.quote, side:pv2.side, rank:pv2.rank, entry_policy:"smart_swing_limit", entry_type:"limit", activation:"on_fill", entry_mid:pv2.entry_mid, entry_limit:pv2.entry_limit, tp_abs:pv2.tp_abs, sl_abs:pv2.sl_abs, tp_bps:pv2.tp_bps, sl_bps:pv2.sl_bps, rrr:pv2.rrr, exp_lcb_bps:pv2.exp_lcb_bps, ev_bps:pv2.ev_bps, cost_bps:pv2.cost_bps, p_win:pv2.p_lcb, p_lcb:pv2.p_lcb, p_raw:pv2.p_raw, calib_key:pv2.calib_key, regime:pv2.regime, ttl_sec:pv2.ttl_sec, size_bps:pv2.size_bps, predicted:{ ...pv2.predicted, meta:{ strategy:STRATEGY_NAME, model_version:MODEL_VERSION, schema_version:SCHEMA_VERSION, git_sha:GIT_SHA, config_hash:CONFIG_HASH, futures_hint:{ target_exchange:pv2.target_exchange, market_type:pv2.market_type, margin_mode:pv2.margin_mode, leverage:pv2.leverage, entry_policy_override:pv2.entry_policy, exec:pv2.exec } } }, confidence:pv2.confidence, reasons:pv2.reasons, reasons_text:pv2.reasons_text, hedge_metrics:pv2.hedge_metrics, mtf_analysis:pv2.mtf_analysis||null, mtf_overridden:pv2.mtf_overridden||false, dir_analysis:pv2.dir_analysis||null, atr_bps: pv2.atr_bps });
+            const toV1Compat=(pv2)=>({ idea_id:pv2.idea_id, client_order_id:pv2.client_order_id, symbol:pv2.symbol, symbol_full:pv2.symbol_full, quote:pv2.quote, side:pv2.side, rank:pv2.rank, entry_policy:"smart_swing_limit", entry_type:"limit", activation:"on_fill", entry_mid:pv2.entry_mid, entry_limit:pv2.entry_limit, tp_abs:pv2.tp_abs, sl_abs:pv2.sl_abs, tp_bps:pv2.tp_bps, sl_bps:pv2.sl_bps, rrr:pv2.rrr, exp_lcb_bps:pv2.exp_lcb_bps, ev_bps:pv2.ev_bps, cost_bps:pv2.cost_bps, p_win:pv2.p_lcb, p_lcb:pv2.p_lcb, p_raw:pv2.p_raw, calib_key:pv2.calib_key, regime:pv2.regime, ttl_sec:pv2.ttl_sec, size_bps:pv2.size_bps, predicted:{ ...pv2.predicted, meta:{ strategy:STRATEGY_NAME, model_version:MODEL_VERSION, schema_version:SCHEMA_VERSION, git_sha:GIT_SHA, config_hash:CONFIG_HASH, futures_hint:{ target_exchange:pv2.target_exchange, market_type:pv2.market_type, margin_mode:pv2.margin_mode, leverage:pv2.leverage, entry_policy_override:pv2.entry_policy, exec:pv2.exec } } }, confidence:pv2.confidence, reasons:pv2.reasons, reasons_text:pv2.reasons_text, hedge_metrics:pv2.hedge_metrics, mtf_analysis:pv2.mtf_analysis||null, mtf_overridden:pv2.mtf_overridden||false, dir_analysis:pv2.dir_analysis||null, atr_bps: pv2.atr_bps, contradiction_strikes: pv2.contradiction_strikes ?? 0 });
 
             let picks=picksV2.map(toV1Compat);
 
@@ -2001,6 +2201,8 @@ jobs:
                   continue;
                 }
                 log(`[PRE-PUSH-LIQ-OK] ${p.symbol_full} passed: depth=$${Math.round(freshDepthUSD)} spread=${freshSpread}bps`);
+                p._fresh_depth_usd = freshDepthUSD;
+                p._fresh_spread_bps = freshSpread;
                 verifiedPicks.push(p);
               }catch(e){ verifiedPicks.push(p); }
             }
@@ -2032,6 +2234,37 @@ jobs:
             const ideaLogs=picks.map(p=>({ symbol:p.symbol_full, side:p.side, flipped:p.predicted?.flipped||false, confidence:p.confidence, hedge_confidence:p.predicted?.hedge_confidence||0, vol_1h_pct:+(p.predicted?.vol_1h_pct||0).toFixed(2), funding_rate:+(p.predicted?.funding_rate||0).toFixed(5), oi_delta_pct:+(p.predicted?.oi_delta_pct||0).toFixed(1), volume_1h_usd:Math.round((p.predicted?.volume_1h_usd||0)/1e6)+"M", reasons:p.reasons_text, p_cal:+p.p_lcb.toFixed(3), ev_bps:p.ev_bps, idea_id:p.idea_id, mtf_long_prob:p.mtf_analysis?.long_prob_pct??null, mtf_short_prob:p.mtf_analysis?.short_prob_pct??null, mtf_confidence:p.mtf_analysis?.confidence_pct??null, mtf_overridden:p.mtf_overridden||false, mtf_reasons:p.mtf_analysis?.reasons?.slice(0,3)||[] }));
 
             const meta={ origin:"github_actions", reason, exchange:"bybit_futures", execution_exchange:"bybit_futures", strategy:STRATEGY_NAME, model_version:MODEL_VERSION, schema_version:SCHEMA_VERSION, git_sha:GIT_SHA, config_hash:CONFIG_HASH, counts:{ bybit_universe:bybitSymbols.length, metrics_fetched:allMetrics.length, refined:refined.length, selected_pre_mtf:selected.length, selected_post_mtf:finalSelected.length, mtf_stats:mtfStats, final_picks:picks.length }, dd_gate:{ pnl24_bps, peak_dd_bps, throttle }, tod:{ active:S_H!=null&&E_H!=null, start:S_H, end:E_H }, heartbeat:{ mismatches:0, zombies:0 }, tier:selectionTier, idea_logs:ideaLogs, calibration_health:calibHealth, market_health:{ median_vol:+medianVol.toFixed(2), dynamic_vol_gate:DYNAMIC_VOL_GATE, dynamic_top_n:DYNAMIC_TOP_N, btc_crash:btcCrash, alt_crash:altCrash, alt_pump:altPump, macro_bull:isMacroBull, macro_bear:isMacroBear, fetch_ratio:+fetchRatio.toFixed(3) }, extras:{ v2_ideas:picksV2, features_requested:["maker_join","post_only","futures","hedge_trading","bybit_execution","mtf_direction_analysis_v2","smart_direction_engine","always_trade","gap_fix_rocket_adx","gap_fix_vol_conflict","gap_fix_crash_gate","gap_fix_balance","gap_fix_vol_collapse"] } };
+
+            // ── TOP_NNN FINAL SCORING AND CUT ──
+            if (TOP_NNN < picks.length) {
+              log(`\n🏆 TOP_NNN=${TOP_NNN} — scoring ${picks.length} ideas...`);
+
+              // Attach scores
+              const scored = picks.map(p => ({ p, score: scoreIdeaForPush(p) }));
+
+              // Sort descending
+              scored.sort((a, b) => b.score - a.score);
+
+              // Log full ranking
+              log("📊 TOP_NNN ranking:");
+              scored.forEach((s, i) => {
+                log(`   ${i+1}. ${s.p.symbol_full} ${s.p.side.toUpperCase()} score=${s.score.toFixed(4)} ${s.score === 0 ? "❌ DISQUALIFIED" : "✅"}`);
+              });
+
+              // Cut to TOP_NNN (skip zeros)
+              const qualified = scored.filter(s => s.score > 0);
+              const cut = qualified.slice(0, TOP_NNN);
+
+              if (cut.length === 0) {
+                log("🚨 TOP_NNN: all ideas disqualified — pushing 0");
+              } else {
+                log(`✅ TOP_NNN: pushing ${cut.length}/${picks.length} ideas`);
+              }
+
+              const keptIds = new Set(cut.map(s => s.p.idea_id));
+              picks   = picks.filter(p   => keptIds.has(p.idea_id));
+              picksV2 = picksV2.filter(p => keptIds.has(p.idea_id));
+            }
 
             const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta, top_n:picks.length||0, ideas:picks||[] };
             log(`pushing ${picks.length} ideas (${selectionTier}) to ${PUSH_URL}`);
