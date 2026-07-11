@@ -1122,7 +1122,7 @@ jobs:
               cand.contradiction_reasons=strikeReasons;
 
               // DECISION
-              if(strikes >= 2 && strikeReasons.some(r => r.includes("win_prob_low"))) {   log(`[CONTRA-DROP] ${cand.symbol} ${cand.side.toUpperCase()} win_prob strike at 2 strikes — hard drop`);   continue; } if(strikes>=3){   log(`[CONTRA-DROP] ${cand.symbol} ${cand.side.toUpperCase()} strikes=${strikes} [${strikeReasons.join(", ")}] — dropped`);   continue; }
+              const structPatternHG = getSig("price_structure")?.patternType ?? "no_pattern"; const volScoreHG = getSig("volume_direction")?.score ?? 0; if(cand.side === "short" && structPatternHG === "uptrend" && volScoreHG > 0.50) {   log(`[CONTRA-DROP] ${cand.symbol} SHORT: uptrend structure + strong bull volume (${volScoreHG.toFixed(2)}) — hard drop`);   continue; } if(cand.side === "long" && structPatternHG === "downtrend" && volScoreHG < -0.50) {   log(`[CONTRA-DROP] ${cand.symbol} LONG: downtrend structure + strong bear volume (${volScoreHG.toFixed(2)}) — hard drop`);   continue; } if(strikes >= 2 && strikeReasons.some(r => r.includes("win_prob_low"))) {   log(`[CONTRA-DROP] ${cand.symbol} ${cand.side.toUpperCase()} win_prob strike at 2 strikes — hard drop`);   continue; } if(strikes>=3){   log(`[CONTRA-DROP] ${cand.symbol} ${cand.side.toUpperCase()} strikes=${strikes} [${strikeReasons.join(", ")}] — dropped`);   continue; }
 
               if(strikes===2){
                 const hasVolumeContra = strikeReasons.some(r => r.includes("volume_against"));
@@ -1699,7 +1699,7 @@ jobs:
                 log(`[POOL-EXPAND] Added ${cand.symbol} conf=${cand.confidence}`);
               }
             }
-            log(`✅ Selected ${selected.length} ideas before MTF analysis (target=${TARGET_TOP_N})`);
+            const qualityCount = selected.filter(c => c.confidence >= MIN_CONF_TO_TRADE).length; if(qualityCount === 0 && selected.length > 2) {   log(`⚠️ Zero quality picks — capping relaxed ideas from ${selected.length} to 2`);   selected = selected.slice(0, 2); } log(`✅ Selected ${selected.length} ideas before MTF analysis (target=${TARGET_TOP_N})`);
 
             log("\n🔬 ════════════════════════════════════════════════════════");
             log("🔬  FINAL MTF DIRECTION ANALYSIS — running for all selected ideas");
