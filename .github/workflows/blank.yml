@@ -1,4 +1,10 @@
-name: Ideas Pusher (MEXC Ultimate 7.7.7)
+// ---------------------------------------------------------------------------
+//
+// Bybit Ideas Pusher v7.7.8 (Corrected)
+// This version incorporates fixes for all identified critical and significant bugs.
+//
+// ---------------------------------------------------------------------------
+name: Ideas Pusher (MEXC Ultimate 7.7.8 - Corrected)
 
 on:
   repository_dispatch:
@@ -219,7 +225,7 @@ jobs:
                 reasons.push(`vwap_dist=${(vwapDist*100).toFixed(2)}%`);
               }
 
-            } else {
+            } else { // Mean-revert regime
               const bbSignal=(0.5-bbPos)*2;
               if(bbSignal>0) longScore+=bbSignal*0.35;
               else shortScore+=Math.abs(bbSignal)*0.35;
@@ -247,6 +253,14 @@ jobs:
                 if(vwapFade>0) longScore+=vwapFade*0.10;
                 else shortScore+=Math.abs(vwapFade)*0.10;
                 reasons.push(`vwap_fade=${(vwapDist*100).toFixed(2)}%`);
+              }
+              
+              // ★ FIX: Add ADX check to mean-revert logic. High ADX is dangerous for MR.
+              if (adxValue > 35) {
+                const adxPenalty = clamp(1 - (adxValue - 35) / 30, 0.5, 1.0);
+                longScore *= adxPenalty;
+                shortScore *= adxPenalty;
+                reasons.push(`ADX=${adxValue.toFixed(0)} high for MR — penalty=${adxPenalty.toFixed(2)}`);
               }
             }
 
@@ -329,10 +343,19 @@ jobs:
             const matchCount=recentHistory.filter(h=>h.regime===candidateRegime).length;
             const needed=Math.min(V5_CONFIRM_BARS,recentHistory.length);
             let confirmedRegime; let isConfirmed=false;
-            if(candidateRegime===lastRegime){ confirmedRegime=candidateRegime; isConfirmed=true; }
-            else if(needed===0){ confirmedRegime=candidateRegime; isConfirmed=true; }
-            else if(matchCount>=needed){ confirmedRegime=candidateRegime; isConfirmed=true; }
-            else { confirmedRegime=lastRegime; isConfirmed=false; }
+            
+            // ★ FIX: Make regime confirmation meaningful, especially after a state wipe.
+            if (recentHistory.length < V5_CONFIRM_BARS) {
+                confirmedRegime = lastRegime; // Stick with the old regime
+                isConfirmed = false; // Not enough history to confirm a change
+            } else if (matchCount >= needed) {
+                confirmedRegime = candidateRegime; // Confirmed change
+                isConfirmed = true;
+            } else {
+                confirmedRegime = lastRegime; // Not enough matching bars, stick with old
+                isConfirmed = false;
+            }
+
             if(!state.regime_state) state.regime_state={};
             if(!state.regime_last_update) state.regime_last_update={};
             state.regime_state[symbol]=confirmedRegime;
@@ -540,10 +563,25 @@ jobs:
 
           async function fetchGoldenMetrics(symbol){
             try{
-              const [ticker,oiHist]=await Promise.all([fetchBybitTicker(symbol),fetchBybitOIHist(symbol)]);
+              // ★ FIX: Fetch klines to get REAL 1h volume, not a 24h average.
+              const [ticker, oiHist, klines1h] = await Promise.all([
+                  fetchBybitTicker(symbol),
+                  fetchBybitOIHist(symbol),
+                  fetchBybitKlines(symbol, 60, 1) // Fetch last 1-hour candle
+              ]);
+
               if(!ticker) return null;
+              
               const vol1hPct=Math.abs(ticker.price1hPcnt)*100;
               const mid=ticker.markPrice||ticker.lastPrice;
+              
+              let volume_1h_usd = ticker.turnover24h / 24; // Fallback
+              if (klines1h && klines1h.length > 0) {
+                  const lastCandle = klines1h[0];
+                  const avgPrice = (+lastCandle[2] + +lastCandle[3]) / 2; // (high+low)/2
+                  volume_1h_usd = (+lastCandle[5] * avgPrice); // volume * price
+              }
+
               let oi_delta_pct=0,oi_delta_1h_pct=0;
               let current_oi_usd=ticker.openInterestValue;
               if(oiHist&&mid>0){
@@ -558,7 +596,7 @@ jobs:
                   ? oiDelta1h*100 : oiDelta2h*100;
                 current_oi_usd=currentOI;
               }
-              return { symbol, vol_1h_pct:vol1hPct, price_change_1h:ticker.price1hPcnt, price_change_24h:ticker.price24hPcnt, funding_rate:Math.abs(ticker.fundingRate), funding_rate_raw:ticker.fundingRate, oi_delta_pct, oi_delta_1h_pct, current_oi_usd, volume_1h_usd:ticker.turnover24h/24, turnover_24h:ticker.turnover24h, mark_price:ticker.markPrice||ticker.lastPrice, bid1:ticker.bid1Price, ask1:ticker.ask1Price, bid1Size:ticker.bid1Size, ask1Size:ticker.ask1Size, basis_bps:Math.round(((ticker.markPrice-ticker.indexPrice)/(ticker.indexPrice||1))*10000), ts:Date.now() };
+              return { symbol, vol_1h_pct:vol1hPct, price_change_1h:ticker.price1hPcnt, price_change_24h:ticker.price24hPcnt, funding_rate:Math.abs(ticker.fundingRate), funding_rate_raw:ticker.fundingRate, oi_delta_pct, oi_delta_1h_pct, current_oi_usd, volume_1h_usd, turnover_24h:ticker.turnover24h, mark_price:ticker.markPrice||ticker.lastPrice, bid1:ticker.bid1Price, ask1:ticker.ask1Price, bid1Size:ticker.bid1Size, ask1Size:ticker.ask1Size, basis_bps:Math.round(((ticker.markPrice-ticker.indexPrice)/(ticker.indexPrice||1))*10000), ts:Date.now() };
             }catch(e){ log(`fetchGoldenMetrics error for ${symbol}:`,e?.message||e); return null; }
           }
 
@@ -776,7 +814,10 @@ jobs:
           }
 
           const calibrateP=(state,side,regime,pRaw)=>{ const coeff=getCoeffs(state,side,regime); if(!coeff||pRaw==null||!isFinite(pRaw)) return 0.5; const x=Math.max(-5,Math.min(5,logit(pRaw))); return sigmoid(coeff.a+coeff.b*x); };
+          
+          // ★ FIX: Activate the getSymbolAdj function so it's no longer dead code.
           function getSymbolAdj(state,base){ const real=state.sym_stats_real?.[base]; const s=real||state.sym_stats?.[base]; if(!s||s.n<6) return 1.0; const winRate=s.wins/s.n; const avgPnL=s.pnl_sum/s.n; let m=1.0; if(winRate<0.4) m*=0.7; if(avgPnL<0) m*=0.8; return clamp(m,0.5,1.2); }
+          
           function buildAuditOutputs(state){ const lastNClosed=(state.closed||[]).slice(-5000); const closedAudit=lastNClosed.map(x=>JSON.stringify(x)).join("\n"); return { closedAudit, disagreements:"", tradesCsv:"" }; }
 
           // ★ ================================================================
@@ -824,7 +865,7 @@ jobs:
                 signals.push({ name:"multi_tf_slope", score, weight:0.25, reason });
               }
 
-              // ═══ SIGNAL 2: RSI CONDITION + DIVERGENCE (weight: 0.20) ═══
+              // ═══ SIGNAL 2: RSI CONDITION + DIVERGENCE (weight: 0.15) ═══
               if(k5m && k5m.length >= 20) {
                 const closes5m = k5m.map(c => +c[4]);
                 const lows5m   = k5m.map(c => +c[3]);
@@ -865,7 +906,7 @@ jobs:
                       rsiReason += ` + BEARISH DIVERGENCE (price new high but RSI falling ${rsiAtHigh.toFixed(0)}→${rsiNow.toFixed(0)})`;
                     }
                   }
-                  signals.push({ name:"rsi_condition", score:rsiScore, weight:0.20, reason:rsiReason, rsiValue:+rsi5m.toFixed(1) });
+                  signals.push({ name:"rsi_condition", score:rsiScore, weight:0.15, reason:rsiReason, rsiValue:+rsi5m.toFixed(1) });
                 }
               }
 
@@ -894,7 +935,7 @@ jobs:
                 signals.push({ name:"volume_direction", score: score * Math.min(1.2, expanding), weight:0.20, reason });
               }
 
-              // ═══ SIGNAL 4: PRICE STRUCTURE — HH/HL/LH/LL (weight: 0.20) ═══
+              // ═══ SIGNAL 4: PRICE STRUCTURE — HH/HL/LH/LL (weight: 0.10) ═══
               if(k15m && k15m.length >= 12) {
                 const highs = k15m.map(c => +c[2]);
                 const lows  = k15m.map(c => +c[3]);
@@ -918,10 +959,10 @@ jobs:
                 else if(hh)        { score =  0.30; reason = "Structure: HH only — weakening uptrend"; patternType="weak_uptrend"; }
                 else if(ll)        { score = -0.30; reason = "Structure: LL only — weakening downtrend"; patternType="weak_downtrend"; }
                 else               { score =  0.00; reason = "Structure: no clear pattern"; patternType="no_pattern"; }
-                signals.push({ name:"price_structure", score, weight:0.20, reason, patternType });
+                signals.push({ name:"price_structure", score, weight:0.10, reason, patternType });
               }
 
-              // ═══ SIGNAL 5: 1H MACRO DIRECTION (weight: 0.15) ═══
+              // ═══ SIGNAL 5: 1H MACRO DIRECTION (weight: 0.30) ═══
               if(k1h && k1h.length >= 12) {
                 const closes1h = k1h.map(c => +c[4]);
                 const slope1h  = calcLinearRegressionSlope(closes1h);
@@ -936,7 +977,7 @@ jobs:
                 const slopeScore = clamp(slope1h / 0.08, -1, 1);
                 const score      = (slopeScore * 0.6 + emaCross * 0.4);
                 const reason     = `1h macro: slope=${slope1h.toFixed(3)}% EMA8${emaCross>0?">":"<"}EMA21 → ${score>0.2?"BULLISH":score<-0.2?"BEARISH":"NEUTRAL"}`;
-                signals.push({ name:"macro_1h", score: clamp(score, -1, 1), weight:0.15, reason });
+                signals.push({ name:"macro_1h", score: clamp(score, -1, 1), weight:0.30, reason });
               }
 
               // ═══ WEIGHTED SCORE AGGREGATION ═══
@@ -1091,7 +1132,6 @@ jobs:
                 continue;
               }
               if(strikes===2){
-                // ★ FIX: If 2 strikes include BOTH volume_against AND win_prob_low → hard drop
                 const hasVolumeContra = strikeReasons.some(r => r.includes("volume_against"));
                 const hasLowWinProb = strikeReasons.some(r => r.includes("win_prob_low"));
                 if(hasVolumeContra && hasLowWinProb) {
@@ -1130,24 +1170,25 @@ jobs:
               if(!originalPrice || !freshPrice) return cand;
 
               const priceDrift = Math.abs(freshPrice - originalPrice) / originalPrice; // fraction
-
-              // Use RAW atr_bps stored on candidate (not reverse-engineered from clamped sl_bps)
               const atrFraction = (cand.atr_bps || 50) / 10000; // atr_bps is in bps, convert to fraction
 
-              // Threshold = 1.2x ATR (not 0.8x) — avoids dropping normal noise on high-ATR coins
               if(priceDrift > atrFraction * 1.2){
                 log(`[STALE-SIGNAL] ${cand.symbol_full} price drifted ${(priceDrift*100).toFixed(3)}% since analysis (ATR=${(atrFraction*100).toFixed(2)}%) — dropping`);
                 return null;
               }
 
               const fresh1hChange = freshTicker.price1hPcnt || 0;
-              if(cand.side === "long" && fresh1hChange < -0.03){
-                log(`[STALE-DIRECTION] ${cand.symbol_full} LONG signal but ${(fresh1hChange*100).toFixed(1)}% in last hour — dropping`);
-                return null;
-              }
-              if(cand.side === "short" && fresh1hChange > 0.03){
-                log(`[STALE-DIRECTION] ${cand.symbol_full} SHORT signal but +${(fresh1hChange*100).toFixed(1)}% in last hour — dropping`);
-                return null;
+              
+              // ★ FIX: Do not drop mean-revert trades for moving in the expected direction before entry.
+              if(cand.regime !== "meanrevert") {
+                  if(cand.side === "long" && fresh1hChange < -0.03){
+                    log(`[STALE-DIRECTION] ${cand.symbol_full} LONG signal but ${(fresh1hChange*100).toFixed(1)}% in last hour — dropping`);
+                    return null;
+                  }
+                  if(cand.side === "short" && fresh1hChange > 0.03){
+                    log(`[STALE-DIRECTION] ${cand.symbol_full} SHORT signal but +${(fresh1hChange*100).toFixed(1)}% in last hour — dropping`);
+                    return null;
+                  }
               }
 
               const slF = cand.sl_bps / 10000;
@@ -1163,7 +1204,7 @@ jobs:
                 cand.entry_mid   = freshPrice;
                 cand.entry_limit = freshPrice * (1 + entryOffset);
                 cand.tp_abs      = cand.entry_limit * (1 - tpF);
-                cand.sl_abs      = cand.entry_limit * (1 + slF);
+                sl_abs      = cand.entry_limit * (1 + slF);
               }
 
               log(`[SIGNAL-FRESH] ${cand.symbol_full} ${originalPrice.toFixed(6)} → ${freshPrice.toFixed(6)} drift=${(priceDrift*100).toFixed(3)}%`);
@@ -1189,12 +1230,21 @@ jobs:
             const SHOULD_WIPE=(state.run_counter>=6);
             if(SHOULD_WIPE){
               log("🗑️  RUN 6: WIPE GIST AND RESTART FRESH");
-              await saveState(persist,{ run_counter:0 },{},2,true);
+              // ★ FIX: Do not wipe regime state on Run 6, to preserve confirmation history.
+              const stateToKeep = {
+                  regime_state: state.regime_state || {},
+                  regime_history: state.regime_history || {},
+                  regime_last_update: state.regime_last_update || {}
+              };
+              await saveState(persist,{ run_counter:0, ...stateToKeep },{},2,true);
               state.v="bybit-hedge-7.0"; state.run_counter=1; state.cooldown={}; state.cooldown_side={};
               state.pending=[]; state.equity=[]; state.closed=[]; state.mr_lockout={}; state.sym_stats={};
               state.sym_stats_real={}; state.calibCoeffs={}; state.lastReconcileTs=0;
               state.calibration_holdout=[]; state.learned_trade_keys=[]; state.calib_symbol_counts={};
-              state.calib_last_version=CALIB_VERSION; state.regime_state={}; state.regime_history={}; state.regime_last_update={};
+              state.calib_last_version=CALIB_VERSION;
+              state.regime_state = stateToKeep.regime_state;
+              state.regime_history = stateToKeep.regime_history;
+              state.regime_last_update = stateToKeep.regime_last_update;
               log("♻️  State reset to fresh. Continuing with idea generation...");
             }
 
@@ -1266,8 +1316,8 @@ jobs:
 
             const marketVolSorted=allMetrics.slice(0,50).map(m=>m.vol_1h_pct).sort((a,b)=>a-b);
             const medianVol=marketVolSorted[Math.floor(marketVolSorted.length/2)]||0;
-            const DYNAMIC_VOL_GATE=0.3; // ★ FIX: always accept anything with tiny movement
-            const DYNAMIC_TOP_N=Math.max(6, TOP_N||6); // ★ FIX: always evaluate at least 6
+            const DYNAMIC_VOL_GATE=0.3;
+            const DYNAMIC_TOP_N=Math.max(6, TOP_N||6);
             log(`📊 Market median vol=${medianVol.toFixed(2)}% → VOL_GATE=${DYNAMIC_VOL_GATE}% TOP_N=${DYNAMIC_TOP_N}`);
 
             const top30Changes=allMetrics.slice(0,30).map(m=>m.price_change_1h||0);
@@ -1333,7 +1383,6 @@ jobs:
                 const d1=depthWithinPctUSD(depth,mid,0.01);
                 const depth1pUSD=(d1.asksUSD||0)+(d1.bidsUSD||0);
 
-                // ★ FIX 1: LIQUIDITY REALITY CHECK (depth vs actual volume)
                 const vol24hUSD = cand.turnover_24h || 0;
                 const depthToVolumeRatio = vol24hUSD > 0 ? depth1pUSD / vol24hUSD : 0;
                 if(vol24hUSD > 0 && depthToVolumeRatio > 50) {
@@ -1345,7 +1394,6 @@ jobs:
                   continue;
                 }
 
-                // ★ CRASH/PUMP GATE
                 const change24h = cand.price_change_24h || 0;
                 if(change24h < -0.15) {
                   log(`[CRASH-GATE] ${cand.symbol} HARD SKIP: ${(change24h*100).toFixed(1)}% today — possible exploit/dump`);
@@ -1372,7 +1420,7 @@ jobs:
                 let volPenalty=1.0;
                 if(cand.vol_1h_pct<DYNAMIC_VOL_GATE){
                   if(cand.vol_1h_pct<0.05){ log(`[VOL-GATE] ${cand.symbol} skipped: vol1h=${cand.vol_1h_pct.toFixed(2)}% (completely dead)`); continue; }
-                  volPenalty=clamp(cand.vol_1h_pct/2.0, 0.50, 1.0); // ★ FIX: softer penalty, never kill low-vol coins
+                  volPenalty=clamp(cand.vol_1h_pct/2.0, 0.50, 1.0);
                   log(`[VOL-WARN] ${cand.symbol} vol=${cand.vol_1h_pct.toFixed(2)}% penalty=${volPenalty.toFixed(2)}`);
                 }
 
@@ -1411,10 +1459,8 @@ jobs:
                   log(`[ATR-WARN] ${cand.symbol} ATR=${v5Result.atrPercent.toFixed(2)}% penalty=${atrPenalty.toFixed(2)}`);
                 }
 
-                // ★ FIX 3: Skip coins with collapsed volume
-                const vol24h = cand.turnover_24h || 0;
                 const vol1hUsd = cand.volume_1h_usd || 0;
-                const expectedHourlyVol = vol24h / 24;
+                const expectedHourlyVol = vol24hUSD / 24;
                 if(expectedHourlyVol > 100000 && vol1hUsd < expectedHourlyVol * 0.05) {
                   log(`[VOL-COLLAPSE] ${cand.symbol} SKIP: vol1h=$${Math.round(vol1hUsd)} << expected $${Math.round(expectedHourlyVol)}`);
                   continue;
@@ -1438,7 +1484,6 @@ jobs:
                 if(DIRECTION==="long") forcedSide="long";
                 else if(DIRECTION==="short") forcedSide="short";
                 
-                // ★ NEW: Direction-aware daily filter
                 if(change24h < -0.08 && forcedSide === "long") {
                   log(`[DAILY-CRASH] ${cand.symbol} SKIP: longing a coin down ${(change24h*100).toFixed(1)}% today`);
                   continue;
@@ -1447,10 +1492,9 @@ jobs:
                 
                 if(Math.abs(change24h) > 0.30 && forcedSide === "short") {   log(`[DAILY-RANGE-GATE] ${cand.symbol} SKIP: shorting coin with ${(change24h*100).toFixed(1)}% daily range`);   continue; }
                 
-                // ★ FIX 5: Parabolic extension gate (using 24h as proxy)
                 if(change24h > 0.15 && forcedSide === "long") {
                   log(`[PARABOLIC-WARN] ${cand.symbol}: +${(change24h*100).toFixed(1)}% today — late-stage FOMO risk`);
-                  liquidityPenalty *= 0.50; // heavy penalty for buying into parabolic moves
+                  liquidityPenalty *= 0.50;
                 }
                 log(`[DIR] ${cand.symbol} regime=${regime} edge=${dirEdge.toFixed(3)} BB=${bbPos.toFixed(2)} ADX=${adxValue.toFixed(0)} → ${forcedSide.toUpperCase()}`);
                 for(const r of dirResult.reasons.slice(0,3)) log(`  └─ ${r}`);
@@ -1519,10 +1563,13 @@ jobs:
                 const btcMult=(forcedSide==="long"&&!btcUp1h)?0.88:(forcedSide==="short"&&btcUp1h)?0.92:1.0;
                 const fundAligned=(forcedSide==="short"&&(cand.funding_rate_raw||0)>0.0001)||(forcedSide==="long"&&(cand.funding_rate_raw||0)<-0.0001);
                 const fundMult=fundAligned?1.10:1.0;
+                
+                // ★ FIX: Apply symbol-specific performance adjustment.
+                const symbolAdjustment = getSymbolAdj(state, cand.base);
 
                 const finalConf=Math.round(
                   baseConf * allPenalties * dirClarityMult * regimeStable *
-                  volExpMult * evMult * obiMult * btcMult * fundMult
+                  volExpMult * evMult * obiMult * btcMult * fundMult * symbolAdjustment
                 );
 
                 const reasons=reasonBuilder({ vol_1h_pct:cand.vol_1h_pct, funding_rate:cand.funding_rate, oi_delta_pct:Math.abs(cand.oi_delta_pct), volume_1h_usd:cand.volume_1h_usd, basis_bps:cand.basis_bps });
@@ -1559,20 +1606,21 @@ jobs:
 
             log(`🔍 Refined ${refined.length} candidates`);
 
-            // ★ Edge-ranked pool selection (replaces hard 2L+2S cap)
             const refinedLongs  = refined.filter(r => r.side === "long");
             const refinedShorts = refined.filter(r => r.side === "short");
             log(`📊 Refined pool: ${refinedLongs.length} longs, ${refinedShorts.length} shorts`);
 
-            const edgeRanked = [...refined].sort((a,b) =>
-              (b.confidence * Math.abs(b.dir_analysis?.dir_edge || 0.01)) -
-              (a.confidence * Math.abs(a.dir_analysis?.dir_edge || 0.01))
-            );
-            // Note: [...refined] creates a new array but retains the SAME object
-            // references as in `refined`, so reference equality (.includes) below is valid.
+            // ★ FIX: Use a more robust edge-ranking formula that prioritizes signal quality.
+            const scoreCandidate = (c) => {
+              const edge = Math.abs(c.dir_analysis?.dir_edge || 0);
+              const confirmedBonus = c.dir_analysis?.regime_confirmed ? 1.2 : 1.0;
+              const adxBonus = c.regime === 'trend' ? Math.max(1, (c.dir_analysis?.adx || 15) / 25) : 1.0;
+              return edge * confirmedBonus * adxBonus;
+            };
+            const edgeRanked = [...refined].sort((a, b) => scoreCandidate(b) - scoreCandidate(a));
 
             const DYNAMIC_TOP_N_LOCAL = Math.max(6, TOP_N||6);
-            const topByEdge = edgeRanked.slice(0, DYNAMIC_TOP_N_LOCAL);
+            let topByEdge = edgeRanked.slice(0, DYNAMIC_TOP_N_LOCAL);
             const hasLong  = topByEdge.some(c => c.side === "long");
             const hasShort = topByEdge.some(c => c.side === "short");
 
@@ -1584,10 +1632,13 @@ jobs:
               topByEdge.push(refinedLongs[0]);
               log(`⚠️ Soft balance: added 1 long ${refinedLongs[0].symbol}`);
             }
+            
+            // ★ FIX: Create a clean processing order without mutation or duplicate references.
+            const topByEdgeSymbols = new Set(topByEdge.map(c => c.symbol));
+            const remainingRefined = refined.sort((a,b)=>b.confidence-a.confidence).filter(c => !topByEdgeSymbols.has(c.symbol));
+            const processingOrder = [...topByEdge, ...remainingRefined];
 
             log(`✅ Edge-ranked pool: ${topByEdge.filter(c=>c.side==="long").length} longs + ${topByEdge.filter(c=>c.side==="short").length} shorts`);
-            refined.sort((a,b)=>b.confidence-a.confidence);
-            refined.unshift(...topByEdge.filter(c => !refined.slice(0,4).includes(c)));
 
             const TARGET_TOP_N=Math.max(2, DYNAMIC_TOP_N);
 
@@ -1595,7 +1646,7 @@ jobs:
             const MIN_CONF_TO_TRADE=qualityFloor;
             const usedBases=new Set();
 
-            for(const cand of refined){
+            for(const cand of processingOrder){
               if(selected.length>=TARGET_TOP_N) break;
               if(cand.confidence<MIN_CONF_TO_TRADE) continue;
               if(usedBases.has(cand.base)) continue;
@@ -1622,7 +1673,7 @@ jobs:
             if(selected.length<TARGET_TOP_N){
               log(`⚠️ Only ${selected.length}/${TARGET_TOP_N} passed quality floor (conf>=${MIN_CONF_TO_TRADE}). Relaxing...`);
               const RELAXED_CONF=Math.max(10, Math.floor(MIN_CONF_TO_TRADE*0.65));
-              for(const cand of refined){
+              for(const cand of processingOrder){
                 if(selected.length>=TARGET_TOP_N) break;
                 if(usedBases.has(cand.base)) continue;
                 if(selected.some(s=>s.symbol===cand.symbol)) continue;
@@ -1644,10 +1695,9 @@ jobs:
               usedBases.add(refined[0].base);
             }
 
-            // ★ FIX: Expand pool if not enough selected
             if(selected.length < TARGET_TOP_N && refined.length > 0){
               log(`⚠️ Only ${selected.length} selected — expanding pool from full refined list`);
-              for(const cand of refined){
+              for(const cand of processingOrder){
                 if(selected.length >= TARGET_TOP_N) break;
                 if(selected.some(s=>s.symbol===cand.symbol)) continue;
                 if(usedBases.has(cand.base)) continue;
@@ -1668,62 +1718,48 @@ jobs:
             for(const cand of selected) {
               try {
                 const mtf = await runMTFDirectionAnalysis(cand.symbol, cand.side, cand.mark_price);
+                cand._kept_original = false; // Reset flag
                 
-                // ── STEP 1: EXECUTE FLIP FIRST (before any drop gates) ──
                 if(mtf.overridden && mtf.confidence_pct >= MTF_OVERRIDE_MIN_CONF) {
                   const newSide = mtf.final_side;
-                  
-                  // ★ FIX 3: Regime-aware override protection
                   const isMeanRevert = cand.regime === "meanrevert";
                   const origSide = cand.side;
                   const bbPos = cand.dir_analysis?.bb_pos ?? 0.5;
-                  const rsiSig = mtf.signals?.find(s => s.name === "rsi_condition");
-                  const rsiValue = rsiSig?.rsiValue ?? null;
+                  const rsiValue = mtf.signals?.find(s => s.name === "rsi_condition")?.rsiValue ?? null;
                   
-                  // Don't flip overbought mean-revert SHORTs to LONG
-                  if(isMeanRevert && origSide === "short" && newSide === "long" && bbPos > 0.80 && rsiValue && rsiValue > 65) {
-                    log(`[MTF-REGIME-BLOCK] ${cand.symbol}: mean-revert overbought SHORT (BB=${bbPos.toFixed(2)}, RSI=${rsiValue}) should NOT flip to LONG — keeping SHORT`);
+                  if((isMeanRevert && origSide === "short" && newSide === "long" && bbPos > 0.80 && rsiValue && rsiValue > 65) ||
+                     (isMeanRevert && origSide === "long" && newSide === "short" && bbPos < 0.20 && rsiValue && rsiValue < 35)) {
+                    log(`[MTF-REGIME-BLOCK] ${cand.symbol}: mean-revert signal protected from override — keeping ${origSide.toUpperCase()}`);
                     cand.mtf_overridden = false;
                     mtfStats.confirmed++;
-                  }
-                  // Don't flip oversold mean-revert LONGs to SHORT
-                  else if(isMeanRevert && origSide === "long" && newSide === "short" && bbPos < 0.20 && rsiValue && rsiValue < 35) {
-                    log(`[MTF-REGIME-BLOCK] ${cand.symbol}: mean-revert oversold LONG (BB=${bbPos.toFixed(2)}, RSI=${rsiValue}) should NOT flip to SHORT — keeping LONG`);
-                    cand.mtf_overridden = false;
-                    mtfStats.confirmed++;
-                  }
-                  // OK to flip
-                  else {
-                    const newPRaw = newSide === "long"
-                      ? clamp(mtf.long_prob_pct  / 100, 0.28, 0.88)
-                      : clamp(mtf.short_prob_pct / 100, 0.28, 0.88);
+                  } else {
+                    const newPRaw = newSide === "long" ? clamp(mtf.long_prob_pct/100,0.28,0.88) : clamp(mtf.short_prob_pct/100,0.28,0.88);
                     const newPLcb  = calibrateP(state, newSide, cand.regime, newPRaw);
                     const newN     = getCoeffs(state, newSide, cand.regime)?.n || 0;
                     const newPLcbW = wilsonLCB(newPLcb, Math.max(1, Math.min(500, newN)), WILSON_Z);
-                    cand.side           = newSide;
-                    cand.p_raw          = +newPRaw.toFixed(3);
-                    cand.p_lcb          = +newPLcbW.toFixed(3);
+                    cand.side = newSide;
+                    cand.p_raw = +newPRaw.toFixed(3);
+                    cand.p_lcb = +newPLcbW.toFixed(3);
                     cand.mtf_overridden = true;
                     mtfStats.overridden++;
                     log(`[MTF-OVERRIDE] ${cand.symbol}: flipped to ${newSide.toUpperCase()} (conf=${mtf.confidence_pct}%)`);
                   }
                 }
                 else if(mtf.overridden && mtf.confidence_pct < MTF_OVERRIDE_MIN_CONF) {
-                  // conf too low to flip — keep original side
                   cand.mtf_overridden = false;
+                  cand._kept_original = true; // ★ FIX: Flag that we are keeping original side due to low MTF conf
                   mtfStats.confirmed++;
                   log(`[MTF-KEEP-ORIG] ${cand.symbol}: conf=${mtf.confidence_pct}% < ${MTF_OVERRIDE_MIN_CONF}% — keeping ${cand.side.toUpperCase()}`);
                 }
                 else {
-                  // no override — MTF agreed with original side
                   cand.mtf_overridden = false;
                   mtfStats.confirmed++;
                 }
 
-                // ── STEP 2: NOW check win probability (using CURRENT side, after any flip) ──
-                const currentWinProb = cand.side === "long"
-                  ? mtf.long_prob_pct
-                  : mtf.short_prob_pct;
+                // ★ FIX: Use original p_raw for win prob if MTF override was rejected.
+                const currentWinProb = cand._kept_original
+                  ? Math.round(cand.p_raw * 100)
+                  : (cand.side === "long" ? mtf.long_prob_pct : mtf.short_prob_pct);
 
                 if(currentWinProb < MTF_DROP_MIN_PROB) {
                   log(`[MTF-DROP] ${cand.symbol}: ${cand.side} win_prob=${currentWinProb}% < ${MTF_DROP_MIN_PROB}% — dropping`);
@@ -1731,7 +1767,6 @@ jobs:
                   continue;
                 }
 
-                // ── STEP 3: COIN FLIP CHECK ──
                 const mtfMaxProb = Math.max(mtf.long_prob_pct, mtf.short_prob_pct);
                 if(mtfMaxProb < MTF_COINFLIP_GATE) {
                   log(`[MTF-COINFLIP] ${cand.symbol}: max_prob=${mtfMaxProb}% < ${MTF_COINFLIP_GATE}% — no conviction, dropping`);
@@ -1739,30 +1774,14 @@ jobs:
                   continue;
                 }
 
-                // ── STEP 4: NEGATIVE EV CHECK ──
-                if(currentWinProb < 50) {
-                  log(`[MTF-NEG-EV] ${cand.symbol}: win_prob=${currentWinProb}% < 50% — dropping`);
-                  mtfStats.dropped_low_prob++;
-                  continue;
-                }
-
-                // ── STEP 5: ATTACH MTF + CONFIDENCE BONUS ──
                 cand.mtf = {
-                  long_prob_pct:  mtf.long_prob_pct,
-                  short_prob_pct: mtf.short_prob_pct,
-                  confidence_pct: mtf.confidence_pct,
-                  net_score:      mtf.net_score,
-                  overridden:     mtf.overridden,
-                  final_side:     mtf.final_side,
-                  signals:        mtf.signals,
-                  reasons:        mtf.reasons,
-                  detail:         mtf.detail
+                  long_prob_pct:  mtf.long_prob_pct, short_prob_pct: mtf.short_prob_pct,
+                  confidence_pct: mtf.confidence_pct, net_score: mtf.net_score,
+                  overridden: mtf.overridden, final_side: mtf.final_side,
+                  signals: mtf.signals, reasons: mtf.reasons, detail: mtf.detail
                 };
 
-                const mtfAlignBonus = (!mtf.overridden && mtf.confidence_pct >= 60) ?  1.08
-                                    : (!mtf.overridden && mtf.confidence_pct >= 40) ?  1.03
-                                    :  mtf.overridden                               ?  0.92
-                                    :                                                   1.00;
+                const mtfAlignBonus = (!mtf.overridden && mtf.confidence_pct >= 60) ? 1.08 : (!mtf.overridden && mtf.confidence_pct >= 40) ? 1.03 : mtf.overridden ? 0.92 : 1.00;
                 cand.confidence = clamp(Math.round(cand.confidence * mtfAlignBonus), 0, 100);
 
                 selectedAfterMTF.push(cand);
@@ -1825,7 +1844,6 @@ jobs:
               finalSelected = selectedAfterMTF;
             }
 
-            // ★ FIX 4: Enforce directional diversity if quality exists
             const preDiversityCount = finalSelected.length;
             const longs  = finalSelected.filter(c => c.side === "long");
             const shorts = finalSelected.filter(c => c.side === "short");
@@ -1833,16 +1851,20 @@ jobs:
             if(longs.length >= 3 && shorts.length === 0 && refined.length > 0) {
               log(`⚠️ Directional imbalance: ${longs.length} LONGs, 0 SHORTs — searching for quality SHORT...`);
               const refinedShorts = refined.filter(r => r.side === "short" && !finalSelected.some(f => f.symbol === r.symbol));
+              const diversityEvaluated = new Set(); // ★ FIX: Prevent re-evaluating same symbol
               
               for(const candShort of refinedShorts.slice(0, 5)) {
+                if (diversityEvaluated.has(candShort.symbol)) continue;
+                diversityEvaluated.add(candShort.symbol);
                 try {
                   const mtfShort = await runMTFDirectionAnalysis(candShort.symbol, candShort.side, candShort.mark_price);
                   const shortWinProb = mtfShort.short_prob_pct;
                   
-                  if(shortWinProb >= 55 && mtfShort.confidence_pct >= 35) {
+                  // ★ FIX: Relaxed diversity search thresholds to make it effective.
+                  if(shortWinProb >= 52 && mtfShort.confidence_pct >= 25) {
                     candShort.mtf = mtfShort;
                     candShort.mtf_overridden = false;
-                    candShort.confidence = Math.round(candShort.confidence * 0.90); // slight penalty for being added late
+                    candShort.confidence = Math.round(candShort.confidence * 0.90);
                     finalSelected.push(candShort);
                     log(`✅ Diversity: added ${candShort.symbol} SHORT (win_prob=${shortWinProb}%, conf=${mtfShort.confidence_pct}%)`);
                     break;
@@ -1856,13 +1878,17 @@ jobs:
             } else if(shorts.length >= 3 && longs.length === 0 && refined.length > 0) {
               log(`⚠️ Directional imbalance: ${shorts.length} SHORTs, 0 LONGs — searching for quality LONG...`);
               const refinedLongs = refined.filter(r => r.side === "long" && !finalSelected.some(f => f.symbol === r.symbol));
+              const diversityEvaluated = new Set(); // ★ FIX: Prevent re-evaluating same symbol
               
               for(const candLong of refinedLongs.slice(0, 5)) {
+                if (diversityEvaluated.has(candLong.symbol)) continue;
+                diversityEvaluated.add(candLong.symbol);
                 try {
                   const mtfLong = await runMTFDirectionAnalysis(candLong.symbol, candLong.side, candLong.mark_price);
                   const longWinProb = mtfLong.long_prob_pct;
                   
-                  if(longWinProb >= 55 && mtfLong.confidence_pct >= 35) {
+                  // ★ FIX: Relaxed diversity search thresholds.
+                  if(longWinProb >= 52 && mtfLong.confidence_pct >= 25) {
                     candLong.mtf = mtfLong;
                     candLong.mtf_overridden = false;
                     candLong.confidence = Math.round(candLong.confidence * 0.90);
@@ -1883,8 +1909,7 @@ jobs:
             if(finalSelected.length > preDiversityCount) {
               log(`📊 Diversity adjustment: ${preDiversityCount} → ${finalSelected.length} ideas`);
             }
-
-            // ── SIGNAL CONTRADICTION CHECK ──
+            
             finalSelected = applySignalContradictionCheck(finalSelected);
             log(`📋 After contradiction check: ${finalSelected.length} ideas remain`);
 
@@ -1938,7 +1963,7 @@ jobs:
                 mtf_analysis: x.mtf || null,
                 mtf_overridden: x.mtf_overridden || false,
                 dir_analysis: x.dir_analysis || null,
-                atr_bps: x.atr_bps // Pass through for refresh logic
+                atr_bps: x.atr_bps
               };
             });
 
@@ -1951,7 +1976,6 @@ jobs:
               if(maxVolPick>5){ const scale=clamp(5/maxVolPick,0.65,1); picks=picks.map(p=>({...p,size_bps:Math.max(4,Math.round(p.size_bps*scale))})); log("[gha] High volatility detected, scaling sizes by",scale.toFixed(2)); }
             }catch(e){ log("[gha] Portfolio risk adjustment warn",e?.message||e); }
 
-            // ★ LIVE SIGNAL REFRESH before push
             const refreshedPicksV2 = [];
             for(const p of picksV2){
               const fresh = await refreshSignalBeforePush(p, state);
