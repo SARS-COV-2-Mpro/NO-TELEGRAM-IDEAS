@@ -2214,9 +2214,8 @@ jobs:
             finalSelected = applySignalContradictionCheck(finalSelected);
             log(`📋 After contradiction check: ${finalSelected.length} ideas remain`);
 
-            const flipped=HEDGE?finalSelected.map(orig=>({ ...orig, side:orig.side==="long"?"short":"long", flipped:true, original_idea_id:orig.symbol+"_"+orig.side })):[];
-            const selectedWithFlipped=[...finalSelected,...flipped];
-            log(`📦 Ideas: ${finalSelected.length} original + ${flipped.length} flipped = ${selectedWithFlipped.length} total`);
+            const selectedWithFlipped=finalSelected; log(`📦 Ideas: ${finalSelected.length} original (HEDGE flip, if enabled, applied after TOP_NNN cut)`);
+
 
             const wEv=softmax(selectedWithFlipped.map(x=>x.exp_lcb_bps),20);
 
@@ -2364,12 +2363,8 @@ jobs:
                 log(`✅ TOP_NNN: pushing ${cut.length}/${picks.length} ideas`);
               }
 
-              const keptIds = new Set(cut.map(s => s.p.idea_id));
-              picks   = picks.filter(p   => keptIds.has(p.idea_id));
-              picksV2 = picksV2.filter(p => keptIds.has(p.idea_id));
-            }
+              const keptIds = new Set(cut.map(s => s.p.idea_id));               picks   = picks.filter(p   => keptIds.has(p.idea_id));               picksV2 = picksV2.filter(p => keptIds.has(p.idea_id));             }              if(HEDGE && picksV2.length>0){               const flippedV2 = picksV2.map(orig=>{                 const mid=orig.entry_mid;                 const newSide=orig.side==="long"?"short":"long";                 let entry_limit=null, tp_abs=null, sl_abs=null;                 if(mid!=null){                   const slF=orig.sl_bps/10000, tpF=orig.tp_bps/10000;                   const entryOffset=Math.max(0.0005, slF*0.15);                   if(newSide==="long"){                     entry_limit=mid*(1-entryOffset);                     tp_abs=entry_limit*(1+tpF);                     sl_abs=entry_limit*(1-slF);                   } else {                     entry_limit=mid*(1+entryOffset);                     tp_abs=entry_limit*(1-tpF);                     sl_abs=entry_limit*(1+slF);                   }                 }                 return {                   ...orig,                   idea_id:uuidv4(),                   client_order_id:mkClientOrderId("byh"),                   side:newSide,                   entry_limit, tp_abs, sl_abs,                   predicted:{ ...orig.predicted, flipped:true },                 };               });               picksV2=[...picksV2, ...flippedV2];               picks=[...picks, ...flippedV2.map(toV1Compat)];               log(`🔀 HEDGE: appended ${flippedV2.length} flipped pairs after TOP_NNN cut → total ${picks.length} ideas`);             }              const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta, top_n:picks.length||0, ideas:picks||[] };
 
-            const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta, top_n:picks.length||0, ideas:picks||[] };
             log(`pushing ${picks.length} ideas (${selectionTier}) to ${PUSH_URL}`);
             try{ const r=await fetchWithTimeout(PUSH_URL,{ method:"POST", headers:{ "Content-Type":"application/json","Authorization":"Bearer "+PUSH_TOKEN }, body:JSON.stringify(payload) },15000); let txt=""; try{ txt=await r.text(); }catch{} log("push status",r?.status||"ERR",(txt||"").slice(0,400)); }catch(e){ log("push failed",e?.message||e); }
 
