@@ -1199,7 +1199,7 @@ jobs:
                 cand.entry_mid   = freshPrice;
                 cand.entry_limit = freshPrice * (1 + entryOffset);
                 cand.tp_abs      = cand.entry_limit * (1 - tpF);
-                sl_abs      = cand.entry_limit * (1 + slF);
+                cand.sl_abs = cand.entry_limit * (1 + slF);
               }
 
               log(`[SIGNAL-FRESH] ${cand.symbol_full} ${originalPrice.toFixed(6)} → ${freshPrice.toFixed(6)} drift=${(priceDrift*100).toFixed(3)}%`);
@@ -1630,7 +1630,7 @@ jobs:
             
             // ★ FIX: Create a clean processing order without mutation or duplicate references.
             const topByEdgeSymbols = new Set(topByEdge.map(c => c.symbol));
-            const remainingRefined = refined.sort((a,b)=>b.confidence-a.confidence).filter(c => !topByEdgeSymbols.has(c.symbol));
+            const remainingRefined = [...refined].sort((a,b)=>b.confidence-a.confidence).filter(c => !topByEdgeSymbols.has(c.symbol));
             const processingOrder = [...topByEdge, ...remainingRefined];
 
             log(`✅ Edge-ranked pool: ${topByEdge.filter(c=>c.side==="long").length} longs + ${topByEdge.filter(c=>c.side==="short").length} shorts`);
