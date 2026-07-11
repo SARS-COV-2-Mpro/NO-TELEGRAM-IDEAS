@@ -436,13 +436,13 @@ jobs:
           const MR_LOCKOUT_SEC=Number(process.env.MR_LOCKOUT_SEC||"1800");
           const MAX_COST_BPS_HARD=Number(process.env.MAX_COST_BPS_HARD||"15");
           // ★ CHANGE: Raised MIN_VOL_1H_USD default
-          const MIN_VOL_1H_USD=Number(process.env.MIN_VOL_1H_USD||"5000000");
+          const MIN_VOL_1H_USD=Number(process.env.MIN_VOL_1H_USD||"3000000");
           const DEPTH_1P_MIN_USD=Number(process.env.DEPTH_1P_MIN_USD||"12000");
           const LONG_EDGE_MULT_MIN=Number(process.env.LONG_EDGE_MULT_MIN||"2.5");
           const LONG_BOUNCE_SL_ATR=Number(process.env.LONG_BOUNCE_SL_ATR||"0.55");
           const LONG_BOUNCE_TP_ATR=Number(process.env.LONG_BOUNCE_TP_ATR||"1.80");
           // ★ CHANGE: Raised ATR_MIN_PCT default
-          const ATR_MIN_PCT=Number(process.env.ATR_MIN_PCT||"0.60");
+          const ATR_MIN_PCT=Number(process.env.ATR_MIN_PCT||"0.45");
 
           const IDEAL_VOL_1H_PCT=2.0;
           const IDEAL_FUNDING_RATE=0.0004;
@@ -1282,7 +1282,7 @@ jobs:
 
             // ★ CHANGE: Raised qualityFloor to have a hard minimum of 30
             const cooldownCount=Object.keys(state.cooldown||{}).length;
-            const qualityFloor=Math.max(30, cooldownCount>=12?25:cooldownCount>=8?22:20);
+            const qualityFloor=Math.max(30, cooldownCount>=12?25:cooldownCount>=8?20:18);
             log(`♻️  Fresh cycle: ${cooldownCount} cooldowns, ${(state.closed||[]).length} closed trades, ${Object.keys(state.calibCoeffs||{}).length} calib models → min_conf=${qualityFloor}`);
 
             const calibHealth=validateCalibration(state);
@@ -1583,7 +1583,7 @@ jobs:
                 const rrr=+(tp/Math.max(1,sl)).toFixed(2);
 
                 // ★ CHANGE: Added hard negative-EV gate
-                const MIN_EV_BPS = 8;
+                const MIN_EV_BPS = 5;
                 if(evLCB < MIN_EV_BPS) {
                   log(`[EV-GATE] ${cand.symbol} skipped: evLCB=${evLCB}bps < ${MIN_EV_BPS}bps — no mathematical edge`);
                   continue;
@@ -1599,7 +1599,7 @@ jobs:
 
                 const dirClarityMult=clamp(0.7+Math.abs(dirEdge)*2, 0.7, 1.3);
                 // ★ CHANGE: Stricter regime confirmation multiplier
-                const regimeStable=v5Result&&v5Result.confirmed?1.12:0.72;
+                const regimeStable=v5Result&&v5Result.confirmed?1.12:0.82;
                 const volExpMult=regime==="trend"?clamp(0.85+volExp*0.15,0.85,1.15):1.0;
                 const evMult=clamp(0.5+evLCB/40, 0.4, 1.3);
                 const obiAligned=(forcedSide==="long"&&obi>0.15)||(forcedSide==="short"&&obi<-0.15);
