@@ -1086,7 +1086,6 @@ jobs:
               cand.contradiction_reasons=strikeReasons;
 
               // DECISION
-              
               if(strikes>=3){
                 log(`[CONTRA-DROP] ${cand.symbol} ${cand.side.toUpperCase()} strikes=${strikes} [${strikeReasons.join(", ")}] — dropped`);
                 continue;
@@ -1331,8 +1330,23 @@ jobs:
                 const slipL=sideSlipL?.slip_bps??Math.round(spreadBps/2);
                 const slipS=sideSlipS?.slip_bps??Math.round(spreadBps/2);
                 const costLong=COST_BPS+slipL, costShort=COST_BPS+slipS;
-                const d1=depthWithinPctUSD(depth,mid,0.01);                 const depth1pUSD=(d1.asksUSD||0)+(d1.bidsUSD||0);                  // ★ LIQUIDITY REALITY CHECK (depth vs actual volume)                 const vol24hUSD = cand.turnover_24h || 0;                 const depthToVolumeRatio = vol24hUSD > 0 ? depth1pUSD / vol24hUSD : 0;                 if(vol24hUSD > 0 && depthToVolumeRatio > 50) {                   log(`[LIQ-PHANTOM] ${cand.symbol} SKIP: depth=$${Math.round(depth1pUSD)} but 24h_vol=$${Math.round(vol24hUSD)} (ratio=${depthToVolumeRatio.toFixed(1)}x) — phantom liquidity`);                   continue;                 }                 if(vol24hUSD > 0 && vol24hUSD < NOTIONAL * 100) {                   log(`[LIQ-MICRO] ${cand.symbol} SKIP: 24h_vol=$${Math.round(vol24hUSD)} << ${NOTIONAL * 100} minimum`);                   continue;                 }                  // ★ CRASH/PUMP GATE                 const change24h = cand.price_change_24h || 0;
-                
+                const d1=depthWithinPctUSD(depth,mid,0.01);
+                const depth1pUSD=(d1.asksUSD||0)+(d1.bidsUSD||0);
+
+                // ★ FIX 1: LIQUIDITY REALITY CHECK (depth vs actual volume)
+                const vol24hUSD = cand.turnover_24h || 0;
+                const depthToVolumeRatio = vol24hUSD > 0 ? depth1pUSD / vol24hUSD : 0;
+                if(vol24hUSD > 0 && depthToVolumeRatio > 50) {
+                  log(`[LIQ-PHANTOM] ${cand.symbol} SKIP: depth=$${Math.round(depth1pUSD)} but 24h_vol=$${Math.round(vol24hUSD)} (ratio=${depthToVolumeRatio.toFixed(1)}x) — phantom liquidity`);
+                  continue;
+                }
+                if(vol24hUSD > 0 && vol24hUSD < NOTIONAL * 100) {
+                  log(`[LIQ-MICRO] ${cand.symbol} SKIP: 24h_vol=$${Math.round(vol24hUSD)} << ${NOTIONAL * 100} minimum`);
+                  continue;
+                }
+
+                // ★ CRASH/PUMP GATE
+                const change24h = cand.price_change_24h || 0;
                 if(change24h < -0.15) {
                   log(`[CRASH-GATE] ${cand.symbol} HARD SKIP: ${(change24h*100).toFixed(1)}% today — possible exploit/dump`);
                   continue;
@@ -1433,11 +1447,12 @@ jobs:
                 
                 if(Math.abs(change24h) > 0.30 && forcedSide === "short") {   log(`[DAILY-RANGE-GATE] ${cand.symbol} SKIP: shorting coin with ${(change24h*100).toFixed(1)}% daily range`);   continue; }
                 
-                // ★ FIX: Parabolic extension gate (using 24h as proxy)
+                // ★ FIX 5: Parabolic extension gate (using 24h as proxy)
                 if(change24h > 0.15 && forcedSide === "long") {
                   log(`[PARABOLIC-WARN] ${cand.symbol}: +${(change24h*100).toFixed(1)}% today — late-stage FOMO risk`);
                   liquidityPenalty *= 0.50; // heavy penalty for buying into parabolic moves
-                } log(`[DIR] ${cand.symbol} regime=${regime} edge=${dirEdge.toFixed(3)} BB=${bbPos.toFixed(2)} ADX=${adxValue.toFixed(0)} → ${forcedSide.toUpperCase()}`);
+                }
+                log(`[DIR] ${cand.symbol} regime=${regime} edge=${dirEdge.toFixed(3)} BB=${bbPos.toFixed(2)} ADX=${adxValue.toFixed(0)} → ${forcedSide.toUpperCase()}`);
                 for(const r of dirResult.reasons.slice(0,3)) log(`  └─ ${r}`);
 
                 const shortingRocket = forcedSide === "short"
@@ -1658,7 +1673,7 @@ jobs:
                 if(mtf.overridden && mtf.confidence_pct >= MTF_OVERRIDE_MIN_CONF) {
                   const newSide = mtf.final_side;
                   
-                  // ★ FIX: Regime-aware override protection
+                  // ★ FIX 3: Regime-aware override protection
                   const isMeanRevert = cand.regime === "meanrevert";
                   const origSide = cand.side;
                   const bbPos = cand.dir_analysis?.bb_pos ?? 0.5;
@@ -1810,7 +1825,7 @@ jobs:
               finalSelected = selectedAfterMTF;
             }
 
-            // ★ FIX: Enforce directional diversity if quality exists
+            // ★ FIX 4: Enforce directional diversity if quality exists
             const preDiversityCount = finalSelected.length;
             const longs  = finalSelected.filter(c => c.side === "long");
             const shorts = finalSelected.filter(c => c.side === "short");
