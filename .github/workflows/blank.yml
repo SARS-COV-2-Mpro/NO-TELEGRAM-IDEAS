@@ -1086,11 +1086,19 @@ jobs:
               cand.contradiction_reasons=strikeReasons;
 
               // DECISION
+              
               if(strikes>=3){
                 log(`[CONTRA-DROP] ${cand.symbol} ${cand.side.toUpperCase()} strikes=${strikes} [${strikeReasons.join(", ")}] — dropped`);
                 continue;
               }
               if(strikes===2){
+                // ★ FIX: If 2 strikes include BOTH volume_against AND win_prob_low → hard drop
+                const hasVolumeContra = strikeReasons.some(r => r.includes("volume_against"));
+                const hasLowWinProb = strikeReasons.some(r => r.includes("win_prob_low"));
+                if(hasVolumeContra && hasLowWinProb) {
+                  log(`[CONTRA-DROP] ${cand.symbol} strikes=2 WITH volume+winprob conflict [${strikeReasons.join(", ")}] — hard drop`);
+                  continue;
+                }
                 const before=cand.confidence;
                 cand.confidence=Math.round(cand.confidence*0.65);
                 log(`[CONTRA-WARN2] ${cand.symbol} strikes=2 [${strikeReasons.join(", ")}] confidence ${before}→${cand.confidence}`);
@@ -1323,11 +1331,8 @@ jobs:
                 const slipL=sideSlipL?.slip_bps??Math.round(spreadBps/2);
                 const slipS=sideSlipS?.slip_bps??Math.round(spreadBps/2);
                 const costLong=COST_BPS+slipL, costShort=COST_BPS+slipS;
-                const d1=depthWithinPctUSD(depth,mid,0.01);
-                const depth1pUSD=(d1.asksUSD||0)+(d1.bidsUSD||0);
-
-                // ★ CRASH/PUMP GATE
-                const change24h = cand.price_change_24h || 0;
+                const d1=depthWithinPctUSD(depth,mid,0.01);                 const depth1pUSD=(d1.asksUSD||0)+(d1.bidsUSD||0);                  // ★ LIQUIDITY REALITY CHECK (depth vs actual volume)                 const vol24hUSD = cand.turnover_24h || 0;                 const depthToVolumeRatio = vol24hUSD > 0 ? depth1pUSD / vol24hUSD : 0;                 if(vol24hUSD > 0 && depthToVolumeRatio > 50) {                   log(`[LIQ-PHANTOM] ${cand.symbol} SKIP: depth=$${Math.round(depth1pUSD)} but 24h_vol=$${Math.round(vol24hUSD)} (ratio=${depthToVolumeRatio.toFixed(1)}x) — phantom liquidity`);                   continue;                 }                 if(vol24hUSD > 0 && vol24hUSD < NOTIONAL * 100) {                   log(`[LIQ-MICRO] ${cand.symbol} SKIP: 24h_vol=$${Math.round(vol24hUSD)} << ${NOTIONAL * 100} minimum`);                   continue;                 }                  // ★ CRASH/PUMP GATE                 const change24h = cand.price_change_24h || 0;
+                
                 if(change24h < -0.15) {
                   log(`[CRASH-GATE] ${cand.symbol} HARD SKIP: ${(change24h*100).toFixed(1)}% today — possible exploit/dump`);
                   continue;
@@ -1426,7 +1431,13 @@ jobs:
                 }
                 if(change24h > 0.10 && forcedSide === "short") {   log(`[DAILY-PUMP] ${cand.symbol} SKIP: shorting a coin up +${(change24h*100).toFixed(1)}% today`);   continue; }
                 
-                if(Math.abs(change24h) > 0.30 && forcedSide === "short") {   log(`[DAILY-RANGE-GATE] ${cand.symbol} SKIP: shorting coin with ${(change24h*100).toFixed(1)}% daily range`);   continue; } log(`[DIR] ${cand.symbol} regime=${regime} edge=${dirEdge.toFixed(3)} BB=${bbPos.toFixed(2)} ADX=${adxValue.toFixed(0)} → ${forcedSide.toUpperCase()}`);
+                if(Math.abs(change24h) > 0.30 && forcedSide === "short") {   log(`[DAILY-RANGE-GATE] ${cand.symbol} SKIP: shorting coin with ${(change24h*100).toFixed(1)}% daily range`);   continue; }
+                
+                // ★ FIX: Parabolic extension gate (using 24h as proxy)
+                if(change24h > 0.15 && forcedSide === "long") {
+                  log(`[PARABOLIC-WARN] ${cand.symbol}: +${(change24h*100).toFixed(1)}% today — late-stage FOMO risk`);
+                  liquidityPenalty *= 0.50; // heavy penalty for buying into parabolic moves
+                } log(`[DIR] ${cand.symbol} regime=${regime} edge=${dirEdge.toFixed(3)} BB=${bbPos.toFixed(2)} ADX=${adxValue.toFixed(0)} → ${forcedSide.toUpperCase()}`);
                 for(const r of dirResult.reasons.slice(0,3)) log(`  └─ ${r}`);
 
                 const shortingRocket = forcedSide === "short"
@@ -1646,18 +1657,41 @@ jobs:
                 // ── STEP 1: EXECUTE FLIP FIRST (before any drop gates) ──
                 if(mtf.overridden && mtf.confidence_pct >= MTF_OVERRIDE_MIN_CONF) {
                   const newSide = mtf.final_side;
-                  const newPRaw = newSide === "long"
-                    ? clamp(mtf.long_prob_pct  / 100, 0.28, 0.88)
-                    : clamp(mtf.short_prob_pct / 100, 0.28, 0.88);
-                  const newPLcb  = calibrateP(state, newSide, cand.regime, newPRaw);
-                  const newN     = getCoeffs(state, newSide, cand.regime)?.n || 0;
-                  const newPLcbW = wilsonLCB(newPLcb, Math.max(1, Math.min(500, newN)), WILSON_Z);
-                  cand.side           = newSide;
-                  cand.p_raw          = +newPRaw.toFixed(3);
-                  cand.p_lcb          = +newPLcbW.toFixed(3);
-                  cand.mtf_overridden = true;
-                  mtfStats.overridden++;
-                  log(`[MTF-OVERRIDE] ${cand.symbol}: flipped to ${newSide.toUpperCase()} (conf=${mtf.confidence_pct}%)`);
+                  
+                  // ★ FIX: Regime-aware override protection
+                  const isMeanRevert = cand.regime === "meanrevert";
+                  const origSide = cand.side;
+                  const bbPos = cand.dir_analysis?.bb_pos ?? 0.5;
+                  const rsiSig = mtf.signals?.find(s => s.name === "rsi_condition");
+                  const rsiValue = rsiSig?.rsiValue ?? null;
+                  
+                  // Don't flip overbought mean-revert SHORTs to LONG
+                  if(isMeanRevert && origSide === "short" && newSide === "long" && bbPos > 0.80 && rsiValue && rsiValue > 65) {
+                    log(`[MTF-REGIME-BLOCK] ${cand.symbol}: mean-revert overbought SHORT (BB=${bbPos.toFixed(2)}, RSI=${rsiValue}) should NOT flip to LONG — keeping SHORT`);
+                    cand.mtf_overridden = false;
+                    mtfStats.confirmed++;
+                  }
+                  // Don't flip oversold mean-revert LONGs to SHORT
+                  else if(isMeanRevert && origSide === "long" && newSide === "short" && bbPos < 0.20 && rsiValue && rsiValue < 35) {
+                    log(`[MTF-REGIME-BLOCK] ${cand.symbol}: mean-revert oversold LONG (BB=${bbPos.toFixed(2)}, RSI=${rsiValue}) should NOT flip to SHORT — keeping LONG`);
+                    cand.mtf_overridden = false;
+                    mtfStats.confirmed++;
+                  }
+                  // OK to flip
+                  else {
+                    const newPRaw = newSide === "long"
+                      ? clamp(mtf.long_prob_pct  / 100, 0.28, 0.88)
+                      : clamp(mtf.short_prob_pct / 100, 0.28, 0.88);
+                    const newPLcb  = calibrateP(state, newSide, cand.regime, newPRaw);
+                    const newN     = getCoeffs(state, newSide, cand.regime)?.n || 0;
+                    const newPLcbW = wilsonLCB(newPLcb, Math.max(1, Math.min(500, newN)), WILSON_Z);
+                    cand.side           = newSide;
+                    cand.p_raw          = +newPRaw.toFixed(3);
+                    cand.p_lcb          = +newPLcbW.toFixed(3);
+                    cand.mtf_overridden = true;
+                    mtfStats.overridden++;
+                    log(`[MTF-OVERRIDE] ${cand.symbol}: flipped to ${newSide.toUpperCase()} (conf=${mtf.confidence_pct}%)`);
+                  }
                 }
                 else if(mtf.overridden && mtf.confidence_pct < MTF_OVERRIDE_MIN_CONF) {
                   // conf too low to flip — keep original side
@@ -1774,6 +1808,65 @@ jobs:
                 log("🚫 No valid trades found even after rescue scan. Market is truly dead.");
               }
               finalSelected = selectedAfterMTF;
+            }
+
+            // ★ FIX: Enforce directional diversity if quality exists
+            const preDiversityCount = finalSelected.length;
+            const longs  = finalSelected.filter(c => c.side === "long");
+            const shorts = finalSelected.filter(c => c.side === "short");
+            
+            if(longs.length >= 3 && shorts.length === 0 && refined.length > 0) {
+              log(`⚠️ Directional imbalance: ${longs.length} LONGs, 0 SHORTs — searching for quality SHORT...`);
+              const refinedShorts = refined.filter(r => r.side === "short" && !finalSelected.some(f => f.symbol === r.symbol));
+              
+              for(const candShort of refinedShorts.slice(0, 5)) {
+                try {
+                  const mtfShort = await runMTFDirectionAnalysis(candShort.symbol, candShort.side, candShort.mark_price);
+                  const shortWinProb = mtfShort.short_prob_pct;
+                  
+                  if(shortWinProb >= 55 && mtfShort.confidence_pct >= 35) {
+                    candShort.mtf = mtfShort;
+                    candShort.mtf_overridden = false;
+                    candShort.confidence = Math.round(candShort.confidence * 0.90); // slight penalty for being added late
+                    finalSelected.push(candShort);
+                    log(`✅ Diversity: added ${candShort.symbol} SHORT (win_prob=${shortWinProb}%, conf=${mtfShort.confidence_pct}%)`);
+                    break;
+                  } else {
+                    log(`[DIVERSITY-SKIP] ${candShort.symbol} SHORT: win_prob=${shortWinProb}% conf=${mtfShort.confidence_pct}% — not strong enough`);
+                  }
+                } catch(e) {
+                  log(`[DIVERSITY-ERR] ${candShort.symbol}:`, e?.message || e);
+                }
+              }
+            } else if(shorts.length >= 3 && longs.length === 0 && refined.length > 0) {
+              log(`⚠️ Directional imbalance: ${shorts.length} SHORTs, 0 LONGs — searching for quality LONG...`);
+              const refinedLongs = refined.filter(r => r.side === "long" && !finalSelected.some(f => f.symbol === r.symbol));
+              
+              for(const candLong of refinedLongs.slice(0, 5)) {
+                try {
+                  const mtfLong = await runMTFDirectionAnalysis(candLong.symbol, candLong.side, candLong.mark_price);
+                  const longWinProb = mtfLong.long_prob_pct;
+                  
+                  if(longWinProb >= 55 && mtfLong.confidence_pct >= 35) {
+                    candLong.mtf = mtfLong;
+                    candLong.mtf_overridden = false;
+                    candLong.confidence = Math.round(candLong.confidence * 0.90);
+                    finalSelected.push(candLong);
+                    log(`✅ Diversity: added ${candLong.symbol} LONG (win_prob=${longWinProb}%, conf=${mtfLong.confidence_pct}%)`);
+                    break;
+                  } else {
+                    log(`[DIVERSITY-SKIP] ${candLong.symbol} LONG: win_prob=${longWinProb}% conf=${mtfLong.confidence_pct}% — not strong enough`);
+                  }
+                } catch(e) {
+                  log(`[DIVERSITY-ERR] ${candLong.symbol}:`, e?.message || e);
+                }
+              }
+            } else {
+              log(`✅ Directional balance OK: ${longs.length} LONGs, ${shorts.length} SHORTs`);
+            }
+            
+            if(finalSelected.length > preDiversityCount) {
+              log(`📊 Diversity adjustment: ${preDiversityCount} → ${finalSelected.length} ideas`);
             }
 
             // ── SIGNAL CONTRADICTION CHECK ──
