@@ -55,6 +55,7 @@ jobs:
 
       # New Confidence Model Knobs
       DIRECTION: ${{ vars.DIRECTION }}
+      HEDGE: ${{ vars.HEDGE }}
       MR_SLOPE_MAX_ATR50: ${{ vars.MR_SLOPE_MAX_ATR50 }}
       MR_BREAKOUT_DC_N: ${{ vars.MR_BREAKOUT_DC_N }}
       MR_BREAKOUT_RET15_ATR: ${{ vars.MR_BREAKOUT_RET15_ATR }}
@@ -294,6 +295,7 @@ jobs:
           const STABLES=new Set(["USDT","USDC","USD","USDE","USDD","BUSD","FDUSD","TUSD","DRKUSD","DAI","USDP","PAX","USTC"]);
 
           const DIRECTION=(process.env.DIRECTION||"both").trim().toLowerCase();
+          const HEDGE=(process.env.HEDGE||"off").trim().toLowerCase()==="on";
           const MR_ADX_MAX_DEFAULT=20, MR_BREAKOUT_DC_N=Number(process.env.MR_BREAKOUT_DC_N||"120");
           const MR_BREAKOUT_RET15_ATR=Number(process.env.MR_BREAKOUT_RET15_ATR||"1.5"), MR_LOCKOUT_SEC=Number(process.env.MR_LOCKOUT_SEC||"1800");
           const MAX_COST_BPS_HARD=Number(process.env.MAX_COST_BPS_HARD||"15");
@@ -873,6 +875,7 @@ jobs:
             
             const calibHealth = validateCalibration(state);
             if(!todOK) reason="tod_gate";
+            log("HEDGE mode:", HEDGE ? "ON (will double ideas: long+short per symbol, full size each)" : "OFF (normal, one-directional)");
 
             // ========== DYNAMIC UNIVERSE FROM BYBIT GAINERS/LOSERS ==========
             log("📡 Fetching all Bybit Linear tickers to find gainers/losers...");
@@ -1193,6 +1196,42 @@ jobs:
               };
             });
 
+            if (HEDGE) {
+              const flippedPicks = picksV2.map(orig => {
+                const flippedSide = orig.side === "long" ? "short" : "long";
+                const mid = orig.entry_mid;
+                const slF = orig.sl_bps / 10000, tpF = orig.tp_bps / 10000;
+
+                let entry_limit = null, tp_abs = null, sl_abs = null;
+                if (mid != null) {
+                  if (flippedSide === "long") {
+                    entry_limit = mid * (1 - Math.max(0.001, slF * 0.5));
+                    tp_abs = entry_limit * (1 + tpF);
+                    sl_abs = entry_limit * (1 - slF);
+                  } else {
+                    entry_limit = mid * (1 + slF);
+                    tp_abs = entry_limit * (1 - tpF);
+                    sl_abs = entry_limit * (1 + slF);
+                  }
+                }
+
+                return {
+                  ...orig,
+                  idea_id: uuidv4(),
+                  client_order_id: mkClientOrderId("byh"),
+                  side: flippedSide,
+                  entry_limit, tp_abs, sl_abs,
+                  calib_key: `side:${flippedSide}|regime:${orig.regime}`,
+                  hedge_pair_of: orig.idea_id,
+                  is_hedge_flip: true
+                  // size_bps intentionally NOT modified — full size on both legs (2x total exposure)
+                };
+              });
+
+              picksV2 = [...picksV2, ...flippedPicks];
+              log(`🔁 HEDGE ON: ${picksV2.length} ideas total (${picksV2.length / 2} pairs, long+short each, full size both legs)`);
+            }
+
             const toV1Compat = (pv2) => ({
               idea_id: pv2.idea_id, client_order_id: pv2.client_order_id, symbol: pv2.symbol, symbol_full: pv2.symbol_full,
               quote: pv2.quote, side: pv2.side, rank: pv2.rank, entry_policy: "smart_swing_limit", entry_type: "limit",
@@ -1254,7 +1293,7 @@ jobs:
               origin: "github_actions", reason, exchange: "bybit_linear", execution_exchange: "bybit_linear",
               strategy: STRATEGY_NAME, model_version: MODEL_VERSION, schema_version: SCHEMA_VERSION, git_sha: GIT_SHA,
               config_hash: CONFIG_HASH,
-              counts: { bybit_universe: bybitUniverseCount, metrics_fetched: filteredTickers.length, selected: picks.length },
+              counts: { bybit_universe: bybitUniverseCount, metrics_fetched: filteredTickers.length, selected: picks.length, hedge_mode: HEDGE, symbols_analyzed: HEDGE ? picks.length/2 : picks.length },
               dd_gate: { pnl24_bps, peak_dd_bps, throttle },
               tod: { active: S_H != null && E_H != null, start: S_H, end: E_H },
               heartbeat: { mismatches: 0, zombies: 0 }, tier: selectionTier, idea_logs: ideaLogs,
