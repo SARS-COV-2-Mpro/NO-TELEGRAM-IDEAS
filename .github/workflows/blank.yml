@@ -460,9 +460,12 @@ jobs:
           const WEIGHT_VOLUME=0.15;
           const WEIGHT_DIRECTION=0.20;
 
-          const MTF_OVERRIDE_MIN_CONF = 45;
-          const MTF_DROP_MIN_PROB     = 50;
-          const MTF_COINFLIP_GATE     = 52;
+          const MTF_OVERRIDE_MIN_CONF = Number(process.env.MTF_OVERRIDE_MIN_CONF || "45");
+
+          const MTF_DROP_MIN_PROB     = Number(process.env.MTF_DROP_MIN_PROB || "50");
+
+          const MTF_COINFLIP_GATE     = Number(process.env.MTF_COINFLIP_GATE || "62");
+
 
           const CONFIG_HASH=(()=>{ try{ const knobs={ DIRECTION,MR_BREAKOUT_DC_N,MR_BREAKOUT_RET15_ATR,MR_LOCKOUT_SEC,MAX_COST_BPS_HARD,MIN_VOL_1H_USD,DEPTH_1P_MIN_USD,LONG_EDGE_MULT_MIN,LONG_BOUNCE_SL_ATR,LONG_BOUNCE_TP_ATR,TOP_N,MAX_SPREAD_BPS,EXP_LCB_MIN_BPS_BASE,COST_BPS,NOTIONAL,DEPTH_LIMIT,OBI_TOPN,MIN_TF_ALIGN,TF_WEIGHTS,IDEAL_VOL_1H_PCT,IDEAL_FUNDING_RATE,IDEAL_OI_DELTA_PCT,IDEAL_VOLUME_1H_USD,WEIGHT_VOL_1H,WEIGHT_FUNDING,WEIGHT_OI_DELTA,WEIGHT_VOLUME,WEIGHT_DIRECTION,REG_INTERVAL:process.env.REG_INTERVAL,REG_LIMIT:process.env.REG_LIMIT,REG_SLOPE_THRESHOLD:process.env.REG_SLOPE_THRESHOLD,SLOPE_EXIT_RATIO:process.env.SLOPE_EXIT_RATIO,REG_RANGING_THRESHOLD:process.env.REG_RANGING_THRESHOLD,REG_RANGE_THRESHOLD:process.env.REG_RANGE_THRESHOLD,ATR_VOLATILE_THRESHOLD:process.env.ATR_VOLATILE_THRESHOLD,REG_CONFIRM_BARS:process.env.REG_CONFIRM_BARS,MIN_ALT_SCORE:process.env.MIN_ALT_SCORE,ATR_MIN_PCT }; return hashObj(knobs); }catch{ return "cfg-unknown"; } })();
 
@@ -1816,13 +1819,14 @@ jobs:
                 const pLcb=wilsonLCB(pCal,nCoeff,WILSON_Z);
 
                 const atr_bps=Math.round((v5Result?v5Result.atrPercent:cand.vol_1h_pct)*100);
-                const MAX_SL_BPS=80;
+                const MAX_SL_BPS=130;
                 let tp=Math.round(atr_bps*LONG_BOUNCE_TP_ATR);
                 let sl=Math.round(atr_bps*LONG_BOUNCE_SL_ATR);
                 sl=Math.min(sl,MAX_SL_BPS);
-                tp=Math.max(tp,Math.round(sl*2.5));
-                sl=clamp(sl, 30, 80);
-                tp=clamp(tp, 100, 300);
+                tp=Math.max(tp,Math.round(sl*1.8));
+
+                sl=clamp(sl, 40, 130);
+                tp=clamp(tp, 80, 280);
 
                 const costSide=forcedSide==="long"?costLong:costShort;
                 const slipSide=forcedSide==="long"?slipL:slipS;
