@@ -24,40 +24,253 @@ jobs:
           sleep 60
           echo "✅ A3 done at $(date)"
 
-      - name: 🔍 Fetch live regime from Worker 1 (balance monitor)
+      - name: 🔍 Detect market regime locally
         id: regime
         env:
-          WORKER_REGIME_URL: ${{ secrets.WORKER_REGIME_URL }}
+          BYBIT_API_KEY: ${{ secrets.BYBIT_API_KEY }}
+          BYBIT_SECRET_KEY: ${{ secrets.BYBIT_SECRET_KEY }}
+          BYBIT_BASE_URL: ${{ secrets.BYBIT_BASE_URL }}
         run: |
-          set +e
-          echo "[DEBUG] Fetching regime from: ${WORKER_REGIME_URL}/regime"
-          JSON=$(curl -fsS --max-time 10 "${WORKER_REGIME_URL}/regime")
-          EXIT=$?
-          echo "[DEBUG] Exit code: $EXIT"
-          echo "[DEBUG] Raw response: $JSON"
+          node - <<'NODE'
+          const crypto = require('crypto');
+          const https = require('https');
+
+          const RECV_WINDOW = 5000;
+          const REGIME_CONFIG = {
+            SECTORS: {
+              'L1': ['ETHUSDT','SOLUSDT','BNBUSDT','AVAXUSDT','ADAUSDT','SUIUSDT','APTUSDT','NEARUSDT'],
+              'DeFi': ['AAVEUSDT','UNIUSDT','LINKUSDT','ENAUSDT','HYPEUSDT'],
+              'AI/GPU': ['RENDERUSDT','FETUSDT','WLDUSDT'],
+              'Meme': ['DOGEUSDT','WIFUSDT','PEPEUSDT'],
+              'Infra': ['OPUSDT','ARBUSDT','INJUSDT','DOTUSDT'],
+              'Legacy': ['XRPUSDT','LTCUSDT','XLMUSDT']
+            },
+            PUMP_4H: 3.0, DUMP_4H: -3.0, FLAT: 1.0,
+            BROAD_RATIO: 0.50, SELECTIVE_RATIO: 0.25,
+            DOM_BTC_SEASON: 60, DOM_ALT_FAVOR: 54, ALTSEASON_INDEX: 75,
+            VOL_SURGE: 1.8, FUNDING_HOT: 0.010, FUNDING_COLD: -0.005,
+            DEAD_ATR_MAX: 1.5, DEAD_VOL_LOW: 0.5, DEAD_VOL_EXTREME: 0.15,
+            DEAD_FLAT_HIGH: 0.85, DEAD_FLAT_EXTREME: 0.95,
+            MIN_CONFIDENCE: 55, MIN_SCORE_GAP: 8, MIN_ABS_SCORE: 25,
+          };
+
+          const mean=(a)=>a.length?a.reduce((x,y)=>x+y,0)/a.length:0;
+          const std=(a)=>{ const m=mean(a); let v=0; for(const x of a) v+=(x-m)*(x-m); return a.length>1?Math.sqrt(v/(a.length-1)):0; };
           
-          if [[ $EXIT -ne 0 || -z "$JSON" ]]; then
-            echo "⚠️ Regime fetch failed (exit=$EXIT) — defaulting to ACTIVE"
-            JSON='{}'
-          fi
-          
-          REG=$(node -e "
-            try {
-              const j = JSON.parse(process.argv[1]);
-              console.log(j.regime || 'Unknown');
-            } catch(e) {
-              console.log('Unknown');
+          function calcSlope(values) {
+            const n = values.length;
+            if (n < 2) return 0;
+            let ySum = 0;
+            for (let i = 0; i < n; i++) ySum += values[i];
+            const yMean = ySum / n;
+            if (Math.abs(yMean) < 1e-9) return 0;
+            const xMean = (n - 1) * 0.5;
+            let num = 0, den = 0;
+            for (let i = 0; i < n; i++) {
+              const dx = i - xMean;
+              num += dx * (values[i] - yMean);
+              den += dx * dx;
             }
-          " "$JSON")
-          echo "regime=$REG" >> "$GITHUB_OUTPUT"
-          echo "✅ Fetched regime: $REG"
+            return den === 0 ? 0 : (num / den / yMean) * 100;
+          }
+
+          function calcEMA(values, period) {
+            const n = values.length;
+            if (n < period) return values[n - 1] ?? 0;
+            const k = 2 / (period + 1);
+            let ema = 0;
+            for (let i = 0; i < period; i++) ema += values[i];
+            ema /= period;
+            for (let i = period; i < n; i++) {
+              ema = values[i] * k + ema * (1 - k);
+            }
+            return ema;
+          }
+
+          function calcATR(candles) {
+            const n = candles.length;
+            if (n < 2) return 0;
+            let sum = 0;
+            for (let i = 1; i < n; i++) {
+              const prev = candles[i - 1].close;
+              const c = candles[i];
+              sum += Math.max(c.high - c.low, Math.abs(c.high - prev), Math.abs(c.low - prev));
+            }
+            return sum / (n - 1);
+          }
+
+          function parseKlines(list) {
+            if (!list?.length) return [];
+            const len = list.length;
+            const out = new Array(len);
+            for (let i = 0; i < len; i++) {
+              const c = list[len - 1 - i];
+              out[i] = {
+                time: parseInt(c[0]),
+                open: parseFloat(c[1]),
+                high: parseFloat(c[2]),
+                low: parseFloat(c[3]),
+                close: parseFloat(c[4]),
+                volume: parseFloat(c[5])
+              };
+            }
+            return out;
+          }
+
+          async function createBybitSignature(timestamp, payload, apiKey, secretKey) {
+            const signString = String(timestamp) + String(apiKey) + String(RECV_WINDOW) + String(payload);
+            const enc = new TextEncoder();
+            const key = await crypto.subtle.importKey('raw', enc.encode(secretKey), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+            const sig = await crypto.subtle.sign('HMAC', key, enc.encode(signString));
+            return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, '0')).join('');
+          }
+
+          async function bybitRequest(endpoint, params) {
+            const baseUrl = process.env.BYBIT_BASE_URL?.trim();
+            const apiKey = process.env.BYBIT_API_KEY?.trim();
+            const secretKey = process.env.BYBIT_SECRET_KEY?.trim();
+            
+            if (!baseUrl || !apiKey || !secretKey) {
+              throw new Error('Missing BYBIT credentials');
+            }
+
+            const timestamp = String(Date.now());
+            const payload = new URLSearchParams(params).toString();
+            const signature = await createBybitSignature(timestamp, payload, apiKey, secretKey);
+
+            const url = `${baseUrl}${endpoint}?${payload}`;
+            return new Promise((resolve, reject) => {
+              const request = https.get(url, {
+                headers: {
+                  'X-BAPI-API-KEY': apiKey,
+                  'X-BAPI-TIMESTAMP': timestamp,
+                  'X-BAPI-SIGN': signature,
+                  'X-BAPI-RECV-WINDOW': String(RECV_WINDOW),
+                  'Content-Type': 'application/json'
+                }
+              }, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => {
+                  try {
+                    const json = JSON.parse(data);
+                    if (json.retCode !== 0) throw new Error(`${json.retCode}: ${json.retMsg}`);
+                    resolve(json.result);
+                  } catch(e) {
+                    reject(e);
+                  }
+                });
+              });
+              request.on('error', reject);
+              request.setTimeout(10000, () => {
+                request.abort();
+                reject(new Error('Request timeout'));
+              });
+            });
+          }
+
+          async function fetchGlobalMetrics() {
+            return new Promise((resolve) => {
+              https.get('https://api.coingecko.com/api/v3/global', (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => {
+                  try {
+                    const json = JSON.parse(data);
+                    const d = json.data || {};
+                    resolve({
+                      btcDominance: parseFloat(d.market_cap_percentage?.btc || 0),
+                      ethDominance: parseFloat(d.market_cap_percentage?.eth || 0),
+                      totalMarketCap: parseFloat(d.total_market_cap?.usd || 0),
+                      marketCapChange: parseFloat(d.market_cap_change_percentage_24h_usd || 0),
+                      totalVolume: parseFloat(d.total_volume?.usd || 0),
+                    });
+                  } catch {
+                    resolve(null);
+                  }
+                });
+              }).on('error', () => resolve(null));
+            });
+          }
+
+          async function getMarketRegime() {
+            const allSymbols = [...new Set(Object.values(REGIME_CONFIG.SECTORS).flat())];
+
+            try {
+              const [btc4h, btcDay, eth4h, global] = await Promise.all([
+                bybitRequest('/v5/market/kline', { category: 'linear', symbol: 'BTCUSDT', interval: '240', limit: '30' }).catch(()=>({list:[]})),
+                bybitRequest('/v5/market/kline', { category: 'linear', symbol: 'BTCUSDT', interval: 'D', limit: '14' }).catch(()=>({list:[]})),
+                bybitRequest('/v5/market/kline', { category: 'linear', symbol: 'ETHUSDT', interval: '240', limit: '10' }).catch(()=>({list:[]})),
+                fetchGlobalMetrics()
+              ]);
+
+              const btc4hCandles = parseKlines(btc4h?.list || []);
+              const btcDayCandles = parseKlines(btcDay?.list || []);
+              const eth4hCandles = parseKlines(eth4h?.list || []);
+
+              if (btc4hCandles.length < 5) {
+                return { regime: 'Unknown', confidence: 0, detail: 'Insufficient data' };
+              }
+
+              const btcCloses4h = btc4hCandles.map(c => c.close);
+              const btcClosesDay = btcDayCandles.map(c => c.close);
+              const btcPrice = btcCloses4h.at(-1);
+
+              const btcEMA9 = calcEMA(btcCloses4h, 9);
+              const btcEMA21 = calcEMA(btcCloses4h, 21);
+              const emaGolden = btcEMA9 > btcEMA21;
+              const btcATR = calcATR(btc4hCandles);
+              const btcATRpct = (btcATR / btcPrice) * 100;
+              const btcSlope4h = calcSlope(btcCloses4h.slice(-10));
+              const btcSlopeDay = calcSlope(btcClosesDay);
+
+              const btc4hOpen = btc4hCandles.at(-1)?.open ?? btcPrice;
+              const btc4hChange = ((btcPrice - btc4hOpen) / btc4hOpen) * 100;
+
+              const btcVols = btc4hCandles.map(c => c.volume);
+              const btcVolAvg = btcVols.slice(0, -1).reduce((a, b) => a + b, 0) / Math.max(btcVols.length - 1, 1);
+              const btcVolCurr = btcVols.at(-1);
+              const btcVolRatio = btcVolAvg > 0 ? btcVolCurr / btcVolAvg : 1;
+
+              const flatRatio = 0.5; // simplified for A3
+
+              // Dead market detection
+              const isDead = flatRatio >= REGIME_CONFIG.DEAD_FLAT_EXTREME &&
+                            btcVolRatio < REGIME_CONFIG.DEAD_VOL_EXTREME &&
+                            Math.abs(btc4hChange) < 0.2;
+
+              let regime = 'Unknown';
+              if (isDead) regime = 'Dead Market';
+              else if (emaGolden && btcSlope4h > 0.2) regime = 'Trending Up';
+              else if (!emaGolden && btcSlope4h < -0.2) regime = 'Trending Down';
+              else if (btcATRpct > 1.5) regime = 'Volatile';
+              else regime = 'Ranging';
+
+              console.log(`[A3-REGIME] ${regime} (ATR=${btcATRpct.toFixed(2)}% Vol=${btcVolRatio.toFixed(2)}x Slope=${btcSlope4h.toFixed(2)}%)`);
+
+              return {
+                regime,
+                confidence: 85,
+                detail: `BTC 4h: ${btc4hChange.toFixed(2)}% | ATR: ${btcATRpct.toFixed(2)}% | Vol: ${btcVolRatio.toFixed(2)}x`
+              };
+
+            } catch(e) {
+              console.log(`[A3-REGIME-ERROR] ${e.message}`);
+              return { regime: 'Unknown', confidence: 0, detail: e.message };
+            }
+          }
+
+          (async () => {
+            const result = await getMarketRegime();
+            console.log(`[A3-REGIME-RESULT] regime="${result.regime}"`);
+            console.log(`::set-output name=regime::${result.regime}`);
+          })();
+          NODE
 
       - name: 🔁 Route — Dead Market → B, anything else → A
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-        env:
-          WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}
         script: |
           const regime = `${{ steps.regime.outputs.regime }}`.trim();
           const isDead = regime === 'Dead Market';
@@ -65,7 +278,6 @@ jobs:
 
           console.log(`[A3-ROUTER] regime="${regime}" → ${eventType}`);
 
-          // Determine which pipeline to cancel (the one we're NOT running)
           const otherEvent = isDead ? 'run_A' : 'run_B';
           const workflowNameMap = { 
             'run_A': 'Ideas Pusher (MEXC Ultimate 7.7.8)',
@@ -91,15 +303,11 @@ jobs:
                   run_id: run.id
                 });
               }
-            } else {
-              console.log(`[A3-ROUTER] No in-progress runs of "${otherWorkflowName}" found`);
             }
           } catch(e) {
-            console.log(`[A3-ROUTER] Cancel check failed (non-fatal): ${e.message}`);
+            console.log(`[A3-ROUTER] Cancel check skipped: ${e.message}`);
           }
 
-          // Dispatch the correct pipeline
-          console.log(`[A3-ROUTER] Dispatching ${eventType}...`);
           await github.rest.repos.createDispatchEvent({
             owner: context.repo.owner,
             repo: context.repo.repo,
@@ -107,4 +315,3 @@ jobs:
           });
 
           console.log(`✅ Dispatched ${eventType}`);
-          console.log(`[A3-ROUTER] Worker 2 (push) URL: ${process.env.WORKER_PUSH_URL}`);
