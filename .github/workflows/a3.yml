@@ -142,7 +142,7 @@ jobs:
             const payload = new URLSearchParams(params).toString();
             const signature = await createBybitSignature(timestamp, payload, apiKey, secretKey);
 
-            const res = await fetch(\`\${baseUrl}\${endpoint}?\${payload}\`, {
+            const res = await fetch(`${baseUrl}${endpoint}?${payload}`, {
               method: 'GET',
               headers: {
                 'X-BAPI-API-KEY': apiKey,
