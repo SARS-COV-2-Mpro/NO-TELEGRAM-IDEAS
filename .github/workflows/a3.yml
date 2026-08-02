@@ -24,528 +24,68 @@ jobs:
           sleep 60
           echo "✅ A3 done at $(date)"
 
-      - name: 🔍 Detect market regime locally
+      - name: 🔍 Fetch regime from Worker
         id: regime
         env:
-          BYBIT_API_KEY: ${{ secrets.BYBIT_API_KEY }}
-          BYBIT_SECRET_KEY: ${{ secrets.BYBIT_SECRET_KEY }}
-          BYBIT_BASE_URL: ${{ secrets.BYBIT_BASE_URL }}
+          WORKER_JSON_URL: ${{ secrets.WORKER_JSON_URL }}
         run: |
-          node <<'NODESCRIPT'
-          const crypto = require('crypto');
-
-          const RECV_WINDOW = 5000;
-          const REGIME_CONFIG = {
-            SECTORS: {
-              'L1':     ['ETHUSDT','SOLUSDT','BNBUSDT','AVAXUSDT','ADAUSDT','SUIUSDT','APTUSDT','NEARUSDT'],
-              'DeFi':   ['AAVEUSDT','UNIUSDT','LINKUSDT','ENAUSDT','HYPEUSDT'],
-              'AI/GPU': ['RENDERUSDT','FETUSDT','WLDUSDT'],
-              'Meme':   ['DOGEUSDT','WIFUSDT','PEPEUSDT'],
-              'Infra':  ['OPUSDT','ARBUSDT','INJUSDT','DOTUSDT'],
-              'Legacy': ['XRPUSDT','LTCUSDT','XLMUSDT']
-            },
-            PUMP_4H: 3.0, DUMP_4H: -3.0, FLAT: 1.0,
-            BROAD_RATIO: 0.50, SELECTIVE_RATIO: 0.25,
-            DOM_BTC_SEASON: 60, DOM_ALT_FAVOR: 54, ALTSEASON_INDEX: 75,
-            VOL_SURGE: 1.8, FUNDING_HOT: 0.010, FUNDING_COLD: -0.005,
-            DEAD_ATR_MAX: 1.5, DEAD_VOL_LOW: 0.5, DEAD_VOL_EXTREME: 0.15,
-            DEAD_FLAT_HIGH: 0.85, DEAD_FLAT_EXTREME: 0.95,
-            MIN_CONFIDENCE: 55, MIN_SCORE_GAP: 8, MIN_ABS_SCORE: 25,
-          };
-
-          const SYMBOL_TO_SECTOR = (() => {
-            const map = {};
-            for (const [sec, syms] of Object.entries(REGIME_CONFIG.SECTORS)) {
-              for (const sym of syms) map[sym] = sec;
-            }
-            return map;
-          })();
-
-          const mean=(a)=>a.length?a.reduce((x,y)=>x+y,0)/a.length:0;
-          const std=(a)=>{ const m=mean(a); let v=0; for(const x of a) v+=(x-m)*(x-m); return a.length>1?Math.sqrt(v/(a.length-1)):0; };
-
-          function calcSlope(values) {
-            const n = values.length;
-            if (n < 2) return 0;
-            let ySum = 0;
-            for (let i = 0; i < n; i++) ySum += values[i];
-            const yMean = ySum / n;
-            if (Math.abs(yMean) < 1e-9) return 0;
-            const xMean = (n - 1) * 0.5;
-            let num = 0, den = 0;
-            for (let i = 0; i < n; i++) {
-              const dx = i - xMean;
-              num += dx * (values[i] - yMean);
-              den += dx * dx;
-            }
-            return den === 0 ? 0 : (num / den / yMean) * 100;
-          }
-
-          function calcEMA(values, period) {
-            const n = values.length;
-            if (n < period) return values[n - 1] ?? 0;
-            const k = 2 / (period + 1);
-            let ema = 0;
-            for (let i = 0; i < period; i++) ema += values[i];
-            ema /= period;
-            for (let i = period; i < n; i++) {
-              ema = values[i] * k + ema * (1 - k);
-            }
-            return ema;
-          }
-
-          function calcATR(candles) {
-            const n = candles.length;
-            if (n < 2) return 0;
-            let sum = 0;
-            for (let i = 1; i < n; i++) {
-              const prev = candles[i - 1].close;
-              const c = candles[i];
-              sum += Math.max(c.high - c.low, Math.abs(c.high - prev), Math.abs(c.low - prev));
-            }
-            return sum / (n - 1);
-          }
-
-          function parseKlines(list) {
-            if (!list?.length) return [];
-            const len = list.length;
-            const out = new Array(len);
-            for (let i = 0; i < len; i++) {
-              const c = list[len - 1 - i];
-              out[i] = {
-                time:   parseInt(c[0]),
-                open:   parseFloat(c[1]),
-                high:   parseFloat(c[2]),
-                low:    parseFloat(c[3]),
-                close:  parseFloat(c[4]),
-                volume: parseFloat(c[5])
-              };
-            }
-            return out;
-          }
-
-          async function createBybitSignature(timestamp, payload, apiKey, secretKey) {
-            const signString = String(timestamp) + String(apiKey) + String(RECV_WINDOW) + String(payload);
-            const enc = new TextEncoder();
-            const key = await crypto.subtle.importKey('raw', enc.encode(secretKey), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-            const sig = await crypto.subtle.sign('HMAC', key, enc.encode(signString));
-            return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, '0')).join('');
-          }
-
-          async function bybitRequest(endpoint, params) {
-            const baseUrl = (process.env.BYBIT_BASE_URL || '').trim();
-            const apiKey = (process.env.BYBIT_API_KEY || '').trim();
-            const secretKey = (process.env.BYBIT_SECRET_KEY || '').trim();
-            if (!baseUrl || !apiKey || !secretKey) throw new Error('Missing BYBIT credentials');
-
-            const timestamp = String(Date.now());
-            const payload = new URLSearchParams(params).toString();
-            const signature = await createBybitSignature(timestamp, payload, apiKey, secretKey);
-
-            const res = await fetch(`${baseUrl}${endpoint}?${payload}`, {
-              method: 'GET',
-              headers: {
-                'X-BAPI-API-KEY': apiKey,
-                'X-BAPI-TIMESTAMP': timestamp,
-                'X-BAPI-SIGN': signature,
-                'X-BAPI-RECV-WINDOW': String(RECV_WINDOW),
-                'Content-Type': 'application/json'
-              }
-            });
-
-            const data = await res.json();
-            if (data.retCode !== 0) throw new Error(\`Bybit API \${data.retCode}: \${data.retMsg}\`);
-            return data.result;
-          }
-
-          async function fetchGlobalMetrics() {
-            try {
-              const res = await fetch('https://api.coingecko.com/api/v3/global', {
-                headers: { 'Accept': 'application/json', 'User-Agent': 'a3-regime/1.0' }
-              });
-              if (!res.ok) return null;
-              const { data: d } = await res.json();
-              return {
-                btcDominance:    parseFloat(d?.market_cap_percentage?.btc || 0),
-                ethDominance:    parseFloat(d?.market_cap_percentage?.eth || 0),
-                totalMarketCap:  parseFloat(d?.total_market_cap?.usd || 0),
-                marketCapChange: parseFloat(d?.market_cap_change_percentage_24h_usd || 0),
-                totalVolume:     parseFloat(d?.total_volume?.usd || 0),
-              };
-            } catch { return null; }
-          }
-
-          async function fetchAllTickers(symbols) {
-            const map = {};
-            try {
-              const r = await bybitRequest('/v5/market/tickers', { category: 'linear' });
-              const list = r?.list || [];
-              const set = new Set(symbols);
-              for (const t of list) {
-                if (set.has(t.symbol)) {
-                  map[t.symbol] = {
-                    fundingRate:  parseFloat(t.fundingRate || '0'),
-                    volume24h:    parseFloat(t.volume24h || '0'),
-                    turnover24h:  parseFloat(t.turnover24h || '0'),
-                    change24h:    parseFloat(t.price24hPcnt || '0') * 100,
-                    openInterest: parseFloat(t.openInterest || '0'),
-                  };
-                }
-              }
-            } catch {}
-            return map;
-          }
-
-          async function getMarketRegime() {
-            const allSymbols = [...new Set(Object.values(REGIME_CONFIG.SECTORS).flat())];
-
-            const [btc4hResult, btcDayResult, eth4hResult, globalResult, tickerResult, ...altResults] = await Promise.allSettled([
-              bybitRequest('/v5/market/kline', { category: 'linear', symbol: 'BTCUSDT', interval: '240', limit: '30' }),
-              bybitRequest('/v5/market/kline', { category: 'linear', symbol: 'BTCUSDT', interval: 'D', limit: '14' }),
-              bybitRequest('/v5/market/kline', { category: 'linear', symbol: 'ETHUSDT', interval: '240', limit: '10' }),
-              fetchGlobalMetrics(),
-              fetchAllTickers(allSymbols),
-              ...allSymbols.map(sym =>
-                bybitRequest('/v5/market/kline', {
-                  category: 'linear', symbol: sym, interval: '240', limit: '10'
-                }).catch(() => null)
-              )
-            ]);
-
-            const btc4h = parseKlines(btc4hResult.status === 'fulfilled' ? btc4hResult.value?.list : []);
-            const btcDay = parseKlines(btcDayResult.status === 'fulfilled' ? btcDayResult.value?.list : []);
-            const eth4h = parseKlines(eth4hResult.status === 'fulfilled' ? eth4hResult.value?.list : []);
-
-            if (btc4h.length < 5) {
-              return { regime: 'Unknown', confidence: 0, detail: 'Insufficient BTC data' };
-            }
-
-            const btcCloses4h = btc4h.map(c => c.close);
-            const btcClosesDay = btcDay.map(c => c.close);
-            const btcPrice = btcCloses4h.at(-1);
-
-            const btcEMA9 = calcEMA(btcCloses4h, 9);
-            const btcEMA21 = calcEMA(btcCloses4h, 21);
-            const emaGolden = btcEMA9 > btcEMA21;
-            const emaDeath = btcEMA9 < btcEMA21;
-            const aboveEMA9 = btcPrice > btcEMA9;
-            const aboveEMA21 = btcPrice > btcEMA21;
-
-            const btcATR = calcATR(btc4h);
-            const btcATRpct = (btcATR / btcPrice) * 100;
-
-            const btcSlope4h = calcSlope(btcCloses4h.slice(-10));
-            const btcSlopeDay = calcSlope(btcClosesDay);
-
-            const btc4hOpen = btc4h.at(-1)?.open ?? btcPrice;
-            const btc4hChange = ((btcPrice - btc4hOpen) / btc4hOpen) * 100;
-            const btc24hRef = btc4h.length >= 6 ? btc4h.at(-6).close : btc4h[0].close;
-            const btc24hChange = ((btcPrice - btc24hRef) / btc24hRef) * 100;
-
-            const btcVols = btc4h.map(c => c.volume);
-            const btcVolAvg = btcVols.slice(0, -1).reduce((a, b) => a + b, 0) / Math.max(btcVols.length - 1, 1);
-            const btcVolCurr = btcVols.at(-1);
-            const btcVolSurge = btcVolCurr > btcVolAvg * REGIME_CONFIG.VOL_SURGE;
-            const btcVolRatio = btcVolAvg > 0 ? btcVolCurr / btcVolAvg : 1;
-
-            const ethCloses = eth4h.map(c => c.close);
-            const ethPrice = ethCloses.at(-1) ?? 0;
-            const ethPrev = ethCloses.at(-2) ?? ethPrice;
-            const btcPrev4h = btcCloses4h.at(-2) ?? btcPrice;
-            const ratioCurr = btcPrice > 0 ? ethPrice / btcPrice : 0;
-            const ratioPrev = btcPrev4h > 0 ? ethPrev / btcPrev4h : 0;
-            const ethBtcChg = ratioPrev > 0 ? ((ratioCurr - ratioPrev) / ratioPrev) * 100 : 0;
-            const ethOutperf = ethBtcChg > 0.3;
-
-            const global = globalResult.status === 'fulfilled' ? globalResult.value : null;
-            const btcDom = global?.btcDominance ?? 0;
-            const mcChange = global?.marketCapChange ?? 0;
-
-            const tickers = tickerResult.status === 'fulfilled' ? (tickerResult.value ?? {}) : {};
-
-            const altData = [];
-            for (let i = 0; i < allSymbols.length; i++) {
-              const res = altResults[i];
-              if (res?.status !== 'fulfilled' || !res.value?.list) continue;
-
-              const candles = parseKlines(res.value.list);
-              if (candles.length < 3) continue;
-
-              const closes = candles.map(c => c.close);
-              const volumes = candles.map(c => c.volume);
-              const curr = closes.at(-1);
-              const prev4h = closes.at(-2) ?? curr;
-              const prev8h = closes.at(-3) ?? curr;
-              const oldest = closes[0];
-
-              const change4h = ((curr - prev4h) / prev4h) * 100;
-              const change8h = ((curr - prev8h) / prev8h) * 100;
-              const change40h = ((curr - oldest) / oldest) * 100;
-
-              const volAvg = volumes.slice(0, -1).reduce((a, b) => a + b, 0) / Math.max(volumes.length - 1, 1);
-              const volRatio = volAvg > 0 ? volumes.at(-1) / volAvg : 1;
-
-              const atr = calcATR(candles);
-              const atrPct = curr > 0 ? (atr / curr) * 100 : 0;
-
-              const sector = SYMBOL_TO_SECTOR[allSymbols[i]] || 'Other';
-
-              const tk = tickers[allSymbols[i]] ?? {};
-              altData.push({
-                symbol: allSymbols[i],
-                sector,
-                curr,
-                change4h,
-                change8h,
-                change40h,
-                volRatio,
-                slope: calcSlope(closes),
-                atrPct,
-                accelerating: Math.abs(change4h) > Math.abs(change8h / 2),
-                outperformBTC: change4h > btc4hChange,
-                fundingRate: tk.fundingRate ?? 0,
-                change24h: tk.change24h ?? change8h,
-                openInterest: tk.openInterest ?? 0,
-              });
-            }
-
-            const totalAlts = altData.length;
-            if (totalAlts < 5) {
-              return { regime: 'Unknown', confidence: 0, detail: 'Insufficient altcoin data' };
-            }
-
-            let pumpCount = 0, dumpCount = 0, flatCount = 0, outperfCnt = 0;
-            let sumAlt4h = 0, sumAlt40h = 0, sumVolRatio = 0, sumVwAlt4h = 0;
-            let volSurgeCount = 0, sumFunding = 0;
-
-            for (const a of altData) {
-              if (a.change4h > REGIME_CONFIG.PUMP_4H) pumpCount++;
-              if (a.change4h < REGIME_CONFIG.DUMP_4H) dumpCount++;
-              if (Math.abs(a.change4h) < REGIME_CONFIG.FLAT) flatCount++;
-              if (a.outperformBTC) outperfCnt++;
-              if (a.volRatio > REGIME_CONFIG.VOL_SURGE) volSurgeCount++;
-              sumAlt4h += a.change4h;
-              sumAlt40h += a.change40h;
-              sumVolRatio += a.volRatio;
-              sumVwAlt4h += a.change4h * a.volRatio;
-              sumFunding += a.fundingRate;
-            }
-
-            const avgAlt4h = sumAlt4h / totalAlts;
-            const avgAlt40h = sumAlt40h / totalAlts;
-            const vwAvg4h = sumVolRatio > 0 ? sumVwAlt4h / sumVolRatio : avgAlt4h;
-            const avgFunding = sumFunding / totalAlts;
-
-            const pumpRatio = pumpCount / totalAlts;
-            const dumpRatio = dumpCount / totalAlts;
-            const flatRatio = flatCount / totalAlts;
-            const altSeasonIdx = (outperfCnt / totalAlts) * 100;
-
-            const overheatedL = avgFunding > REGIME_CONFIG.FUNDING_HOT;
-            const overheatedS = avgFunding < REGIME_CONFIG.FUNDING_COLD;
-
-            const btcUp = btc4hChange > 1.0;
-            const btcDown = btc4hChange < -1.0;
-            const altsUp = avgAlt4h > 1.0;
-            const altsDown = avgAlt4h < -1.0;
-
-            const div_BtcUpAltsDown = btcUp && altsDown;
-            const div_BtcUpAltsFlat = btcUp && !altsUp && !altsDown;
-            const div_BtcDownAltsUp = btcDown && altsUp;
-            const correlatedUp = btcUp && altsUp;
-            const correlatedDown = btcDown && altsDown;
-
-            const S = {
-              'Altcoin Season': 0, 'Bitcoin Season': 0, 'Broad Pump': 0, 'Broad Rally': 0,
-              'Broad Dump': 0, 'Selloff': 0, 'Selective Rotation': 0, 'Risk-Off Liquidation': 0,
-              'Overheated Longs': 0, 'Accumulation': 0, 'Dead Market': 0, 'Trending Up': 0,
-              'Trending Down': 0, 'Volatile Chop': 0, 'Ranging': 0,
-            };
-
-            if (btcDom > REGIME_CONFIG.DOM_BTC_SEASON) S['Bitcoin Season'] += 30;
-            if (btcDom > 62) S['Bitcoin Season'] += 10;
-            if (div_BtcUpAltsDown) S['Bitcoin Season'] += 25;
-            if (div_BtcUpAltsFlat) S['Bitcoin Season'] += 12;
-            if (!ethOutperf && aboveEMA21) S['Bitcoin Season'] += 8;
-            if (altSeasonIdx < 35) S['Bitcoin Season'] += 15;
-            if (btc24hChange > 2.0 && avgAlt40h < 0) S['Bitcoin Season'] += 10;
-
-            if (btcDom < REGIME_CONFIG.DOM_ALT_FAVOR) S['Altcoin Season'] += 25;
-            if (altSeasonIdx > REGIME_CONFIG.ALTSEASON_INDEX) S['Altcoin Season'] += 30;
-            if (ethOutperf) S['Altcoin Season'] += 12;
-            if (div_BtcDownAltsUp) S['Altcoin Season'] += 20;
-            if (outperfCnt / totalAlts > 0.65) S['Altcoin Season'] += 10;
-            if (avgAlt40h > 5.0) S['Altcoin Season'] += 8;
-
-            if (pumpRatio >= REGIME_CONFIG.BROAD_RATIO && avgAlt4h > 4.0) S['Broad Pump'] += 55;
-            if (vwAvg4h > 5.0) S['Broad Pump'] += 15;
-            if (correlatedUp && btcVolSurge) S['Broad Pump'] += 15;
-            if (mcChange > 5.0) S['Broad Pump'] += 10;
-            if (pumpRatio > 0.7) S['Broad Pump'] += 10;
-
-            if (pumpRatio >= REGIME_CONFIG.BROAD_RATIO && avgAlt4h > 2.0) S['Broad Rally'] += 40;
-            if (correlatedUp) S['Broad Rally'] += 12;
-            if (emaGolden && aboveEMA9) S['Broad Rally'] += 10;
-            if (mcChange > 2.0) S['Broad Rally'] += 8;
-
-            if (dumpRatio >= REGIME_CONFIG.BROAD_RATIO && avgAlt4h < -4.0) S['Broad Dump'] += 55;
-            if (correlatedDown && btcVolSurge) S['Broad Dump'] += 20;
-            if (mcChange < -5.0) S['Broad Dump'] += 15;
-            if (dumpRatio > 0.7) S['Broad Dump'] += 10;
-
-            if (dumpRatio >= REGIME_CONFIG.BROAD_RATIO && avgAlt4h < -2.0) S['Selloff'] += 40;
-            if (correlatedDown) S['Selloff'] += 12;
-            if (emaDeath && !aboveEMA21) S['Selloff'] += 10;
-            if (mcChange < -2.0) S['Selloff'] += 8;
-
-            if (pumpRatio >= REGIME_CONFIG.SELECTIVE_RATIO && pumpRatio < REGIME_CONFIG.BROAD_RATIO) S['Selective Rotation'] += 30;
-            if (Math.abs(avgAlt4h) < 1.5 && pumpCount >= 3) S['Selective Rotation'] += 18;
-            if (volSurgeCount > 0 && volSurgeCount < totalAlts * 0.35) S['Selective Rotation'] += 10;
-
-            if (correlatedDown && btcATRpct > 2.0) S['Risk-Off Liquidation'] += 45;
-            if (avgFunding < -0.01) S['Risk-Off Liquidation'] += 20;
-            if (dumpRatio >= 0.70) S['Risk-Off Liquidation'] += 15;
-            if (volSurgeCount > totalAlts * 0.5) S['Risk-Off Liquidation'] += 10;
-            if (btcVolSurge && btcDown) S['Risk-Off Liquidation'] += 10;
-
-            if (overheatedL && avgAlt4h > 0) S['Overheated Longs'] += 30;
-            if (avgFunding > 0.02) S['Overheated Longs'] += 20;
-            if (btcVolSurge && btcUp && pumpRatio > 0.4) S['Overheated Longs'] += 12;
-            if (altSeasonIdx > 60 && avgFunding > 0.01) S['Overheated Longs'] += 10;
-
-            if (btcATRpct < 0.3 && Math.abs(avgAlt4h) < 1.0 && Math.abs(btc4hChange) < 0.5) S['Accumulation'] += 35;
-            if (flatRatio > 0.5 && btcVolCurr < btcVolAvg * 0.7) S['Accumulation'] += 18;
-            if (Math.abs(btcSlopeDay) < 0.05) S['Accumulation'] += 12;
-            if (avgAlt40h < -10 && Math.abs(btcSlope4h) < 0.1) S['Accumulation'] += 10;
-
-            if (flatRatio >= 0.60 && btcATRpct < REGIME_CONFIG.DEAD_ATR_MAX) S['Dead Market'] += 45;
-            if (flatRatio >= REGIME_CONFIG.DEAD_FLAT_HIGH) S['Dead Market'] += 15;
-            if (flatRatio >= REGIME_CONFIG.DEAD_FLAT_EXTREME) S['Dead Market'] += 10;
-            if (Math.abs(avgAlt4h) < 0.5 && Math.abs(btc4hChange) < 0.3) S['Dead Market'] += 15;
-            if (btcVolRatio < REGIME_CONFIG.DEAD_VOL_LOW) S['Dead Market'] += 15;
-            if (btcVolRatio < REGIME_CONFIG.DEAD_VOL_EXTREME) S['Dead Market'] += 20;
-            if (flatRatio >= REGIME_CONFIG.DEAD_FLAT_EXTREME && btcVolRatio < 0.30) S['Dead Market'] += 30;
-            if (Math.abs(btcSlope4h) < 0.05 && Math.abs(avgAlt4h) < 0.3) S['Dead Market'] += 10;
-
-            if (emaGolden && aboveEMA9 && aboveEMA21) S['Trending Up'] += 25;
-            if (btcSlopeDay > 0.30) S['Trending Up'] += 18;
-            if (btc4hChange > 1.0 && avgAlt4h > 0) S['Trending Up'] += 12;
-            if (btcSlope4h > 0.2 && !correlatedDown) S['Trending Up'] += 8;
-
-            if (emaDeath && !aboveEMA9 && !aboveEMA21) S['Trending Down'] += 25;
-            if (btcSlopeDay < -0.30) S['Trending Down'] += 18;
-            if (btc4hChange < -1.0 && avgAlt4h < 0) S['Trending Down'] += 12;
-            if (btcSlope4h < -0.2 && !correlatedUp) S['Trending Down'] += 8;
-
-            if (btcATRpct > 1.5 && Math.abs(btcSlope4h) < 0.20) S['Volatile Chop'] += 35;
-            if (pumpCount > 2 && dumpCount > 2) S['Volatile Chop'] += 15;
-            if (btcVolSurge && Math.abs(btc4hChange) < 0.5) S['Volatile Chop'] += 12;
-
-            if (btcATRpct > 0.3 && btcATRpct < 0.8 && Math.abs(btcSlope4h) < 0.10) S['Ranging'] += 30;
-            if (Math.abs(avgAlt4h) < 1.5 && flatRatio > 0.35) S['Ranging'] += 15;
-            if (!emaGolden && !emaDeath) S['Ranging'] += 8;
-
-            if (btcVolRatio < 0.3) {
-              S['Trending Up'] = Math.max(0, S['Trending Up'] - 25);
-              S['Trending Down'] = Math.max(0, S['Trending Down'] - 25);
-              S['Broad Rally'] = Math.max(0, S['Broad Rally'] - 20);
-              S['Broad Pump'] = Math.max(0, S['Broad Pump'] - 20);
-              S['Broad Dump'] = Math.max(0, S['Broad Dump'] - 20);
-              S['Selloff'] = Math.max(0, S['Selloff'] - 20);
-            }
-
-            const hardDeadMarket = flatRatio >= REGIME_CONFIG.DEAD_FLAT_EXTREME &&
-                                  btcVolRatio < REGIME_CONFIG.DEAD_VOL_EXTREME &&
-                                  Math.abs(btc4hChange) < 0.2;
-            if (hardDeadMarket) S['Dead Market'] += 100;
-
-            const sortedScores = Object.entries(S).sort((a, b) => b[1] - a[1]);
-            let topRegime = sortedScores[0][0];
-            const topScore = sortedScores[0][1];
-            const runnerUp = sortedScores[1][0];
-            const runnerScore = sortedScores[1][1];
-            const totalTop2 = topScore + runnerScore;
-            const scoreGap = topScore - runnerScore;
-
-            let confidence = totalTop2 > 0 ? Math.min(Math.round((topScore / totalTop2) * 100), 99) : 0;
-
-            const weakSignal = topScore < REGIME_CONFIG.MIN_ABS_SCORE ||
-                              scoreGap < REGIME_CONFIG.MIN_SCORE_GAP ||
-                              confidence < REGIME_CONFIG.MIN_CONFIDENCE;
-
-            if (weakSignal && !hardDeadMarket) topRegime = 'Transitional';
-
-            const detail = \`Pump=\${pumpCount} Dump=\${dumpCount} Flat=\${flatCount} | Alt4h=\${avgAlt4h.toFixed(2)}% | BTC=\${btc4hChange.toFixed(2)}% | ATR=\${btcATRpct.toFixed(2)}% | Vol=\${btcVolRatio.toFixed(2)}x\`;
-
-            console.log(\`[A3-REGIME] \${topRegime} (conf=\${confidence}%)\`);
-            console.log(\`[A3-REGIME-DETAIL] \${detail}\`);
-
-            return {
-              regime: topRegime,
-              confidence,
-              detail
-            };
-          }
-
-          (async () => {
-            try {
-              const result = await getMarketRegime();
-              console.log(\`::set-output name=regime::\${result.regime}\`);
-              console.log(\`::set-output name=confidence::\${result.confidence}\`);
-            } catch(e) {
-              console.log(\`[A3-REGIME-ERROR] \${e.message}\`);
-              console.log('::set-output name=regime::Unknown');
-              console.log('::set-output name=confidence::0');
-            }
-          })();
-          NODESCRIPT
-
-      - name: 🔁 Route — Dead Market to B, else A
+          set +e
+          JSON=$(curl -fsS --max-time 10 "${WORKER_JSON_URL}")
+          EXIT=$?
+          if [[ $EXIT -ne 0 || -z "$JSON" ]]; then
+            echo "⚠️ Regime fetch failed (exit=$EXIT) — defaulting to ACTIVE"
+            REGIME="Unknown"
+          else
+            REGIME=$(node -e "try{const j=JSON.parse(process.argv[1]);console.log(j.regime?.regime||'Unknown')}catch{console.log('Unknown')}" "$JSON")
+          fi
+          echo "regime=$REGIME" >> "$GITHUB_OUTPUT"
+          echo "✅ Fetched regime: $REGIME"
+
+      - name: 🔁 Route — Dead Market → B, else A
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const regime = `${{ steps.regime.outputs.regime }}`.trim();
-            const confidence = parseInt(`${{ steps.regime.outputs.confidence }}` || '0');
-            const isDead = regime === 'Dead Market';
-            const eventType = isDead ? 'run_B' : 'run_A';
+        script: |
+          const regime = `${{ steps.regime.outputs.regime }}`.trim();
+          const isDead = regime === 'Dead Market';
+          const eventType = isDead ? 'run_B' : 'run_A';
 
-            console.log(`[A3-ROUTER] regime="${regime}" conf=${confidence}% → ${eventType}`);
+          console.log(`[A3-ROUTER] regime="${regime}" → ${eventType}`);
 
-            const otherEvent = isDead ? 'run_A' : 'run_B';
-            const workflowNameMap = { 
-              'run_A': 'Ideas Pusher (MEXC Ultimate 7.7.8)',
-              'run_B': 'Ideas Pusher (Bybit Ultimate 1.0.0)'
-            };
-            const otherWorkflowName = workflowNameMap[otherEvent];
+          const otherEvent = isDead ? 'run_A' : 'run_B';
+          const workflowNameMap = { 
+            'run_A': 'Ideas Pusher (MEXC Ultimate 7.7.8)',
+            'run_B': 'Ideas Pusher (Bybit Ultimate 1.0.0)'
+          };
+          const otherWorkflowName = workflowNameMap[otherEvent];
 
-            try {
-              console.log(`[A3-ROUTER] Checking for in-progress runs of "${otherWorkflowName}"...`);
-              const runs = await github.rest.actions.listWorkflowRuns({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                workflow_id: otherWorkflowName,
-                status: 'in_progress'
-              });
-              
-              if (runs.data.workflow_runs.length > 0) {
-                for (const run of runs.data.workflow_runs) {
-                  console.log(`[A3-ROUTER] Cancelling in-progress "${otherWorkflowName}" run #${run.id}`);
-                  await github.rest.actions.cancelWorkflowRun({
-                    owner: context.repo.owner,
-                    repo: context.repo.repo,
-                    run_id: run.id
-                  });
-                }
-              }
-            } catch(e) {
-              console.log(`[A3-ROUTER] Cancel check skipped: ${e.message}`);
-            }
-
-            await github.rest.repos.createDispatchEvent({
+          try {
+            console.log(`[A3-ROUTER] Checking for in-progress runs of "${otherWorkflowName}"...`);
+            const runs = await github.rest.actions.listWorkflowRuns({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              event_type: eventType
+              workflow_id: otherWorkflowName,
+              status: 'in_progress'
             });
+            
+            if (runs.data.workflow_runs.length > 0) {
+              for (const run of runs.data.workflow_runs) {
+                console.log(`[A3-ROUTER] Cancelling in-progress "${otherWorkflowName}" run #${run.id}`);
+                await github.rest.actions.cancelWorkflowRun({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  run_id: run.id
+                });
+              }
+            }
+          } catch(e) {
+            console.log(`[A3-ROUTER] Cancel check skipped: ${e.message}`);
+          }
 
-            console.log(`✅ Dispatched ${eventType}`);
+          await github.rest.repos.createDispatchEvent({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            event_type: eventType
+          });
+
+          console.log(`✅ Dispatched ${eventType}`);
