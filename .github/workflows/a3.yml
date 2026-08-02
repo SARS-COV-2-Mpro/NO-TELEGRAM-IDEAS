@@ -33,7 +33,7 @@ jobs:
           JSON=$(curl -fsS --max-time 10 "${WORKER_JSON_URL}")
           EXIT=$?
           if [[ $EXIT -ne 0 || -z "$JSON" ]]; then
-            echo "⚠️ Regime fetch failed (exit=$EXIT) — defaulting to ACTIVE"
+            echo "⚠️ Regime fetch failed (exit=$EXIT)"
             REGIME="Unknown"
           else
             REGIME=$(node -e "try{const j=JSON.parse(process.argv[1]);console.log(j.regime?.regime||'Unknown')}catch{console.log('Unknown')}" "$JSON")
@@ -45,47 +45,50 @@ jobs:
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-        script: |
-          const regime = `${{ steps.regime.outputs.regime }}`.trim();
-          const isDead = regime === 'Dead Market';
-          const eventType = isDead ? 'run_B' : 'run_A';
+          script: |
+            const regime = `${{ steps.regime.outputs.regime }}`.trim();
+            const isDead = regime === 'Dead Market';
+            const eventType = isDead ? 'run_B' : 'run_A';
 
-          console.log(`[A3-ROUTER] regime="${regime}" → ${eventType}`);
+            console.log(`[A3-ROUTER] regime="${regime}" → ${eventType}`);
 
-          const otherEvent = isDead ? 'run_A' : 'run_B';
-          const workflowNameMap = { 
-            'run_A': 'Ideas Pusher (MEXC Ultimate 7.7.8)',
-            'run_B': 'Ideas Pusher (Bybit Ultimate 1.0.0)'
-          };
-          const otherWorkflowName = workflowNameMap[otherEvent];
+            // ✅ Define workflow FILE NAMES (NOT names)
+            const workflowFiles = {
+              run_A: 'a.yml',
+              run_B: 'b.yml'
+            };
 
-          try {
-            console.log(`[A3-ROUTER] Checking for in-progress runs of "${otherWorkflowName}"...`);
-            const runs = await github.rest.actions.listWorkflowRuns({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: otherWorkflowName,
-              status: 'in_progress'
-            });
-            
-            if (runs.data.workflow_runs.length > 0) {
+            const otherEvent = isDead ? 'run_A' : 'run_B';
+            const otherWorkflowFile = workflowFiles[otherEvent];
+
+            try {
+              console.log(`[A3-ROUTER] Checking in-progress runs of ${otherWorkflowFile}`);
+
+              const runs = await github.rest.actions.listWorkflowRuns({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: otherWorkflowFile,
+                status: 'in_progress'
+              });
+
               for (const run of runs.data.workflow_runs) {
-                console.log(`[A3-ROUTER] Cancelling in-progress "${otherWorkflowName}" run #${run.id}`);
+                console.log(`[A3-ROUTER] Cancelling run #${run.id}`);
                 await github.rest.actions.cancelWorkflowRun({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   run_id: run.id
                 });
               }
+
+            } catch (e) {
+              console.log(`[A3-ROUTER] Cancel check skipped: ${e.message}`);
             }
-          } catch(e) {
-            console.log(`[A3-ROUTER] Cancel check skipped: ${e.message}`);
-          }
 
-          await github.rest.repos.createDispatchEvent({
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            event_type: eventType
-          });
+            // ✅ Dispatch correct workflow
+            await github.rest.repos.createDispatchEvent({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              event_type: eventType
+            });
 
-          console.log(`✅ Dispatched ${eventType}`);
+            console.log(`✅ Dispatched ${eventType}`);
