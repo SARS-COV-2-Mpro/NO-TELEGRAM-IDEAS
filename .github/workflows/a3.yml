@@ -25,25 +25,26 @@ jobs:
           sleep 60
           echo "✅ A3 done at $(date)"
 
-      - name: 🔍 Fetch regime from Worker
+      - name: 🔍 Fetch regime from Worker (HTML parser)
         id: regime
         env:
           WORKER_JSON_URL: ${{ secrets.WORKER_JSON_URL }}
         run: |
           set +e
           echo "🔗 Fetching from Worker..."
-          JSON=$(curl -fsS --max-time 10 "${WORKER_JSON_URL}")
+          HTML=$(curl -fsS --max-time 10 "${WORKER_JSON_URL}")
           EXIT_CODE=$?
 
-          echo "📦 RAW JSON RECEIVED:"
-          echo "$JSON"
           echo "🔢 Curl Exit Code: $EXIT_CODE"
 
-          if [[ $EXIT_CODE -ne 0 || -z "$JSON" ]]; then
+          if [[ $EXIT_CODE -ne 0 || -z "$HTML" ]]; then
             echo "⚠️ Fetch failed"
             REGIME="Unknown"
           else
-            REGIME=$(node -e "try{const j=JSON.parse(process.argv[1]);console.log(j.regime?.regime||'Unknown')}catch(e){console.log('Unknown')}" "$JSON")
+            REGIME=$(echo "$HTML" | grep -oE '(Dead Market|Altcoin Season|Bitcoin Season|Trending Up|Trending Down|Volatile|Recovery|Distribution|Accumulation)' | head -n1)
+            if [[ -z "$REGIME" ]]; then
+              REGIME="Unknown"
+            fi
           fi
 
           echo "regime=$REGIME" >> "$GITHUB_OUTPUT"
@@ -61,28 +62,21 @@ jobs:
             console.log(`[A3-ROUTER] Regime: "${regime}"`);
             console.log(`[A3-ROUTER] Dispatching: ${eventType}`);
 
-            // ✅ Your actual workflow file names
             const workflowFiles = {
-              run_A: 'blank2.yml',  // MEXC Ultimate
-              run_B: 'blank.yml'    // Bybit Ultimate
+              run_A: 'blank2.yml',
+              run_B: 'blank.yml'
             };
 
             const otherEvent = isDead ? 'run_A' : 'run_B';
             const otherFile = workflowFiles[otherEvent];
 
-            // Cancel the opposite workflow if running
             try {
-              console.log(`[A3-ROUTER] Checking for running: ${otherFile}`);
               const runs = await github.rest.actions.listWorkflowRuns({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 workflow_id: otherFile,
                 status: 'in_progress'
               });
-
-              if (runs.data.workflow_runs.length === 0) {
-                console.log(`[A3-ROUTER] No running instances of ${otherFile}`);
-              }
 
               for (const run of runs.data.workflow_runs) {
                 console.log(`[A3-ROUTER] Cancelling ${otherFile} run #${run.id}`);
@@ -93,7 +87,6 @@ jobs:
                 });
               }
 
-              // Also cancel queued ones
               const queued = await github.rest.actions.listWorkflowRuns({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -109,16 +102,14 @@ jobs:
                   run_id: run.id
                 });
               }
-
             } catch (e) {
-              console.log(`[A3-ROUTER] Cancel check error: ${e.message}`);
+              console.log(`[A3-ROUTER] Cancel error: ${e.message}`);
             }
 
-            // Dispatch the correct workflow
             await github.rest.repos.createDispatchEvent({
               owner: context.repo.owner,
               repo: context.repo.repo,
               event_type: eventType
             });
 
-            console.log(`✅ Successfully dispatched ${eventType}`);
+            console.log(`✅ Dispatched ${eventType}`);
