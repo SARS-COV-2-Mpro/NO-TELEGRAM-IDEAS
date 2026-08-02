@@ -2,11 +2,15 @@ name: 🔄 A3 (8 min)
 
 on:
   repository_dispatch:
-    types: [run_A3]   # <— must match what Worker sends
+    types: [run_A3]
 
 permissions:
   actions: write
   contents: write
+
+concurrency:
+  group: a3-router
+  cancel-in-progress: true
 
 jobs:
   a3:
@@ -17,17 +21,74 @@ jobs:
       - name: 🚀 A3 Work
         run: |
           echo "⏳ A3 started at $(date)"
-          sleep 60  # 8 minutes
+          sleep 60
           echo "✅ A3 done at $(date)"
 
-      - name: 🔁 Trigger Ideas Pusher (run_B)
+      - name: 🔍 Fetch live regime from Worker
+        id: regime
+        env:
+          WORKER_BASE_URL: ${{ secrets.WORKER_BASE_URL }}
+        run: |
+          set +e
+          JSON=$(curl -fsS --max-time 10 "${WORKER_BASE_URL}/regime")
+          EXIT=$?
+          if [[ $EXIT -ne 0 || -z "$JSON" ]]; then
+            echo "⚠️ Regime fetch failed (exit=$EXIT) — defaulting to ACTIVE"
+            JSON='{}'
+          fi
+          echo "raw=$JSON"
+          REG=$(node -e "
+            try {
+              const j = JSON.parse(process.argv[1]);
+              console.log(j.regime || 'Unknown');
+            } catch(e) {
+              console.log('Unknown');
+            }
+          " "$JSON")
+          echo "regime=$REG" >> "$GITHUB_OUTPUT"
+          echo "✅ Fetched regime: $REG"
+
+      - name: 🔁 Route — Dead Market → B, anything else → A
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
+            const regime = `${{ steps.regime.outputs.regime }}`.trim();
+            const isDead = regime === 'Dead Market';
+            const eventType = isDead ? 'run_B' : 'run_A';
+
+            console.log(`[A3-ROUTER] regime="${regime}" → ${eventType}`);
+
+            // Cancel any in-progress run of the pipeline we are NOT dispatching
+            // so both never run simultaneously
+            const otherEvent = isDead ? 'run_A' : 'run_B';
+            const workflowMap = { 'run_A': 'a.yml', 'run_B': 'b.yml' };
+            const otherWorkflow = workflowMap[otherEvent];
+
+            try {
+              const runs = await github.rest.actions.listWorkflowRuns({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: otherWorkflow,
+                status: 'in_progress'
+              });
+              for (const run of runs.data.workflow_runs) {
+                console.log(`[A3-ROUTER] Cancelling in-progress ${otherWorkflow} run #${run.id}`);
+                await github.rest.actions.cancelWorkflowRun({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  run_id: run.id
+                });
+              }
+            } catch(e) {
+              console.log(`[A3-ROUTER] Cancel check skipped: ${e.message}`);
+            }
+
+            // Dispatch the correct pipeline
             await github.rest.repos.createDispatchEvent({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              event_type: 'run_B'
+              event_type: eventType
             });
-            console.log('🅱️ Triggered Ideas Pusher (run_B)');
+
+            console.log(`✅ Dispatched ${eventType}`);
