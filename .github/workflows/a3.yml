@@ -1,33 +1,26 @@
 name: 🔄 A3 (8 min)
-
 on:
   repository_dispatch:
     types: [run_A3]
   workflow_dispatch: {}
-
 permissions:
   actions: write
   contents: write
-
 concurrency:
   group: a3-router
   cancel-in-progress: true
-
 env:
   ROUTING_MODE: ${{ vars.ROUTING_MODE || 'AGDM' }}
-
 jobs:
   a3:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-
     steps:
       - name: 🚀 A3 Work
         run: |
           echo "⏳ A3 started at $(date)"
-          sleep 60
+          sleep 20
           echo "✅ A3 done at $(date)"
-
       - name: 🔍 Fetch regime from Worker
         id: regime
         env:
@@ -37,9 +30,7 @@ jobs:
           echo "🔗 Fetching from Worker..."
           JSON=$(curl -fsS --max-time 10 "${WORKER_JSON_URL}")
           EXIT_CODE=$?
-
           echo "🔢 Curl Exit Code: $EXIT_CODE"
-
           if [[ $EXIT_CODE -ne 0 || -z "$JSON" ]]; then
             echo "⚠️ Fetch failed"
             REGIME="Unknown"
@@ -49,10 +40,8 @@ jobs:
               REGIME="Unknown"
             fi
           fi
-
           echo "regime=$REGIME" >> "$GITHUB_OUTPUT"
           echo "✅ Final Regime: $REGIME"
-
       - name: 🔁 Route based on ROUTING_MODE
         uses: actions/github-script@v7
         with:
@@ -61,9 +50,7 @@ jobs:
             const mode = `${{ env.ROUTING_MODE }}`.trim().toUpperCase();
             const regime = `${{ steps.regime.outputs.regime }}`.trim();
             const isDead = regime === 'Dead Market';
-
             let eventType;
-
             switch (mode) {
               case 'AGDM':
                 // Dead → MEXC (A), Alt → BYBIT (B)
@@ -85,19 +72,15 @@ jobs:
                 console.log(`⚠️ Unknown mode "${mode}", defaulting to AGDM`);
                 eventType = isDead ? 'run_A' : 'run_B';
             }
-
             const workflowFiles = {
               run_A: 'blank2.yml',   // MEXC
               run_B: 'blank.yml'     // BYBIT
             };
-
             const otherEvent = eventType === 'run_A' ? 'run_B' : 'run_A';
             const otherFile  = workflowFiles[otherEvent];
-
             console.log(`[A3-ROUTER] Mode: "${mode}"`);
             console.log(`[A3-ROUTER] Regime: "${regime}"`);
             console.log(`[A3-ROUTER] Dispatching: ${eventType} → ${workflowFiles[eventType]}`);
-
             // Cancel the opposite workflow (in_progress + queued)
             try {
               for (const status of ['in_progress', 'queued']) {
@@ -119,11 +102,9 @@ jobs:
             } catch (e) {
               console.log(`[A3-ROUTER] Cancel error: ${e.message}`);
             }
-
             await github.rest.repos.createDispatchEvent({
               owner: context.repo.owner,
               repo: context.repo.repo,
               event_type: eventType
             });
-
             console.log(`✅ Dispatched ${eventType}`);
