@@ -1,6 +1,7 @@
-
 name: 🔄 A3 (8 min)
 on:
+  schedule:
+    - cron: '*/35 * * * *'
   repository_dispatch:
     types: [run_A3]
   workflow_dispatch: {}
@@ -22,13 +23,11 @@ jobs:
           script: |
             const { owner, repo } = context.repo;
             const myRunId = context.runId;
-
             // Find this workflow's ID from the current run
             const me = await github.rest.actions.getWorkflowRun({
               owner, repo, run_id: myRunId
             });
             const workflowId = me.data.workflow_id;
-
             // Look for other active runs of this same workflow
             const others = [];
             for (const status of ['in_progress', 'queued', 'waiting', 'pending']) {
@@ -45,31 +44,25 @@ jobs:
                 }
               }
             }
-
             if (others.length === 0) {
               console.log('[A3-GUARD] ✅ No other A3 running. Continuing.');
               core.setOutput('skip', 'false');
               return;
             }
-
             console.log(`[A3-GUARD] ⛔ Another A3 is running: ${others.map(r => '#' + r.id + ' (' + r.status + ')').join(', ')}`);
             console.log('[A3-GUARD] Cancelling myself...');
             core.setOutput('skip', 'true');
-
             await github.rest.actions.cancelWorkflowRun({
               owner, repo, run_id: myRunId
             });
-
             // Give GitHub time to process the cancellation
             await new Promise(r => setTimeout(r, 30000));
-
       - name: 🚀 A3 Work
         if: steps.guard.outputs.skip != 'true'
         run: |
           echo "⏳ A3 started at $(date)"
           sleep 20
           echo "✅ A3 done at $(date)"
-
       - name: 🔍 Fetch regime from Worker
         if: steps.guard.outputs.skip != 'true'
         id: regime
@@ -92,7 +85,6 @@ jobs:
           fi
           echo "regime=$REGIME" >> "$GITHUB_OUTPUT"
           echo "✅ Final Regime: $REGIME"
-
       - name: 🔁 Route based on ROUTING_MODE
         if: steps.guard.outputs.skip != 'true'
         uses: actions/github-script@v7
@@ -160,7 +152,6 @@ jobs:
               event_type: eventType
             });
             console.log(`✅ Dispatched ${eventType}`);
-
             // ➕ NEW: Also trigger A1 (restart the loop)
             await github.rest.repos.createDispatchEvent({
               owner: context.repo.owner,
