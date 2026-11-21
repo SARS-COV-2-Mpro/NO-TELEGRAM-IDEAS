@@ -6,9 +6,6 @@ on:
 permissions:
   actions: write
   contents: write
-concurrency:
-  group: a3-router
-  cancel-in-progress: true
 env:
   ROUTING_MODE: ${{ vars.ROUTING_MODE || 'AGDM' }}
 jobs:
@@ -16,12 +13,64 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: 🛡️ Guard - cancel if another A3 is running
+        id: guard
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const myRunId = context.runId;
+
+            // Find this workflow's ID from the current run
+            const me = await github.rest.actions.getWorkflowRun({
+              owner, repo, run_id: myRunId
+            });
+            const workflowId = me.data.workflow_id;
+
+            // Look for other active runs of this same workflow
+            const others = [];
+            for (const status of ['in_progress', 'queued', 'waiting', 'pending']) {
+              const runs = await github.rest.actions.listWorkflowRuns({
+                owner, repo,
+                workflow_id: workflowId,
+                status,
+                per_page: 100
+              });
+              for (const run of runs.data.workflow_runs) {
+                // Only count OTHER runs that started earlier (lower ID) to avoid both cancelling each other
+                if (run.id !== myRunId && run.id < myRunId) {
+                  others.push(run);
+                }
+              }
+            }
+
+            if (others.length === 0) {
+              console.log('[A3-GUARD] ✅ No other A3 running. Continuing.');
+              core.setOutput('skip', 'false');
+              return;
+            }
+
+            console.log(`[A3-GUARD] ⛔ Another A3 is running: ${others.map(r => '#' + r.id + ' (' + r.status + ')').join(', ')}`);
+            console.log('[A3-GUARD] Cancelling myself...');
+            core.setOutput('skip', 'true');
+
+            await github.rest.actions.cancelWorkflowRun({
+              owner, repo, run_id: myRunId
+            });
+
+            // Give GitHub time to process the cancellation
+            await new Promise(r => setTimeout(r, 30000));
+
       - name: 🚀 A3 Work
+        if: steps.guard.outputs.skip != 'true'
         run: |
           echo "⏳ A3 started at $(date)"
           sleep 20
           echo "✅ A3 done at $(date)"
+
       - name: 🔍 Fetch regime from Worker
+        if: steps.guard.outputs.skip != 'true'
         id: regime
         env:
           WORKER_JSON_URL: ${{ secrets.WORKER_JSON_URL }}
@@ -42,7 +91,9 @@ jobs:
           fi
           echo "regime=$REGIME" >> "$GITHUB_OUTPUT"
           echo "✅ Final Regime: $REGIME"
+
       - name: 🔁 Route based on ROUTING_MODE
+        if: steps.guard.outputs.skip != 'true'
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
