@@ -1,8 +1,6 @@
-0
+
 name: 🔄 A3 (8 min)
 on:
-  schedule:
-    - cron: '*/35 * * * *'
   repository_dispatch:
     types: [run_A3]
   workflow_dispatch: {}
