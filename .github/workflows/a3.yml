@@ -159,3 +159,11 @@ jobs:
               event_type: eventType
             });
             console.log(`✅ Dispatched ${eventType}`);
+
+            // ➕ NEW: Also trigger A1 (restart the loop)
+            await github.rest.repos.createDispatchEvent({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              event_type: 'run_A1'
+            });
+            console.log('✅ Dispatched run_A1');
