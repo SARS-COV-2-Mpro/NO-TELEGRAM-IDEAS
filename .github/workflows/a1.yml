@@ -1,26 +1,21 @@
-name: 🔄 A1 (8 min)
-
+name: 🔄 A1 (20 min)
 on:
   repository_dispatch:
     types: [run_A1]
   workflow_dispatch: {}  # Manual start
-
 permissions:
   actions: write
   contents: write
-
 jobs:
   a1:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-
+    timeout-minutes: 30
     steps:
       - name: 🚀 A1 Work
         run: |
           echo "⏳ A1 started at $(date)"
-          sleep 1200  # 5 minutes - replace with your actual work
+          sleep 1200  # 20 minutes
           echo "✅ A1 done at $(date)"
-
       - name: ➡️ Trigger A2
         uses: actions/github-script@v7
         with:
