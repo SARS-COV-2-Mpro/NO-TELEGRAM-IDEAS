@@ -40,7 +40,7 @@ jobs:
         if: steps.guard.outputs.skip != 'true'
         run: |
           echo "⏳ A3 started at $(date)"
-          sleep 1200  # 20 minutes
+          sleep 300  # 20 minutes
           echo "✅ A3 done at $(date)"
       - name: 🔁 Trigger X and Restart Loop (A1)
         if: steps.guard.outputs.skip != 'true'
