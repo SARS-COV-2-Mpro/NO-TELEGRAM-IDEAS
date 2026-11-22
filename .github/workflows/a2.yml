@@ -1,25 +1,20 @@
-name: 🔄 A2 (8 min)
-
+name: 🔄 A2 (20 min)
 on:
   repository_dispatch:
     types: [run_A2]
-
 permissions:
   actions: write
   contents: write
-
 jobs:
   a2:
     runs-on: ubuntu-latest
-    timeout-minutes: 20  # Also reduced from 20
-
+    timeout-minutes: 30
     steps:
       - name: 🚀 A2 Work
         run: |
           echo "⏳ A2 started at $(date)"
-          sleep 1200  # ← Changed from 600 to 480 (8 minutes)
+          sleep 1200  # 20 minutes
           echo "✅ A2 done at $(date)"
-
       - name: ➡️ Trigger A3
         uses: actions/github-script@v7
         with:
