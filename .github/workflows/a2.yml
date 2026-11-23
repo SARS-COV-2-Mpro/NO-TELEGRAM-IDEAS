@@ -13,7 +13,7 @@ jobs:
       - name: 🚀 A2 Work
         run: |
           echo "⏳ A2 started at $(date)"
-          sleep 300  # 20 minutes
+          sleep 180  # 20 minutes
           echo "✅ A2 done at $(date)"
       - name: ➡️ Trigger A3
         uses: actions/github-script@v7
